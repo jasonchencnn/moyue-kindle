@@ -1,0 +1,414 @@
+# Screenshot manifest for compose.py.
+#
+# Inputs are raw 1072x1448 8-bit gray captures of the device's framebuffer
+# (tools/host/screenshot.sh), in English, of public-domain books: Aristotle's
+# Nicomachean Ethics, Book I, in Bywater's Greek and Chase's translation
+# (Project Gutenberg #8438), with a Wiktionary dictionary (CC BY-SA). Relative
+# input paths resolve against `base`; set SCREENSHOTS_BASE to override it.
+# Paths may use ~ and $VARS. `out_dir` is relative to this file; an output may
+# set its own.
+
+base = "$ARISTOTLE_CACHE/captures/readme"
+out_dir = "../../docs/images"
+
+# Frame styles; an output picks one with `style`, which overrides `default`.
+#   radius     corner radius in output pixels
+#   bezel_px   width of a dark bezel around the page (0: the page is the card)
+#   border     1 px hairline just outside the edge, "#rrggbb/alpha"
+#   shadows    [y offset px, blur px, opacity] layers, all black
+#   padding    transparent margin around everything; gap between screens
+[style.default]
+radius = 18
+bezel_px = 0
+border = "#000000/22"
+shadows = [[1, 2, 0.05], [14, 28, 0.13]]
+padding = 56
+gap = 56
+
+# Night-mode screens, for GitHub's dark theme: a lighter hairline and a
+# stronger shadow, as on a dark page.
+[style.night]
+border = "#ffffff/26"
+shadows = [[1, 2, 0.30], [16, 30, 0.55]]
+
+# The same with a thin dark bezel instead of a bare page.
+[style.bezel]
+radius = 28
+bezel_px = 16
+bezel_color = "#1c1c1c"
+
+[style.bezel-night]
+radius = 28
+bezel_px = 16
+bezel_color = "#262626"
+border = "#ffffff/26"
+shadows = [[1, 2, 0.30], [16, 30, 0.55]]
+
+# The site's figures: a narrower margin, so the card fills its column.
+[style.site]
+padding = 32
+shadows = [[1, 2, 0.05], [8, 16, 0.13]]
+
+[style.site-night]
+padding = 32
+border = "#ffffff/26"
+shadows = [[1, 2, 0.30], [8, 16, 0.45]]
+
+# README: library, English page, Greek dictionary popup. 536 px is half the
+# panel width, so the README shows the panel's pixels at 2x density.
+[[output]]
+name = "readme-light.png"
+screen_width = 536
+inputs = ["day-library.png", "day-english-page.png", "day-greek-popup.png"]
+
+[[output]]
+name = "readme-dark.png"
+style = "night"
+screen_width = 536
+inputs = ["night-library.png", "night-english-page.png", "night-greek-popup.png"]
+
+# Single shots for the docs, at the same 2x density.
+[[output]]
+name = "library.png"
+screen_width = 536
+inputs = ["day-library.png"]
+
+[[output]]
+name = "reader.png"
+screen_width = 536
+inputs = ["day-english-page.png"]
+
+[[output]]
+name = "dictionary.png"
+screen_width = 536
+inputs = ["day-greek-popup.png"]
+
+[[output]]
+name = "reader-menu.png"
+screen_width = 536
+inputs = ["day-menu.png"]
+
+[[output]]
+name = "settings.png"
+screen_width = 536
+inputs = ["day-settings.png"]
+
+[[output]]
+name = "reader-night.png"
+style = "night"
+screen_width = 536
+inputs = ["night-english-page.png"]
+
+# docs/screenshots.md: one card per feature, in day mode for the light theme
+# and in night mode for the dark one. The captures are in gallery/ under
+# `base`, from the public-domain demo library: Nicomachean Ethics, Book I
+# (Bywater's Greek, Chase's translation) and the Chase translation of the
+# whole Ethics (Project Gutenberg #8438), with grc-en and en-pl Wiktionary
+# dictionaries (CC BY-SA). "night" uses night captures in both variants.
+[[output]]
+name = "library-light.png"
+out_dir = "../../docs/images/gallery"
+screen_width = 536
+inputs = ["gallery/day-library.png", "gallery/day-folders.png", "gallery/day-folder.png"]
+
+[[output]]
+name = "library-dark.png"
+out_dir = "../../docs/images/gallery"
+style = "night"
+screen_width = 536
+inputs = ["gallery/night-library.png", "gallery/night-folders.png", "gallery/night-folder.png"]
+
+[[output]]
+name = "reading-light.png"
+out_dir = "../../docs/images/gallery"
+screen_width = 536
+inputs = ["gallery/day-english-page.png", "gallery/day-greek-page.png"]
+
+[[output]]
+name = "reading-dark.png"
+out_dir = "../../docs/images/gallery"
+style = "night"
+screen_width = 536
+inputs = ["gallery/night-english-page.png", "gallery/night-greek-page.png"]
+
+[[output]]
+name = "night-light.png"
+out_dir = "../../docs/images/gallery"
+screen_width = 536
+inputs = ["gallery/night-library.png", "gallery/night-english-page.png"]
+
+[[output]]
+name = "night-dark.png"
+out_dir = "../../docs/images/gallery"
+style = "night"
+screen_width = 536
+inputs = ["gallery/night-library.png", "gallery/night-english-page.png"]
+
+[[output]]
+name = "dictionary-light.png"
+out_dir = "../../docs/images/gallery"
+screen_width = 536
+inputs = ["gallery/day-greek-popup.png", "gallery/day-english-popup.png"]
+
+[[output]]
+name = "dictionary-dark.png"
+out_dir = "../../docs/images/gallery"
+style = "night"
+screen_width = 536
+inputs = ["gallery/night-greek-popup.png", "gallery/night-english-popup.png"]
+
+[[output]]
+name = "footnotes-light.png"
+out_dir = "../../docs/images/gallery"
+screen_width = 536
+inputs = ["gallery/day-footnote-page.png", "gallery/day-footnote.png"]
+
+[[output]]
+name = "footnotes-dark.png"
+out_dir = "../../docs/images/gallery"
+style = "night"
+screen_width = 536
+inputs = ["gallery/night-footnote-page.png", "gallery/night-footnote.png"]
+
+[[output]]
+name = "highlights-light.png"
+out_dir = "../../docs/images/gallery"
+screen_width = 536
+inputs = ["gallery/day-greek-highlighted.png", "gallery/day-highlighted.png"]
+
+[[output]]
+name = "highlights-dark.png"
+out_dir = "../../docs/images/gallery"
+style = "night"
+screen_width = 536
+inputs = ["gallery/night-greek-highlighted.png", "gallery/night-highlighted.png"]
+
+[[output]]
+name = "menu-light.png"
+out_dir = "../../docs/images/gallery"
+screen_width = 536
+inputs = ["gallery/day-menu.png", "gallery/day-menu-size.png"]
+
+[[output]]
+name = "menu-dark.png"
+out_dir = "../../docs/images/gallery"
+style = "night"
+screen_width = 536
+inputs = ["gallery/night-menu.png", "gallery/night-menu-size.png"]
+
+[[output]]
+name = "settings-light.png"
+out_dir = "../../docs/images/gallery"
+screen_width = 536
+inputs = ["gallery/day-settings-1.png", "gallery/day-settings-2.png", "gallery/day-settings-2-pl.png"]
+
+[[output]]
+name = "settings-dark.png"
+out_dir = "../../docs/images/gallery"
+style = "night"
+screen_width = 536
+inputs = ["gallery/night-settings-1.png", "gallery/night-settings-2.png", "gallery/night-settings-2-pl.png"]
+
+[[output]]
+name = "network-light.png"
+out_dir = "../../docs/images/gallery"
+screen_width = 536
+inputs = ["gallery/day-sync.png", "gallery/day-catalogs.png"]
+
+[[output]]
+name = "network-dark.png"
+out_dir = "../../docs/images/gallery"
+style = "night"
+screen_width = 536
+inputs = ["gallery/night-sync.png", "gallery/night-catalogs.png"]
+
+# The site's figures.
+[[output]]
+name = "dictionary.png"
+out_dir = "../../site/assets/shots"
+style = "site"
+screen_width = 536
+inputs = ["day-greek-popup.png"]
+
+[[output]]
+name = "reader-menu.png"
+out_dir = "../../site/assets/shots"
+style = "site"
+screen_width = 536
+inputs = ["day-menu.png"]
+
+[[output]]
+name = "reader-night.png"
+out_dir = "../../site/assets/shots"
+style = "site-night"
+screen_width = 536
+inputs = ["night-english-page.png"]
+
+# The site's demo: every capture unframed, in the panel's 16 grays.
+[[output]]
+name = "library.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["day-library.png"]
+
+[[output]]
+name = "greek-page.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["day-greek-page.png"]
+
+[[output]]
+name = "greek-popup.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["day-greek-popup.png"]
+
+[[output]]
+name = "english-page.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["day-english-page.png"]
+
+[[output]]
+name = "menu.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["day-menu.png"]
+
+[[output]]
+name = "settings.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["day-settings.png"]
+
+[[output]]
+name = "library-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["night-library.png"]
+
+[[output]]
+name = "greek-page-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["night-greek-page.png"]
+
+[[output]]
+name = "greek-popup-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["night-greek-popup.png"]
+
+[[output]]
+name = "english-page-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["night-english-page.png"]
+
+[[output]]
+name = "menu-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/night-menu.png"]
+
+[[output]]
+name = "settings-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["night-settings.png"]
+
+[[output]]
+name = "folders.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/day-folders.png"]
+
+[[output]]
+name = "folders-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/night-folders.png"]
+
+[[output]]
+name = "folder.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/day-folder.png"]
+
+[[output]]
+name = "folder-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/night-folder.png"]
+
+[[output]]
+name = "english-popup.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/day-english-popup.png"]
+
+[[output]]
+name = "english-popup-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/night-english-popup.png"]
+
+[[output]]
+name = "greek-highlighted.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/day-greek-highlighted.png"]
+
+[[output]]
+name = "greek-highlighted-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/night-greek-highlighted.png"]
+
+[[output]]
+name = "footnote-page.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/day-footnote-page.png"]
+
+[[output]]
+name = "footnote-page-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/night-footnote-page.png"]
+
+[[output]]
+name = "footnote.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/day-footnote.png"]
+
+[[output]]
+name = "footnote-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/night-footnote.png"]
+
+[[output]]
+name = "menu-size.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/day-menu-size.png"]
+
+[[output]]
+name = "menu-size-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/night-menu-size.png"]
+
+[[output]]
+name = "greek-menu.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/day-greek-menu.png"]
+
+[[output]]
+name = "greek-menu-night.png"
+out_dir = "../../site/demo/frames"
+frame = false
+inputs = ["gallery/night-greek-menu.png"]

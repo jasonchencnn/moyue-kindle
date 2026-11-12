@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>墨阅传书</title>
+<style>
+  :root {
+    --ink: #1a1a1a;
+    --mid: #6b6b6b;
+    --line: #d8d8d8;
+    --card: #f4f4f4;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #fff;
+    color: var(--ink);
+    font-family: -apple-system, "PingFang SC", "Hiragino Sans GB",
+                 "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  body { padding: 24px 20px 40px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .hint { color: var(--mid); font-size: 14px; margin: 0 0 20px; }
+  #drop {
+    border: 2px dashed var(--line);
+    border-radius: 14px;
+    padding: 40px 20px;
+    text-align: center;
+    background: var(--card);
+    transition: border-color .15s, background .15s;
+  }
+  #drop.over { border-color: var(--ink); background: #ececec; }
+  #drop .big { font-size: 17px; margin-bottom: 10px; }
+  #pick {
+    display: inline-block;
+    padding: 10px 20px;
+    border: 1px solid var(--ink);
+    border-radius: 999px;
+    background: #fff;
+    font-size: 15px;
+    cursor: pointer;
+  }
+  #pick:active { background: var(--ink); color: #fff; }
+  #files { margin-top: 22px; }
+  .file { padding: 12px 0; border-bottom: 1px solid var(--line); }
+  .file:last-child { border-bottom: 0; }
+  .name { font-size: 15px; word-break: break-all; }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; margin-top: 8px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--ink); transition: width .2s; }
+  .note { font-size: 13px; color: var(--mid); margin-top: 6px; }
+  .ok .note { color: #2e7d32; }
+  .bad .note { color: #c62828; }
+  #total { margin-top: 18px; font-size: 14px; color: var(--mid); }
+</style>
+</head>
+<body>
+<h1>墨阅传书</h1>
+<p class="hint">把书拖进来，或点下面的按钮挑文件。可以一次选多个。图片会作为休眠屏图片保存。</p>
+
+<div id="drop">
+  <div class="big">拖书到这里</div>
+  <label id="pick" for="input">选择文件</label>
+  <input id="input" type="file" multiple hidden
+         accept=".epub,.txt,.mobi,.azw3,.pdf,.cbz,.ttf,.otf,.jpg,.jpeg,.png">
+</div>
+
+<div id="files"></div>
+<div id="total"></div>
+
+<script>
+(function () {
+  var drop = document.getElementById('drop');
+  var input = document.getElementById('input');
+  var list = document.getElementById('files');
+  var totalEl = document.getElementById('total');
+
+  // One row per file, so each one can show its own progress.
+  function row(file) {
+    var el = document.createElement('div');
+    el.className = 'file';
+    var name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = file.name;
+    var bar = document.createElement('div');
+    bar.className = 'bar';
+    var fill = document.createElement('i');
+    bar.appendChild(fill);
+    var note = document.createElement('div');
+    note.className = 'note';
+    note.textContent = '等待中';
+    el.appendChild(name);
+    el.appendChild(bar);
+    el.appendChild(note);
+    list.appendChild(el);
+    return { el: el, fill: fill, note: note };
+  }
+
+  function size(bytes) {
+    if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return bytes + ' B';
+  }
+
+  var count = 0;
+  var bytes = 0;
+
+  function send(file) {
+    var r = row(file);
+    var xhr = new XMLHttpRequest();
+    // The device cannot know how big the file is on its own, so it is said
+    // here: without it the device's own screen has no bar to fill.
+    xhr.open('POST', '/upload?size=' + encodeURIComponent(file.size));
+    xhr.upload.onprogress = function (e) {
+      if (!e.lengthComputable) return;
+      var pct = Math.round(e.loaded / e.total * 100);
+      r.fill.style.width = pct + '%';
+      r.note.textContent = pct + '% · ' + size(e.loaded) + ' / ' + size(e.total);
+    };
+    xhr.onload = function () {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        r.el.classList.add('ok');
+        r.fill.style.width = '100%';
+        r.note.textContent = '已收到 · ' + size(file.size);
+        count += 1;
+        bytes += file.size;
+        totalEl.textContent = '已收到 ' + count + ' 个 · 共 ' + size(bytes);
+      } else {
+        r.el.classList.add('bad');
+        r.note.textContent = '失败' + (xhr.responseText ? '：' + xhr.responseText : '');
+      }
+    };
+    xhr.onerror = function () {
+      r.el.classList.add('bad');
+      r.note.textContent = '失败：连接断开';
+    };
+    var form = new FormData();
+    form.append('file', file, file.name);
+    xhr.send(form);
+  }
+
+  function sendAll(files) {
+    for (var i = 0; i < files.length; i++) send(files[i]);
+  }
+
+  input.addEventListener('change', function () {
+    sendAll(input.files);
+    input.value = '';
+  });
+
+  ['dragenter', 'dragover'].forEach(function (name) {
+    drop.addEventListener(name, function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      drop.classList.add('over');
+    });
+  });
+  ['dragleave', 'drop'].forEach(function (name) {
+    drop.addEventListener(name, function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      drop.classList.remove('over');
+    });
+  });
+  drop.addEventListener('drop', function (e) {
+    if (e.dataTransfer && e.dataTransfer.files) sendAll(e.dataTransfer.files);
+  });
+})();
+</script>
+</body>
+</html>

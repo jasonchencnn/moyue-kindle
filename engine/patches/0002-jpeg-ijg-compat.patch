@@ -1,0 +1,87 @@
+From: agy <agy@readest.org>
+Subject: [PATCH 2/2] lvimg: use standard IJG JCS_RGB instead of libjpeg-turbo JCS_EXT_BGRX
+
+Plato / MuPDF on the device links against standard IJG libjpeg (9f) in the
+Plato cross sysroot. Introducing libjpeg-turbo would duplicate or conflict with
+Plato/MuPDF's symbols at link time. Standard IJG libjpeg does not define the
+JCS_EXT_BGRX colorspace enum, which caused build failures on ARM when USE_LIBJPEG=1.
+
+This patch sets cinfo.out_color_space = JCS_RGB (supported by all standard libjpeg
+implementations), reads RGB scanlines, and manually expands RGB to BGRX (with inverted
+alpha 0x00 for opaque pixels as expected by CRe) during the scanline copy loop.
+
+diff --git a/crengine/src/lvimg.cpp b/crengine/src/lvimg.cpp
+index 708c3bb..27c1c9a 100644
+--- a/crengine/src/lvimg.cpp
++++ b/crengine/src/lvimg.cpp
+@@ -761,6 +761,7 @@ public:
+         jpeg_create_decompress(&cinfo);
+ 
+         lUInt8 * buffer = NULL;
++        lUInt8 * raw_scanline = NULL;
+ 
+         if (setjmp(jerr.setjmp_buffer)) {
+         	CRLog::error("JPEG setjmp error handling");
+@@ -768,6 +769,7 @@ public:
+ 	     * We need to clean up the JPEG object, close the input file, and return.
+ 	     */
+             delete[] buffer;
++            delete[] raw_scanline;
+         	CRLog::debug("JPEG decoder cleanup");
+             cr_jpeg_src_free (&cinfo);
+             jpeg_destroy_decompress(&cinfo);
+@@ -799,7 +801,8 @@ public:
+                  * jpeg_read_header(), so we do nothing here.
+                  */
+                 // CRe expects BGRA (w/ inverted alpha, we'll handle that during the scanline copy).
+-                cinfo.out_color_space = JCS_EXT_BGRX;
++                // Use standard IJG JCS_RGB to avoid proprietary libjpeg-turbo extensions.
++                cinfo.out_color_space = JCS_RGB;
+ 
+                 /* Step 5: Start decompressor */
+ 
+@@ -807,7 +810,7 @@ public:
+                 /* We can ignore the return value since suspension is not possible
+                  * with the stdio data source.
+                  */
+-                // NOTE: We know that cinfo.output_components is 4, given the out_color_space we chose.
++                raw_scanline = new lUInt8 [ cinfo.output_width * cinfo.output_components ];
+                 buffer = new lUInt8 [ cinfo.output_width << 2U ];
+                 /* Step 6: while (scan lines remain to be read) */
+                 /*           jpeg_read_scanlines(...); */
+@@ -821,20 +824,28 @@ public:
+                      * Here the array is only one element long, but you could ask for
+                      * more than one scanline at a time if that's more convenient.
+                      */
+-                    (void) jpeg_read_scanlines(&cinfo, &buffer, 1);
+-
+-                    // CRe wants inverted alpha, but libjpeg-turbo doesn't guarantee that the alpha byte will be zero...
+-                    const unsigned char* const end = buffer + (cinfo.output_width << 2U);
+-                    // Start at the first alpha byte, then loop over each subsequent alpha byte, pixel-by-pixel
+-                    for (unsigned char* p = buffer + 3U; p <= end; p += 4U) {
+-                        *p = 0x00;
++                    (void) jpeg_read_scanlines(&cinfo, &raw_scanline, 1);
++
++                    // Expand 3-byte RGB to 4-byte BGRX with inverted alpha (alpha = 0x00 for opaque)
++                    const lUInt8* src = raw_scanline;
++                    lUInt8* dst = buffer;
++                    for (int x = 0; x < static_cast<int>(cinfo.output_width); x++) {
++                        dst[0] = src[2]; // B
++                        dst[1] = src[1]; // G
++                        dst[2] = src[0]; // R
++                        dst[3] = 0x00;   // Inverted alpha
++                        src += 3;
++                        dst += 4;
+                     }
+                     callback->OnLineDecoded( this, y, reinterpret_cast<lUInt32 *>(buffer) );
+ 
+                 }
+                 callback->OnEndDecode(this, false);
++                delete[] raw_scanline;
++                raw_scanline = NULL;
+             }
+ 
++        delete[] raw_scanline;
+         delete[] buffer;
+         cr_jpeg_src_free (&cinfo);
+         jpeg_destroy_decompress(&cinfo);

@@ -1,0 +1,1145 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Host-side test of the device scripts: the device guard
+# (device/extension/guard.sh) in install.sh, bin/start.sh and takeover.sh,
+# uninstall.sh, the kill switch in boot.sh, the takeover flag, the upstart
+# jobs' own scripts (run from the .conf files), Aristotle at boot
+# (ui-boot.sh, autostart.sh, aristotlectl app), the OTA block, the KUAL
+# start and stop items, and the ownership check on /var/local/aristotle.
+#
+#   sh device/tests/agent.sh
+#
+# Each case builds a fake device root in a fresh directory under $TMPDIR: the
+# KUAL extension copied to mnt/us/extensions/ as install-extensions.sh does,
+# /proc/usid and /etc/prettyversion.txt, and stub device commands on PATH that
+# record their calls in the root's `calls` file. The real scripts run against
+# it (AGENT_TEST_ROOT). Nothing outside the fresh directory is touched.
+set -u
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+DEVICE=$(cd "$HERE/.." && pwd)
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/aristotle-agent-test.XXXXXX")
+failures=0
+
+# A PW4 serial (device code 0PP in characters 4-6), an Oasis 2 one (0LN) and a
+# PW5 one (1Q0); all made up for the test.
+PW4_SN=G000PP0123456789
+OASIS2_SN=G000LN0123456789
+PW5_SN=G001Q00123456789
+
+cleanup() {
+    for p in $(cat "$WORK"/*/jobs/*.pid "$WORK"/*/var/run/*.pid "$WORK"/*/var/local/aristotle/dropbear.pid 2> /dev/null); do
+        pkill -TERM -P "$p" 2> /dev/null
+        kill "$p" 2> /dev/null
+    done
+    for r in "$WORK"/*; do
+        for p in $(cat "$r/jobs/sleep-pids" 2> /dev/null); do
+            if [ -r "/proc/$p/environ" ] && tr '\000' '\n' < "/proc/$p/environ" | grep -Fxq "AGENT_TEST_ROOT=$r"; then
+                kill "$p" 2> /dev/null
+            fi
+        done
+    done
+}
+trap 'cleanup; rm -rf "$WORK"' EXIT
+
+check() {
+    if eval "$2"; then
+        printf '  ok    %s\n' "$1"
+    else
+        printf '  FAIL  %s\n' "$1"
+        failures=$((failures + 1))
+    fi
+}
+
+# The scripts check that /var/local/aristotle belongs to root and gives
+# nothing to group or others; here the owner is whoever runs the test, who
+# also needs the owner's bits to enter it.
+AGENT_TEST_OWNER=$(id -u)
+export AGENT_TEST_OWNER
+export AGENT_TEST_DIR_MODE=700
+FAKE_LIVE_PID=$$
+export FAKE_LIVE_PID
+
+# stubs DIR: the device commands the scripts call. Each one appends its
+# command line to $AGENT_TEST_ROOT/calls.
+stubs() {
+    mkdir -p "$1"
+    for c in eips mntroot lipc-set-prop lipc-send-event logger iptables ifconfig modprobe rmmod \
+        sync reboot mount umount; do
+        cat > "$1/$c" << 'EOF'
+#!/bin/sh
+echo "${0##*/} $*" >> "$AGENT_TEST_ROOT/calls"
+case "${0##*/}:$1" in
+# No rule or chain exists yet, as on a fresh boot.
+iptables:-C | iptables:-D | iptables:-F | iptables:-X) exit 1 ;;
+iptables:-L) case "$2" in INPUT | OUTPUT) exit 0 ;; *) exit 1 ;; esac ;;
+mntroot:*) [ "${FAKE_MNTROOT_FAIL:-}" != "$1" ] ;;
+sync:*) [ "${FAKE_APP_SIGNAL:-0}" != 1 ] || kill -TERM "$PPID" ;;
+lipc-set-prop:com.lab126.appmgrd)
+    [ "${FAKE_KUAL_START_FAIL:-0}" != 1 ] || exit 1
+    count=$(cat "$AGENT_TEST_ROOT/kual-requests" 2> /dev/null || echo 0)
+    count=$((count + 1))
+    echo "$count" > "$AGENT_TEST_ROOT/kual-requests"
+    [ "${FAKE_KUAL_IGNORE_ALWAYS:-0}" != 1 ] || exit 0
+    if [ "${FAKE_KUAL_IGNORE_FIRST:-0}" = 1 ] && [ "$count" = 1 ]; then exit 0; fi
+    if [ "${FAKE_KUAL_DELAY_POLLS:-0}" -gt 0 ]; then
+        echo "$FAKE_KUAL_DELAY_POLLS" > "$AGENT_TEST_ROOT/kual-pending"
+    else
+        echo com.mobileread.ixtab.kindlelauncher > "$AGENT_TEST_ROOT/active-app"
+    fi
+    ;;
+lipc-set-prop:com.lab126.volumd) [ "${FAKE_VOLUMD_SET_FAIL:-0}" != 1 ] ;;
+rmmod:g_mass_storage)
+    [ "${FAKE_UNLOAD_FAIL:-0}" != 1 ] || exit 1
+    if [ "${FAKE_UNLOAD_STUCK:-0}" != 1 ]; then
+        awk '$1 != "g_mass_storage"' "$AGENT_TEST_ROOT/modules" > "$AGENT_TEST_ROOT/modules.next"
+        mv "$AGENT_TEST_ROOT/modules.next" "$AGENT_TEST_ROOT/modules"
+    fi
+    ;;
+# A bind mount shows up in /proc/mounts, as on the device.
+mount:--bind) echo "/dev/mmcblk1p9 $3 ext3 rw 0 0" >> "$AGENT_TEST_ROOT/proc/mounts" ;;
+esac
+EOF
+    done
+    cat > "$1/lsmod" << 'EOF'
+#!/bin/sh
+echo "lsmod" >> "$AGENT_TEST_ROOT/calls"
+[ "${FAKE_LSMOD_FAIL:-0}" != 1 ] || exit 1
+cat "$AGENT_TEST_ROOT/modules" 2> /dev/null
+EOF
+    printf '#!/bin/sh\necho 0\n' > "$1/id"
+    cat > "$1/sleep" << 'EOF'
+#!/bin/sh
+echo $$ >> "$AGENT_TEST_ROOT/jobs/sleep-pids"
+exec /bin/sleep "$@"
+EOF
+    cat > "$1/timeout" << 'EOF'
+#!/bin/sh
+seconds=$2
+signal=$4
+shift 4
+exec /usr/bin/timeout -s "$signal" "$seconds" "$@"
+EOF
+    cat > "$1/lipc-get-prop" << 'EOF'
+#!/bin/sh
+echo "lipc-get-prop $*" >> "$AGENT_TEST_ROOT/calls"
+[ "${FAKE_LIPC_HANG:-0}" != 1 ] || exec sleep 30
+if [ "$1:$2" = com.lab126.volumd:driveModeState ]; then
+    [ "${FAKE_VOLUMD_GET_FAIL:-0}" != 1 ] || exit 1
+    if [ "${FAKE_DRIVE_TRANSITION:-0}" = 1 ] && [ ! -e "$AGENT_TEST_ROOT/drive-queried" ]; then
+        : > "$AGENT_TEST_ROOT/drive-queried"
+        echo 1
+    else
+        echo "${FAKE_DRIVE_MODE:-0}"
+        if [ "${FAKE_GADGET_RETURN:-0}" = 1 ]; then
+            echo 'g_mass_storage 40960 0' >> "$AGENT_TEST_ROOT/modules"
+        fi
+    fi
+    exit 0
+fi
+case "$1:$2" in
+com.lab126.appmgrd:activeAppPid) echo "${FAKE_ACTIVE_APP_PID:-$FAKE_LIVE_PID}" ;;
+com.lab126.appmgrd:activeApp)
+    [ "${FAKE_APP_ID_FAIL:-0}" != 1 ] || exit 1
+    if [ -f "$AGENT_TEST_ROOT/kual-pending" ]; then
+        polls=$(cat "$AGENT_TEST_ROOT/kual-pending")
+        if [ "$polls" -gt 0 ]; then
+            echo $((polls - 1)) > "$AGENT_TEST_ROOT/kual-pending"
+        else
+            rm "$AGENT_TEST_ROOT/kual-pending"
+            echo com.mobileread.ixtab.kindlelauncher > "$AGENT_TEST_ROOT/active-app"
+        fi
+    fi
+    cat "$AGENT_TEST_ROOT/active-app" 2> /dev/null || echo com.lab126.booklet.home
+    ;;
+esac
+EOF
+    cat > "$1/cp" << 'EOF'
+#!/bin/sh
+for last do :; done
+case "$last:${FAKE_APP_COPY_FAIL:-0}" in */app.new/:1) exit 1 ;; esac
+case "$last:${FAKE_APP_SOURCE_FAIL:-0}" in */app.rollback/USB-SOURCE.txt:1) exit 1 ;; esac
+command -p cp "$@"
+EOF
+    cat > "$1/mv" << 'EOF'
+#!/bin/sh
+case "$1:$2:${FAKE_APP_MOVE_FAIL:-0}" in */app.new:*/app:1 | */app.rollback:*/app:1) exit 1 ;; esac
+case "$1:${FAKE_APP_RETIRE_FAIL:-0}" in */app:1) exit 1 ;; esac
+case "$1:${FAKE_ROLLBACK_STAGE_FAIL:-0}" in */app.previous:1) exit 1 ;; esac
+case "$1:$2:${FAKE_APP_RESTORE_FAIL:-0}" in */app.previous:*/app:1) exit 1 ;; esac
+command -p mv "$@"
+EOF
+    cat > "$1/initctl" << 'EOF'
+#!/bin/sh
+R=$AGENT_TEST_ROOT
+echo "initctl $*" >> "$R/calls"
+case "$1" in
+reload-configuration) exit 0 ;;
+status)
+    if [ "$2" = framework ] && [ -e "$R/framework-ready" ]; then
+        echo 'framework start/running, process 123'
+        exit 0
+    fi
+    # The stock jobs always exist; ours only once installed.
+    case "$2" in
+    aristotle-*) [ -f "$R/etc/upstart/$2.conf" ] || [ -f "$R/jobs/$2.pid" ] || { echo "initctl: Unknown job: $2" >&2; exit 1; } ;;
+    esac
+    if [ -f "$R/jobs/$2.pid" ] && kill -0 "$(cat "$R/jobs/$2.pid")" 2> /dev/null; then
+        echo "$2 start/running, process $(cat "$R/jobs/$2.pid")"
+    else
+        echo "$2 stop/waiting"
+    fi
+    ;;
+esac
+EOF
+    cat > "$1/start" << 'EOF'
+#!/bin/sh
+R=$AGENT_TEST_ROOT
+echo "start $*" >> "$R/calls"
+if [ "$1" = lab126_gui ] && [ "${FAKE_KUAL_READY:-0}" = 1 ]; then
+    : > "$R/framework-ready"
+fi
+case "$1" in aristotle-agent) ;; *) exit 0 ;; esac
+[ -f "$R/etc/upstart/$1.conf" ] || { echo "start: Unknown job: $1" >&2; exit 1; }
+mkdir -p "$R/jobs"
+sleep 300 > /dev/null 2>&1 &
+echo $! > "$R/jobs/$1.pid"
+EOF
+    cat > "$1/stop" << 'EOF'
+#!/bin/sh
+R=$AGENT_TEST_ROOT
+echo "stop $*" >> "$R/calls"
+# `stop -n` (no wait) is what takeover.sh uses; the stub's jobs end at once.
+while [ $# -gt 0 ]; do
+    case "$1" in -n | --no-wait) shift ;; *) break ;; esac
+done
+[ -f "$R/jobs/$1.pid" ] || exit 1
+kill "$(cat "$R/jobs/$1.pid")" 2> /dev/null
+rm -f "$R/jobs/$1.pid"
+EOF
+    chmod 755 "$1"/*
+}
+
+# device NAME SERIAL FIRMWARE: a fake root with the KUAL extension, KOReader's
+# dropbear and the given /proc/usid and prettyversion (none when empty).
+# Prints the root.
+device() {
+    r="$WORK/$1"
+    mkdir -p "$r/proc/sys/kernel/random" "$r/etc/upstart" "$r/var/local" "$r/var/run" \
+        "$r/mnt/us/extensions" "$r/mnt/us/koreader/settings/SSH" "$r/jobs" "$r/usr/bin" "$r/usr/sbin"
+    echo "boot-$1" > "$r/proc/sys/kernel/random/boot_id"
+    : > "$r/modules"
+    echo "host key" > "$r/mnt/us/koreader/settings/SSH/dropbear_ed25519_host_key"
+    [ -n "$2" ] && printf '%s\n' "$2" > "$r/proc/usid"
+    [ -n "$3" ] && printf 'Kindle %s (~~otaVersion~~)\n\n\n\n' "$3" > "$r/etc/prettyversion.txt"
+    printf '10.00 5.00\n' > "$r/proc/uptime"
+    cp -R "$DEVICE/extension" "$r/mnt/us/extensions/aristotle"
+    cp "$DEVICE/app/takeover.sh" "$DEVICE/app/open-kual.sh" "$r/mnt/us/extensions/aristotle/"
+    printf 'ssh-ed25519 AAAA test\n' > "$r/mnt/us/extensions/aristotle/authorized_keys"
+    cat > "$r/mnt/us/koreader/dropbear" << 'EOF'
+#!/bin/sh
+echo "dropbear $* (in $PWD)" >> "$AGENT_TEST_ROOT/calls"
+while [ $# -gt 0 ]; do [ "$1" = -P ] && pid=$2; shift; done
+# A process with "dropbear" in its command line, as the scripts check.
+sh -c '
+cleanup() { kill "$child" 2> /dev/null; wait "$child" 2> /dev/null; }
+trap cleanup EXIT
+trap "exit 0" TERM INT
+sleep 300 &
+child=$!
+wait "$child"
+' fake-dropbear > /dev/null 2>&1 &
+echo $! > "$pid"
+EOF
+    chmod 755 "$r/mnt/us/koreader/dropbear"
+    cat > "$r/usr/sbin/mntus" << 'EOF'
+#!/bin/sh
+echo "mntus $*" >> "$AGENT_TEST_ROOT/calls"
+[ "${FAKE_MNTUS_FAIL:-0}" != 1 ] || exit 1
+[ "${FAKE_MNTUS_NO_CHANGE:-0}" != 1 ] || exit 0
+printf '/dev/loop/0 %s/mnt/base-us vfat rw 0 0\n' "$AGENT_TEST_ROOT" >> "$AGENT_TEST_ROOT/proc/mounts"
+EOF
+    chmod 755 "$r/usr/sbin/mntus"
+    # The stock crash collector that takeover.sh turns off (FIX-107).
+    printf '#!/bin/sh\necho "dmcc.sh $*" >> "$AGENT_TEST_ROOT/calls"\n' > "$r/usr/bin/dmcc.sh"
+    chmod 755 "$r/usr/bin/dmcc.sh"
+    echo "$r"
+}
+
+# run ROOT SCRIPT [ARGS]: SCRIPT relative to the extension on the fake root.
+run() {
+    r=$1
+    s=$2
+    shift 2
+    AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" \
+        sh "$r/mnt/us/extensions/aristotle/$s" "$@" > "$r.out" 2>&1
+}
+
+running() {
+    AGENT_TEST_ROOT=$1 "$WORK/bin/initctl" status "$2" 2> /dev/null | grep -q start/running
+}
+
+called() {
+    grep -q "^$2" "$1/calls" 2> /dev/null
+}
+
+stubs "$WORK/bin"
+
+echo "guard: install on a PW4 with 5.13.6"
+r=$(device pw4 "$PW4_SN" 5.13.6)
+run "$r" agent/install.sh
+check "exit status 0" "[ $? = 0 ]"
+check "job file installed" "[ -f $r/etc/upstart/aristotle-agent.conf ]"
+check "agent scripts installed" "[ -x $r/var/local/aristotle/boot.sh ] && [ -s $r/var/local/aristotle/authorized_keys ]"
+check "agent started" "called $r 'start aristotle-agent'"
+
+echo "guard: install on an Oasis 2 with 5.16.2"
+r=$(device oasis2 "$OASIS2_SN" 5.16.2)
+run "$r" agent/install.sh
+check "exit status 0" "[ $? = 0 ]"
+check "job file installed" "[ -f $r/etc/upstart/aristotle-agent.conf ]"
+check "agent started" "called $r 'start aristotle-agent'"
+
+# refused NAME SERIAL FIRMWARE SCRIPT REASON: SCRIPT must exit 1, say REASON
+# on stdout/stderr and on screen, and change nothing.
+refused() {
+    r=$(device "$1" "$2" "$3")
+    run "$r" $4
+    check "exit status 1" "[ $? = 1 ]"
+    check "says why" "grep -q '$5' $r.out"
+    check "shows it on screen" "grep -q '^eips 0 1 aristotle: .*$5' $r/calls"
+    check "nothing written" "[ ! -e $r/var/local/aristotle ] && [ ! -e $r/etc/upstart/aristotle-agent.conf ]"
+    check "no root filesystem, module or job command" "! grep -q -e '^mntroot' -e '^modprobe' -e '^rmmod' -e '^start' -e '^stop' -e '^iptables' $r/calls"
+    [ -n "$2" ] && check "serial number not printed" "! grep -q '$2' $r.out $r/calls"
+}
+
+echo "guard: install on a PW5"
+refused pw5 "$PW5_SN" 5.13.6 agent/install.sh "not a Paperwhite 4 or Oasis 2 (device code 1Q0)"
+echo "guard: install on a PW4 with 5.16.2"
+refused fw "$PW4_SN" 5.16.2 agent/install.sh "firmware 5.16.2, not 5.13.x"
+echo "guard: install on an Oasis 2 with 5.13.6"
+refused oasisfw "$OASIS2_SN" 5.13.6 agent/install.sh "firmware 5.13.6, not 5.16.x"
+echo "guard: install without prettyversion.txt"
+refused fwfmt "$PW4_SN" "" agent/install.sh "firmware unknown"
+echo "guard: install on an old-scheme serial (Kindle Touch)"
+refused old B011000000000000 5.3.7 agent/install.sh "device code 11"
+echo "guard: install off a Kindle (no /proc/usid)"
+refused host "" 5.13.6 agent/install.sh "device code unknown"
+echo "guard: bin/start.sh on a PW4 with 5.16.2"
+r=$(device start "$PW4_SN" 5.16.2)
+run "$r" bin/start.sh
+check "exit status 1" "[ $? = 1 ]"
+check "says why in its log" "grep -q 'firmware 5.16.2' $r/mnt/us/extensions/aristotle/usbnet.log"
+check "no module, firewall or dropbear" "! grep -q -e '^modprobe' -e '^rmmod' -e '^iptables' -e '^dropbear' $r/calls"
+echo "guard: takeover.sh start on a PW5"
+refused takeover "$PW5_SN" 5.13.6 "takeover.sh start" "not a Paperwhite 4 or Oasis 2"
+check "stock GUI not stopped" "! called $r 'stop -n lab126_gui'"
+echo "guard: takeover.sh start on an Oasis 2 with 5.16.2"
+r=$(device takeovertwo "$OASIS2_SN" 5.16.2)
+run "$r" takeover.sh start
+# The takeover's own exit status is not checked here: it reads /proc/meminfo,
+# which the host has no.
+check "did not refuse" "! grep -q 'not a Paperwhite 4 or Oasis 2' $r.out"
+check "stock GUI stopped" "called $r 'stop -n lab126_gui'"
+echo "guard: takeover.sh on stdin finds the installed extension's guard"
+r=$(device stdin "$PW5_SN" 5.13.6)
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh -s start < "$DEVICE/app/takeover.sh" > "$r.out" 2>&1
+check "exit status 1" "[ $? = 1 ]"
+check "stock GUI not stopped" "! called $r 'stop -n lab126_gui'"
+run "$r" takeover.sh stop
+check "stop always runs" "[ $? = 0 ] && called $r 'start lab126_gui'"
+echo "guard: takeover.sh in the repository finds ../extension/guard.sh"
+r=$(device repo "$PW5_SN" 5.13.6)
+rm "$r/mnt/us/extensions/aristotle/guard.sh"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh "$DEVICE/app/takeover.sh" start > "$r.out" 2>&1
+check "exit status 1" "[ $? = 1 ]"
+check "says why" "grep -q 'not a Paperwhite 4 or Oasis 2' $r.out"
+check "stock GUI not stopped" "! called $r 'stop -n lab126_gui'"
+echo "guard: ARISTOTLE_FORCE=1 overrides"
+r=$(device force "$PW5_SN" 5.16.2)
+ARISTOTLE_FORCE=1 run "$r" agent/install.sh
+check "exit status 0" "[ $? = 0 ]"
+check "job file installed" "[ -f $r/etc/upstart/aristotle-agent.conf ]"
+
+# installed NAME: a PW4 with the agent installed and running, its dropbear
+# up, g_ether loaded, a log and its rotated copy, a scoped Wi-Fi policy, the
+# backup directory an earlier version could leave, and KOReader's authorized_keys holding the agent's key
+# and one of the owner's.
+installed() {
+    r=$(device "$1" "$PW4_SN" 5.13.6)
+    run "$r" agent/install.sh
+    S=$r/var/local/aristotle
+    printf '2026-01-01 00:00:00 agent: boot\n' > "$S/log"
+    printf '2025-12-31 00:00:00 older lines\n' > "$S/log.1"
+    echo scoped > "$S/net-mode"
+    echo example.org > "$S/net-allow"
+    mkdir -p "$r/mnt/us/koreader/settings/SSH" "$r/var/local/aristotle-migrate/20260101T000000Z"
+    printf 'ssh-ed25519 OWNER own\nssh-ed25519 AAAA test\n' > "$r/mnt/us/koreader/settings/SSH/authorized_keys"
+    printf 'ssh-ed25519 AAAA test\n' > "$r/var/local/aristotle-migrate/20260101T000000Z/authorized_keys"
+    printf 'migrated\n' > "$r/var/local/aristotle-migrate/migrate.log"
+    sh -c '
+cleanup() { kill "$child" 2> /dev/null; wait "$child" 2> /dev/null; }
+trap cleanup EXIT
+trap "exit 0" TERM INT
+sleep 300 &
+child=$!
+wait "$child"
+' fake-dropbear > /dev/null 2>&1 &
+    echo $! > "$r/var/run/aristotle-dropbear.pid"
+    echo 'g_ether 40960 0' > "$r/modules"
+    echo "$r"
+}
+
+echo "uninstall removes everything"
+r=$(installed uninstall)
+dropbear=$(cat "$r/var/run/aristotle-dropbear.pid")
+# The extension under its earlier name, as an older install left it.
+mkdir -p "$r/mnt/us/extensions/aristotle-usbnet"
+printf 'ssh-ed25519 AAAA test\n' > "$r/mnt/us/extensions/aristotle-usbnet/authorized_keys"
+run "$r" agent/uninstall.sh
+check "exit status 0" "[ $? = 0 ]"
+check "job file removed" "[ ! -e $r/etc/upstart/aristotle-agent.conf ] && [ \"\$(grep '^mntroot' $r/calls | tail -n 2 | tr '\n' ' ')\" = 'mntroot rw mntroot ro ' ]"
+check "agent stopped" "called $r 'stop aristotle-agent' && ! running $r aristotle-agent"
+check "Wi-Fi policy back to off" "called $r 'iptables -F ARISTOTLE_IN'"
+check "state directory removed, key included" "[ ! -e $r/var/local/aristotle ]"
+check "migration backups removed" "[ ! -e $r/var/local/aristotle-migrate ]"
+check "log saved to the USB drive" "grep -q 'agent: boot' $r/mnt/us/aristotle-agent.log && grep -q 'older lines' $r/mnt/us/aristotle-agent.log && grep -q migrated $r/mnt/us/aristotle-agent.log"
+check "agent key gone from KOReader, the owner's kept" "[ \"\$(cat $r/mnt/us/koreader/settings/SSH/authorized_keys)\" = 'ssh-ed25519 OWNER own' ]"
+check "extension key removed" "[ ! -e $r/mnt/us/extensions/aristotle/authorized_keys ]"
+check "earlier extension's key removed" "[ ! -e $r/mnt/us/extensions/aristotle-usbnet/authorized_keys ]"
+check "dropbear stopped" "! kill -0 $dropbear 2> /dev/null && [ ! -e $r/var/run/aristotle-dropbear.pid ]"
+check "USB back to volumd" "called $r 'lipc-set-prop com.lab126.volumd useUsbForNetwork 0' && called $r 'rmmod g_ether'"
+check "usb0 firewall holes closed" "called $r 'iptables -D INPUT -i usb0 -j ACCEPT' && called $r 'iptables -D OUTPUT -o usb0 -j ACCEPT'"
+check "nothing left in /var/run" "[ -z \"\$(ls $r/var/run)\" ]"
+check "shows it on screen" "called $r 'eips 0 1 aristotle agent removed'"
+cp "$r/mnt/us/aristotle-agent.log" "$r.usb-log"
+run "$r" agent/uninstall.sh
+check "running it again is harmless" "[ $? = 0 ] && cmp -s $r.usb-log $r/mnt/us/aristotle-agent.log"
+
+echo "uninstall: KOReader's keys were only the agent's"
+r=$(installed onlyours)
+printf 'ssh-ed25519 AAAA test\n' > "$r/mnt/us/koreader/settings/SSH/authorized_keys"
+run "$r" agent/uninstall.sh
+check "KOReader's authorized_keys removed" "[ ! -e $r/mnt/us/koreader/settings/SSH/authorized_keys ] && [ ! -e $r/mnt/us/koreader/settings/SSH/authorized_keys.new ]"
+
+echo "uninstall: mntroot rw fails"
+r=$(installed mntroot)
+FAKE_MNTROOT_FAIL=rw run "$r" agent/uninstall.sh
+check "exit status 1" "[ $? = 1 ]"
+check "says the job file stayed" "grep -q 'mntroot failed' $r.out"
+check "state still removed, so the job cannot run" "[ ! -e $r/var/local/aristotle ]"
+
+# boot ROOT [MOUNT_WAIT]: start the installed agent's boot.sh in the
+# background, as upstart would; its pid goes where cleanup finds it.
+boot() {
+    MOUNT_WAIT=${2:-60} AGENT_TEST_ROOT=$1 PATH="$WORK/bin:$PATH" sh "$1/var/local/aristotle/boot.sh" > "$1.boot.out" 2>&1 &
+    echo $! > "$1/jobs/boot.pid"
+}
+
+# wait_for FILE PATTERN: up to 10 s for PATTERN to show up in FILE.
+wait_for() {
+    i=0
+    until grep -q "$2" "$1" 2> /dev/null; do
+        [ $i -ge 50 ] && return 1
+        sleep 0.2
+        i=$((i + 1))
+    done
+}
+
+# A booted device: the agent installed, the userstore mounted.
+booted() {
+    r=$(device "$1" "$PW4_SN" 5.13.6)
+    run "$r" agent/install.sh
+    # Only the upstart stub's stand-in ran; boot() runs the real script.
+    kill "$(cat "$r/jobs/aristotle-agent.pid")" 2> /dev/null
+    printf 'fsp /mnt/us fuse.fsp rw,nosuid,nodev,noatime 0 0\n' > "$r/proc/mounts"
+    printf '/dev/loop/0 %s/mnt/base-us vfat rw 0 0\n' "$r" >> "$r/proc/mounts"
+    : > "$r/calls"
+    echo "$r"
+}
+
+echo "boot: no kill switch, the agent starts"
+r=$(booted boot)
+boot "$r"
+check "USB network and SSH come up" "wait_for $r/calls '^dropbear ' && called $r 'modprobe g_ether'"
+check "with the fixed MACs" "called $r 'modprobe g_ether dev_addr=02:61:72:69:73:01 host_addr=02:61:72:69:73:02'"
+check "mode logged" "grep -q 'mode: net' $r/var/local/aristotle/log"
+kill "$(cat "$r/jobs/boot.pid")" 2> /dev/null
+
+echo "boot: kill switch on the USB drive"
+r=$(booted kill)
+: > "$r/mnt/us/aristotle-disable"
+boot "$r"
+check "says why in the log" "wait_for $r/var/local/aristotle/log 'aristotle-disable exists; not starting'"
+check "USB left to volumd" "called $r 'lipc-set-prop com.lab126.volumd useUsbForNetwork 0'"
+sleep 1
+check "no g_ether, dropbear, firewall or Wi-Fi policy" "! grep -q -e '^modprobe' -e '^rmmod' -e '^dropbear' -e '^iptables' $r/calls"
+check "stays up idle, so upstart does not respawn it" "kill -0 \$(cat $r/jobs/boot.pid)"
+
+echo "boot: the userstore comes late"
+r=$(booted late)
+: > "$r/mnt/us/aristotle-disable"
+: > "$r/proc/mounts"
+boot "$r"
+sleep 1
+check "waits for it" "! grep -q -e '^modprobe' -e '^dropbear' $r/calls"
+printf 'fsp /mnt/us fuse.fsp rw 0 0\n' > "$r/proc/mounts"
+check "then honours the kill switch" "wait_for $r/var/local/aristotle/log 'aristotle-disable exists' && ! called $r 'modprobe'"
+
+echo "boot: the userstore never comes"
+r=$(booted nomount)
+: > "$r/proc/mounts"
+boot "$r" 1
+check "stays idle when the kill switch cannot be checked" "wait_for $r/var/local/aristotle/log 'cannot check kill switch; staying idle' && ! called $r modprobe && ! called $r dropbear && ! called $r iptables"
+check "does not respawn and leaves USB to volumd" "kill -0 \$(cat $r/jobs/boot.pid) && called $r 'lipc-set-prop com.lab126.volumd useUsbForNetwork 0'"
+
+net_once() {
+    sed '/^log "agent: boot /,$d' "$DEVICE/extension/agent/boot.sh" > "$1.net-up.sh"
+    printf 'net_up\n' >> "$1.net-up.sh"
+    AGENT_TEST_ROOT=$1 PATH="$WORK/bin:$PATH" sh "$1.net-up.sh" > "$1.net.out" 2>&1
+}
+
+unmounted_userstore() {
+    r=$(booted "$1")
+    printf 'fsp /mnt/us fuse.fsp rw 0 0\n' > "$r/proc/mounts"
+    echo 'g_mass_storage 40960 0' > "$r/modules"
+    echo "$r"
+}
+
+echo "net transition: restore the backing userstore after export ends"
+r=$(unmounted_userstore remount)
+FAKE_DRIVE_TRANSITION=1 net_once "$r"
+check "waits for drive mode to clear, then restores storage and SSH" "[ $? = 0 ] && [ \"\$(grep -c '^lipc-get-prop com.lab126.volumd driveModeState' $r/calls)\" -ge 2 ] && called $r 'mntus mount' && called $r 'dropbear '"
+unload_line=$(awk '/^rmmod g_mass_storage$/ { print NR; exit }' "$r/calls")
+mount_line=$(awk '/^mntus mount$/ { print NR; exit }' "$r/calls")
+net_line=$(awk '/^modprobe g_ether / { print NR; exit }' "$r/calls")
+check "unload precedes mount, mount precedes networking" "[ '$unload_line' -lt '$mount_line' ] && [ '$mount_line' -lt '$net_line' ]"
+: > "$r/calls"
+net_once "$r"
+check "an already mounted backing store is not mounted again" "[ $? = 0 ] && ! called $r 'mntus '"
+mkdir -p "$r/sys/class/net/usb0"
+echo 0x1003 > "$r/sys/class/net/usb0/flags"
+sed '/^log "agent: boot /,$d' "$DEVICE/extension/agent/boot.sh" > "$r.health.sh"
+printf 'net_healthy\n' >> "$r.health.sh"
+cp "$r/calls" "$r.health.calls"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh "$r.health.sh"
+check "steady-state health check makes no device command calls" "[ $? = 0 ] && cmp -s $r/calls $r.health.calls"
+echo 0x1002 > "$r/sys/class/net/usb0/flags"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh "$r.health.sh"
+check "a down interface requests repair" "[ $? != 0 ]"
+echo 0x1003 > "$r/sys/class/net/usb0/flags"
+health_pid=$(cat "$r/var/local/aristotle/dropbear.pid")
+echo 99999999 > "$r/var/local/aristotle/dropbear.pid"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh "$r.health.sh"
+check "a stale SSH pid requests repair" "[ $? != 0 ]"
+echo "$health_pid" > "$r/var/local/aristotle/dropbear.pid"
+for fault in busy stuck active unknown policy returned-gadget module-state mount-table mount missing-mount; do
+    r=$(unmounted_userstore "remount-$fault")
+    case "$fault" in
+    busy) FAKE_UNLOAD_FAIL=1 net_once "$r" ;;
+    stuck) FAKE_UNLOAD_STUCK=1 net_once "$r" ;;
+    active) FAKE_DRIVE_MODE=1 net_once "$r" ;;
+    unknown) FAKE_VOLUMD_GET_FAIL=1 net_once "$r" ;;
+    policy) FAKE_VOLUMD_SET_FAIL=1 net_once "$r" ;;
+    returned-gadget) FAKE_GADGET_RETURN=1 net_once "$r" ;;
+    module-state) FAKE_LSMOD_FAIL=1 net_once "$r" ;;
+    mount-table) rm "$r/proc/mounts"; net_once "$r" ;;
+    mount) FAKE_MNTUS_FAIL=1 net_once "$r" ;;
+    missing-mount) FAKE_MNTUS_NO_CHANGE=1 net_once "$r" ;;
+    esac
+    check "$fault: failed transition does not start networking" "[ $? = 1 ] && ! called $r 'modprobe g_ether' && ! called $r 'dropbear '"
+    case "$fault" in
+    busy | stuck | active | unknown | policy | returned-gadget | module-state | mount-table)
+        check "$fault: backing store is never mounted during an unsafe export" "! called $r 'mntus '" ;;
+    esac
+done
+
+# persistent ROOT: the files outside the tmpfs (/var/local, /etc) with their
+# checksums.
+persistent() {
+    find "$1/var/local" "$1/etc" -type f | sort | while read -r f; do
+        cksum "$f"
+    done
+}
+
+echo "takeover: the flag is runtime state only"
+r=$(booted takeover)
+cpu="$r/sys/devices/system/cpu/cpu0/cpufreq"
+mkdir -p "$cpu"
+echo performance > "$cpu/scaling_governor"
+echo 'performance ondemand interactive' > "$cpu/scaling_available_governors"
+persistent "$r" > "$r.before"
+run "$r" takeover.sh start
+check "exit status 0" "[ $? = 0 ]"
+check "stock GUI stopped" "called $r 'stop -n lab126_gui'"
+check "flag on the tmpfs" "[ -e $r/var/run/aristotle-takeover ]"
+check "CPU governor switched to ondemand" "[ \"\$(cat $cpu/scaling_governor)\" = ondemand ] && [ \"\$(cat $r/var/run/aristotle-governor)\" = performance ]"
+run "$r" takeover.sh start
+check "repeated takeover preserves the original governor" "[ \"\$(cat $r/var/run/aristotle-governor)\" = performance ]"
+check "nothing persistent written, so a reboot is stock" "persistent $r | cmp -s - $r.before"
+check "aristotlectl sees it" "AGENT_TEST_ROOT=$r sh $r/var/local/aristotle/aristotlectl status 2> /dev/null | grep -q 'takeover: on'"
+run "$r" takeover.sh stop
+check "stop clears it and restarts the stock GUI" "[ ! -e $r/var/run/aristotle-takeover ] && called $r 'start lab126_gui'"
+check "CPU governor restored on exit" "[ \"\$(cat $cpu/scaling_governor)\" = performance ] && [ ! -e $r/var/run/aristotle-governor ]"
+AGENT_TEST_ROOT=$r sh "$r/var/local/aristotle/aristotlectl" takeover on
+check "aristotlectl takeover on: on the tmpfs" "[ -e $r/var/run/aristotle-takeover ] && persistent $r | cmp -s - $r.before"
+AGENT_TEST_ROOT=$r sh "$r/var/local/aristotle/aristotlectl" takeover off
+check "aristotlectl takeover off" "[ ! -e $r/var/run/aristotle-takeover ]"
+
+echo "takeover: a flag an earlier version left on persistent storage"
+r=$(booted oldflag)
+: > "$r/var/local/aristotle/takeover"
+boot "$r"
+check "boot removes it" "wait_for $r/var/local/aristotle/log 'removed a takeover flag' && [ ! -e $r/var/local/aristotle/takeover ]"
+kill "$(cat "$r/jobs/boot.pid")" 2> /dev/null
+: > "$r/var/local/aristotle/takeover"
+run "$r" takeover.sh stop
+check "takeover.sh stop removes it too" "[ ! -e $r/var/local/aristotle/takeover ]"
+
+echo "takeover: without the agent"
+r=$(device noagent "$PW4_SN" 5.13.6)
+run "$r" takeover.sh start
+check "flag on the tmpfs" "[ -e $r/var/run/aristotle-takeover ]"
+check "no agent directory created" "[ ! -e $r/var/local/aristotle ]"
+run "$r" takeover.sh stop
+check "stop clears it" "[ ! -e $r/var/run/aristotle-takeover ]"
+
+echo "takeover: the stock crash-log collector is turned off"
+r=$(booted dmcc)
+persistent "$r" > "$r.before"
+ARISTOTLE_MOUNT=$WORK/bin/mount ARISTOTLE_UMOUNT=$WORK/bin/umount run "$r" takeover.sh start
+check "exit status 0" "[ $? = 0 ]"
+check "collector stubbed out with a bind mount" "grep -Eq '^mount --bind (/usr)?/bin/true $r/usr/bin/dmcc.sh' $r/calls"
+check "marker on the tmpfs" "[ -e $r/var/run/aristotle-dmcc-stub ]"
+ARISTOTLE_MOUNT=$WORK/bin/mount ARISTOTLE_UMOUNT=$WORK/bin/umount run "$r" takeover.sh start
+check "a repeated start stacks no second mount" "[ \"\$(grep -c '^mount --bind' $r/calls)\" = 1 ]"
+ARISTOTLE_DMCC_GRACE=1 ARISTOTLE_MOUNT=$WORK/bin/mount ARISTOTLE_UMOUNT=$WORK/bin/umount run "$r" takeover.sh stop
+check "the stub goes once the framework's start window has passed" "wait_for $r/calls '^umount ' && [ ! -e $r/var/run/aristotle-dmcc-stub ]"
+check "nothing persistent written, so a reboot is stock" "persistent $r | cmp -s - $r.before"
+
+# --- The upstart jobs' own scripts --------------------------------------
+
+# section CONF NAME: the body of a .conf's "pre-start script" or "script"
+# section, as upstart runs it (with sh -e).
+section() {
+    awk -v want="$2" '
+        $0 == want " script" || ($0 == "script" && want == "main") { on = 1; next }
+        on && $0 == "end script" { exit }
+        on { print }' "$DEVICE/extension/agent/$1.conf"
+}
+
+# job ROOT CONF NAME: run that section of an installed job against ROOT.
+job() {
+    section "$2" "$3" > "$1.$2.$3.sh"
+    AGENT_TEST_ROOT=$1 PATH="$WORK/bin:$PATH" sh -e "$1.$2.$3.sh" > "$1.job.out" 2>&1
+}
+
+echo "jobs: the directory check"
+r=$(booted jobs)
+job "$r" aristotle-agent pre-start
+check "agent: root's directory passes" "[ $? = 0 ]"
+chmod 775 "$r/var/local/aristotle"
+job "$r" aristotle-agent pre-start
+check "agent: a group-writable directory is refused" "[ $? != 0 ]"
+check "logged on the USB drive" "grep -q 'agent: .* is not root.s alone (owner [0-9]*, mode 775)' $r/mnt/us/aristotle-refused.log"
+check "and in syslog" "called $r 'logger -t aristotle agent:'"
+job "$r" aristotle-agent main
+check "agent: the main script refuses too" "[ $? != 0 ] && ! called $r 'lipc-set-prop com.lab126.volumd'"
+chmod 2700 "$r/var/local/aristotle"
+job "$r" aristotle-agent pre-start
+check "agent: a setgid bit alone (the framework's chmod g+s) passes" "[ $? = 0 ]"
+chmod g-s "$r/var/local/aristotle"
+mv "$r/var/local/aristotle" "$r/var/local/real"
+ln -s real "$r/var/local/aristotle"
+job "$r" aristotle-agent pre-start
+check "agent: a link in its place is refused" "[ $? != 0 ]"
+rm "$r/var/local/aristotle"
+mv "$r/var/local/real" "$r/var/local/aristotle"
+job "$r" aristotle-ui pre-start
+check "ui: idle without autostart" "[ $? != 0 ]"
+: > "$r/var/local/aristotle/autostart"
+job "$r" aristotle-ui pre-start
+check "ui: starts with autostart" "[ $? = 0 ]"
+cp "$r/proc/sys/kernel/random/boot_id" "$r/var/local/aristotle/ui-booted"
+job "$r" aristotle-ui pre-start
+check "ui: but once per boot" "[ $? != 0 ]"
+: > "$r/var/local/aristotle/ui-request"
+job "$r" aristotle-ui pre-start
+check "ui: started by hand, again" "[ $? = 0 ]"
+rm "$r/var/local/aristotle/ui-request"
+echo other-boot > "$r/var/local/aristotle/ui-booted"
+chmod 750 "$r/var/local/aristotle"
+job "$r" aristotle-ui pre-start
+check "ui: a directory the group can enter is refused" "[ $? != 0 ] && grep -q 'ui: .*mode 750' $r/mnt/us/aristotle-refused.log"
+chmod 700 "$r/var/local/aristotle"
+
+echo "jobs: the OTA block"
+r=$(booted ota)
+job "$r" aristotle-ota main
+check "binds the stub over both daemons" "called $r 'mount --bind ./ota-stub $r/usr/bin/otaupd' && called $r 'mount --bind ./ota-stub $r/usr/bin/otav3'"
+check "read-only" "called $r 'mount -o remount,ro,bind $r/usr/bin/otav3'"
+check "the stub has no write bits" "[ \"\$(stat -c %a $r/var/local/aristotle/ota-stub)\" = 555 ]"
+: > "$r/calls"
+job "$r" aristotle-ota main
+check "once per boot" "[ $? = 0 ] && ! called $r 'mount --bind'"
+r=$(booted otabad)
+chmod 755 "$r/var/local/aristotle"
+job "$r" aristotle-ota main
+check "nothing bound from a directory others can enter" "! called $r 'mount --bind'"
+r=$(booted otanone)
+rm "$r/var/local/aristotle/ota-stub"
+job "$r" aristotle-ota main
+check "nothing without the stub" "[ $? = 0 ] && ! called $r 'mount'"
+
+echo "install: three jobs, one root filesystem window"
+r=$(device install3 "$PW4_SN" 5.13.6)
+mkdir -p "$r/jobs"
+sleep 300 > /dev/null 2>&1 &
+echo $! > "$r/jobs/otav3.pid"
+run "$r" agent/install.sh
+check "exit status 0" "[ $? = 0 ]"
+check "all three job files" "[ -f $r/etc/upstart/aristotle-agent.conf ] && [ -f $r/etc/upstart/aristotle-ui.conf ] && [ -f $r/etc/upstart/aristotle-ota.conf ]"
+check "one mntroot window" "[ \"\$(grep '^mntroot' $r/calls | tr '\n' ' ')\" = 'mntroot rw mntroot ro ' ]"
+check "a running OTA daemon is restarted (to run as the stub)" "called $r 'stop otav3' && called $r 'start otav3' && ! called $r 'stop otaupd'"
+check "the directory's mode is set" "[ \"\$(stat -c %a $r/var/local/aristotle)\" = 700 ]"
+check "dropbear and the host key copied" "[ -x $r/var/local/aristotle/dropbear ] && [ -f $r/var/local/aristotle/ssh/settings/SSH/dropbear_ed25519_host_key ]"
+check "ui-boot.sh, takeover.sh and the guard copied" "[ -f $r/var/local/aristotle/ui-boot.sh ] && [ -f $r/var/local/aristotle/takeover.sh ] && [ -f $r/var/local/aristotle/guard.sh ]"
+check "autostart stays off" "[ ! -e $r/var/local/aristotle/autostart ]"
+: > "$r/calls"
+run "$r" agent/install.sh
+check "again: no root filesystem write" "! called $r mntroot"
+
+echo "install: over a directory others could write"
+r=$(device untrusted "$PW4_SN" 5.13.6)
+S=$r/var/local/aristotle
+mkdir -p "$S/app"
+chmod 775 "$S"
+echo planted > "$S/boot.sh"
+echo planted > "$S/app/aristotle"
+: > "$S/autostart"
+echo scoped > "$S/net-mode"
+echo example.org > "$S/net-allow"
+echo 'old line' > "$S/log"
+ln -s /etc/passwd "$S/usb-mode"
+run "$r" agent/install.sh
+check "exit status 0" "[ $? = 0 ]"
+check "locked" "[ \"\$(stat -c %a $S)\" = 700 ]"
+check "planted files gone or replaced" "[ ! -e $S/app ] && [ ! -e $S/autostart ] && ! grep -q planted $S/boot.sh"
+check "settings and log kept" "grep -q scoped $S/net-mode && grep -q example.org $S/net-allow && grep -q 'old line' $S/log"
+check "a link among them removed" "[ ! -L $S/usb-mode ]"
+
+echo "aristotlectl: the directory check"
+r=$(booted ctl)
+chmod 770 "$r/var/local/aristotle"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh "$r/var/local/aristotle/aristotlectl" mode net > "$r.out" 2>&1
+check "refuses a directory the group can write" "[ $? = 1 ] && grep -q 'not root.s alone' $r.out"
+chmod 700 "$r/var/local/aristotle"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh "$r/var/local/aristotle/aristotlectl" mode storage 5 > "$r.out" 2>&1
+check "works on root's own" "[ $? = 0 ] && grep -q '^storage ' $r/var/local/aristotle/usb-mode"
+
+# --- Aristotle at boot ------------------------------------------------------
+
+# fake_app ROOT: an app in /mnt/us/aristotle that records its runs, exits
+# with $FAKE_RC after $FAKE_SECS seconds, and saves and exits 0 on SIGTERM,
+# as the real one does.
+fake_app() {
+    mkdir -p "$1/mnt/us/aristotle/data"
+    echo 'test release 1' > "$1/mnt/us/aristotle/SOURCE.txt"
+    cat > "$1/mnt/us/aristotle/aristotle" << 'EOF'
+#!/bin/sh
+echo "app $*" >> "$AGENT_TEST_ROOT/calls"
+echo "launcher-capability ${ARISTOTLE_EXIT_ACTIONS:-unset}" >> "$AGENT_TEST_ROOT/calls"
+echo $$ > "$AGENT_TEST_ROOT/jobs/app-$$.pid"
+trap 'echo "app saved" >> "$AGENT_TEST_ROOT/calls"; rm -f "$AGENT_TEST_ROOT/jobs/app-$$.pid"; exit 0' TERM
+i=0
+while [ $i -lt "${FAKE_SECS:-0}" ]; do sleep 1; i=$((i + 1)); done
+exit "${FAKE_RC:-0}"
+EOF
+    chmod 755 "$1/mnt/us/aristotle/aristotle"
+    cp "$DEVICE/app/run-aristotle.sh" "$DEVICE/app/takeover.sh" "$DEVICE/app/open-kual.sh" "$DEVICE/extension/guard.sh" "$1/mnt/us/aristotle/"
+}
+
+# autostarted NAME: a booted device with autostart on.
+autostarted() {
+    r=$(booted "$1")
+    fake_app "$r"
+    run "$r" agent/autostart.sh on
+    : > "$r/calls"
+    echo "$r"
+}
+
+# ui_boot ROOT: the ui job's main script in the background, as upstart
+# would run it; its pid in jobs/aristotle-ui.pid for initctl.
+ui_boot() {
+    section aristotle-ui main > "$1.ui.sh"
+    AGENT_TEST_ROOT=$1 PATH="$WORK/bin:$PATH" sh -e "$1.ui.sh" > "$1.ui.out" 2>&1 &
+    echo $! > "$1/jobs/aristotle-ui.pid"
+}
+
+# done_ui ROOT: wait up to 20 s for the ui job to end.
+done_ui() {
+    i=0
+    while kill -0 "$(cat "$1/jobs/aristotle-ui.pid")" 2> /dev/null; do
+        [ $i -ge 100 ] && return 1
+        sleep 0.2
+        i=$((i + 1))
+    done
+}
+
+echo "autostart: on and off"
+r=$(booted auto)
+run "$r" agent/autostart.sh on
+check "refused without an app" "[ $? = 1 ] && [ ! -e $r/var/local/aristotle/autostart ]"
+fake_app "$r"
+echo 3 > "$r/var/local/aristotle/ui-fails"
+run "$r" agent/autostart.sh on
+check "on: the app copied, the count reset" "[ $? = 0 ] && [ -x $r/var/local/aristotle/app/aristotle ] && [ -d $r/var/local/aristotle/app/data ] && [ \"\$(cat $r/var/local/aristotle/ui-fails)\" = 0 ] && [ -e $r/var/local/aristotle/autostart ]"
+check "no root filesystem write" "! called $r mntroot"
+echo 'test release 2' > "$r/mnt/us/aristotle/SOURCE.txt"
+run "$r" agent/autostart.sh on
+check "update: both release identities kept" "[ $? = 0 ] && grep -q 'release 2' $r/var/local/aristotle/app/SOURCE.txt && grep -q 'release 1' $r/var/local/aristotle/app.previous/SOURCE.txt"
+run "$r" agent/autostart.sh rollback
+check "rollback: previous becomes current" "[ $? = 0 ] && grep -q 'release 1' $r/var/local/aristotle/app/SOURCE.txt && grep -q 'release 2' $r/var/local/aristotle/app.previous/SOURCE.txt"
+FAKE_APP_COPY_FAIL=1 run "$r" agent/autostart.sh on
+check "failed copy: current and previous kept" "[ $? = 1 ] && grep -q 'release 1' $r/var/local/aristotle/app/SOURCE.txt && grep -q 'release 2' $r/var/local/aristotle/app.previous/SOURCE.txt && [ ! -e $r/var/local/aristotle/app.new ]"
+FAKE_APP_MOVE_FAIL=1 run "$r" agent/autostart.sh on
+check "failed activation: current restored" "[ $? = 1 ] && grep -q 'release 1' $r/var/local/aristotle/app/SOURCE.txt && [ ! -e $r/var/local/aristotle/app.new ]"
+check "failed activation: lock removed" "[ ! -e $r/var/run/aristotle-app-update.lock ]"
+FAKE_APP_RETIRE_FAIL=1 run "$r" agent/autostart.sh on
+check "failed old-copy rename: current kept" "[ $? = 1 ] && grep -q 'release 1' $r/var/local/aristotle/app/SOURCE.txt"
+FAKE_APP_MOVE_FAIL=1 FAKE_APP_RESTORE_FAIL=1 run "$r" agent/autostart.sh on
+check "failed restore: both complete copies kept" "[ $? = 1 ] && [ ! -e $r/var/local/aristotle/app ] && grep -q 'release 1' $r/var/local/aristotle/app.previous/SOURCE.txt && grep -q 'release 2' $r/var/local/aristotle/app.new/SOURCE.txt"
+mv "$r/var/local/aristotle/app.previous" "$r/var/local/aristotle/app"
+mkdir "$r/var/run/aristotle-app-update.lock"
+run "$r" agent/autostart.sh on
+check "concurrent update: refused without taking the lock" "[ $? = 1 ] && [ -d $r/var/run/aristotle-app-update.lock ] && grep -q 'release 1' $r/var/local/aristotle/app/SOURCE.txt"
+rmdir "$r/var/run/aristotle-app-update.lock"
+echo $$ > "$r/jobs/aristotle-ui.pid"
+run "$r" agent/autostart.sh on
+check "running boot app: update refused" "[ $? = 1 ] && grep -q 'quit the boot app' $r.out && grep -q 'release 1' $r/var/local/aristotle/app/SOURCE.txt"
+rm "$r/jobs/aristotle-ui.pid"
+run "$r" agent/autostart.sh off
+check "off: marker gone, copy retained" "[ ! -e $r/var/local/aristotle/autostart ] && [ -x $r/var/local/aristotle/app/aristotle ]"
+r=$(device noagent2 "$PW4_SN" 5.13.6)
+fake_app "$r"
+run "$r" agent/autostart.sh on
+check "on: refused without the agent" "[ $? = 1 ] && grep -q 'install the agent first' $r.out"
+
+echo "rollback: failures never discard the selected previous release"
+r=$(autostarted rollbackfaults)
+echo 'test release 2' > "$r/mnt/us/aristotle/SOURCE.txt"
+run "$r" agent/autostart.sh on
+for fault in signal stage retire activate metadata; do
+    case "$fault" in
+    signal) FAKE_APP_SIGNAL=1 run "$r" agent/autostart.sh rollback ;;
+    stage) FAKE_ROLLBACK_STAGE_FAIL=1 run "$r" agent/autostart.sh rollback ;;
+    retire) FAKE_APP_RETIRE_FAIL=1 run "$r" agent/autostart.sh rollback ;;
+    activate) FAKE_APP_MOVE_FAIL=1 run "$r" agent/autostart.sh rollback ;;
+    metadata) FAKE_APP_SOURCE_FAIL=1 run "$r" agent/autostart.sh rollback ;;
+    esac
+    check "$fault: current and previous identities preserved" "[ $? = 1 ] && grep -q 'release 2' $r/var/local/aristotle/app/SOURCE.txt && grep -q 'release 1' $r/var/local/aristotle/app.previous/SOURCE.txt"
+    check "$fault: no rollback staging or update lock left" "[ ! -e $r/var/local/aristotle/app.rollback ] && [ ! -e $r/var/run/aristotle-app-update.lock ]"
+done
+FAKE_APP_MOVE_FAIL=1 FAKE_APP_RESTORE_FAIL=1 run "$r" agent/autostart.sh rollback
+check "failed rollback recovery: both versions retained in distinct directories" "[ $? = 1 ] && [ ! -e $r/var/local/aristotle/app ] && grep -q 'release 2' $r/var/local/aristotle/app.previous/SOURCE.txt && grep -q 'release 1' $r/var/local/aristotle/app.rollback/SOURCE.txt"
+run "$r" agent/autostart.sh rollback
+check "retry recovers both copies before selecting the rollback" "[ $? = 0 ] && grep -q 'release 1' $r/var/local/aristotle/app/SOURCE.txt && grep -q 'release 2' $r/var/local/aristotle/app.previous/SOURCE.txt"
+mv "$r/var/local/aristotle/app.previous" "$r/var/local/aristotle/app.rollback"
+run "$r" agent/autostart.sh rollback
+check "interrupted staging is recovered before a retry" "[ $? = 0 ] && grep -q 'release 2' $r/var/local/aristotle/app/SOURCE.txt && grep -q 'release 1' $r/var/local/aristotle/app.previous/SOURCE.txt"
+
+echo "ui-boot: the kill switch"
+r=$(autostarted uikill)
+printf 'fsp %s/mnt/us fuse.fsp rw 0 0\n' "$r" > "$r/proc/mounts"
+: > "$r/mnt/us/aristotle-disable"
+ui_boot "$r"
+done_ui "$r"
+check "stays on the stock GUI" "! called $r 'stop -n lab126_gui' && ! called $r 'app' && grep -q 'aristotle-disable exists' $r/var/local/aristotle/ui.log"
+check "remembers this boot" "cmp -s $r/proc/sys/kernel/random/boot_id $r/var/local/aristotle/ui-booted"
+
+echo "ui-boot: interrupted app activation"
+r=$(autostarted uiinterrupted)
+printf 'fsp %s/mnt/us fuse.fsp rw 0 0\n' "$r" > "$r/proc/mounts"
+mv "$r/var/local/aristotle/app" "$r/var/local/aristotle/app.previous"
+ui_boot "$r"
+done_ui "$r"
+check "runs the complete previous copy" "called $r app && grep -q 'activation interrupted' $r/var/local/aristotle/ui.log"
+
+echo "ui-boot: cannot check the kill switch"
+r=$(autostarted uiunmounted)
+: > "$r/proc/mounts"
+MOUNT_WAIT=0 ui_boot "$r"
+done_ui "$r"
+check "leaves stock running without touching the app" "! called $r 'stop -n lab126_gui' && ! called $r app && grep -q 'cannot check the kill switch' $r/var/local/aristotle/ui.log"
+
+echo "ui-boot: USB app replaced without refreshing autostart"
+r=$(autostarted uistale)
+printf 'fsp %s/mnt/us fuse.fsp rw 0 0\n' "$r" > "$r/proc/mounts"
+echo 'test release 2' > "$r/mnt/us/aristotle/SOURCE.txt"
+ui_boot "$r"
+done_ui "$r"
+check "stays stock instead of silently launching an older app" "! called $r 'stop -n lab126_gui' && ! called $r app && grep -q 'USB app changed' $r/var/local/aristotle/ui.log"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh "$r/var/local/aristotle/aristotlectl" app status > "$r.out" 2>&1
+check "status shows both release identities and the mismatch" "grep -q 'release 1' $r.out && grep -q 'release 2' $r.out && grep -q 'changed or untracked' $r.out"
+run "$r" agent/autostart.sh on
+run "$r" agent/autostart.sh rollback
+: > "$r/calls"
+ui_boot "$r"
+done_ui "$r"
+check "explicit rollback still launches the selected older app" "called $r app && grep -q 'release 1' $r/var/local/aristotle/app/SOURCE.txt"
+
+echo "ui-boot: app update in progress"
+r=$(autostarted uiupdating)
+printf 'fsp %s/mnt/us fuse.fsp rw 0 0\n' "$r" > "$r/proc/mounts"
+mkdir "$r/var/run/aristotle-app-update.lock"
+ui_boot "$r"
+done_ui "$r"
+check "does not stop stock or launch the app" "! called $r 'stop -n lab126_gui' && ! called $r app"
+
+echo "ui-boot: Aristotle quits"
+r=$(autostarted uiquit)
+printf 'fsp %s/mnt/us fuse.fsp rw 0 0\n' "$r" > "$r/proc/mounts"
+ui_boot "$r"
+done_ui "$r"
+check "takes the screen" "called $r 'stop -n lab126_gui' && called $r 'lipc-set-prop com.lab126.blanket unload splash' && called $r 'lipc-send-event -r 5 com.lab126.hal bootSplashCleanup'"
+check "runs the copy" "called $r app"
+check "then the stock GUI, screensaver back" "called $r 'start lab126_gui' && called $r 'lipc-set-prop com.lab126.blanket load screensaver'"
+check "count 0" "[ \"\$(cat $r/var/local/aristotle/ui-fails)\" = 0 ]"
+check "takeover flag gone" "[ ! -e $r/var/run/aristotle-takeover ]"
+
+echo "ui-boot: crash loop"
+r=$(autostarted uicrash)
+printf 'fsp %s/mnt/us fuse.fsp rw 0 0\n' "$r" > "$r/proc/mounts"
+FAKE_RC=1 ui_boot "$r"
+done_ui "$r"
+check "three launches, then the stock GUI" "[ \"\$(grep -c '^app' $r/calls)\" = 3 ] && called $r 'start lab126_gui'"
+check "count 3" "[ \"\$(cat $r/var/local/aristotle/ui-fails)\" = 3 ]"
+: > "$r/calls"
+echo other-boot > "$r/var/local/aristotle/ui-booted"
+FAKE_RC=1 ui_boot "$r"
+done_ui "$r"
+check "next boot: stays stock, nothing stopped" "! called $r 'stop -n lab126_gui' && ! called $r app && grep -q 'launches failed in a row' $r/var/local/aristotle/ui.log"
+run "$r" agent/autostart.sh on
+check "autostart on again resets it" "[ \"\$(cat $r/var/local/aristotle/ui-fails)\" = 0 ]"
+
+echo "ui-boot: a launch that stays up is a good one"
+r=$(autostarted uihealthy)
+printf 'fsp %s/mnt/us fuse.fsp rw 0 0\n' "$r" > "$r/proc/mounts"
+echo 1 > "$r/var/local/aristotle/ui-fails"
+HEALTHY_AFTER=1 FAKE_SECS=3 FAKE_RC=1 ui_boot "$r"
+sleep 2
+check "count back to 0 while it runs" "[ \"\$(cat $r/var/local/aristotle/ui-fails)\" = 0 ]"
+kill "$(cat "$r/jobs/aristotle-ui.pid")" 2> /dev/null
+done_ui "$r"
+
+echo "aristotlectl app stop and start"
+r=$(autostarted uistop)
+printf 'fsp %s/mnt/us fuse.fsp rw 0 0\n' "$r" > "$r/proc/mounts"
+FAKE_SECS=60 ui_boot "$r"
+i=0
+until [ -s "$r/var/local/aristotle/app.pid" ] || [ $i -ge 50 ]; do sleep 0.2; i=$((i + 1)); done
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh "$r/var/local/aristotle/aristotlectl" app status > "$r.out" 2>&1
+check "status: running" "grep -q 'running: yes' $r.out && grep -q 'autostart: on' $r.out"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh "$r/var/local/aristotle/aristotlectl" app stop > "$r.out" 2>&1
+check "stop: the app saved and the job ended" "[ $? = 0 ] && called $r 'app saved' && ! kill -0 \$(cat $r/jobs/aristotle-ui.pid) 2> /dev/null"
+check "not counted as a crash" "[ \"\$(cat $r/var/local/aristotle/ui-fails)\" = 0 ]"
+check "the stock GUI back" "called $r 'start lab126_gui'"
+: > "$r/calls"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh "$r/var/local/aristotle/aristotlectl" app start > "$r.out" 2>&1
+check "start: asks upstart, once this boot is over" "[ $? = 0 ] && called $r 'start aristotle-ui' && [ -e $r/var/local/aristotle/ui-request ]"
+job "$r" aristotle-ui pre-start
+check "and the job may run again in this boot" "[ $? = 0 ]"
+FAKE_SECS=60 ui_boot "$r"
+i=0
+until [ -s "$r/var/local/aristotle/app.pid" ] || [ $i -ge 50 ]; do sleep 0.2; i=$((i + 1)); done
+check "the request is used up" "[ ! -e $r/var/local/aristotle/ui-request ]"
+: > "$r/calls"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh "$r/var/local/aristotle/aristotlectl" app stop --keep-takeover > "$r.out" 2>&1
+check "stop --keep-takeover: the stock GUI stays down" "[ $? = 0 ] && called $r 'app saved' && ! called $r 'start lab126_gui' && [ -e $r/var/run/aristotle-takeover ]"
+
+echo "run-aristotle.sh stops Aristotle started at boot"
+r=$(autostarted uirun)
+printf 'fsp %s/mnt/us fuse.fsp rw 0 0\n' "$r" > "$r/proc/mounts"
+FAKE_SECS=60 ui_boot "$r"
+i=0
+until [ -s "$r/var/local/aristotle/app.pid" ] || [ $i -ge 50 ]; do sleep 0.2; i=$((i + 1)); done
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" ARISTOTLE_LOG=$r/app.log sh "$r/mnt/us/aristotle/run-aristotle.sh" > "$r.out" 2>&1
+check "the boot one saved first, not counted" "called $r 'app saved' && [ \"\$(cat $r/var/local/aristotle/ui-fails)\" = 0 ]"
+check "then its own run, then the stock GUI" "[ \"\$(grep -c '^app' $r/calls)\" = 3 ] && called $r 'start lab126_gui'"
+check "the stock GUI was not started in between" "[ \"\$(grep -c '^start lab126_gui' $r/calls)\" = 1 ]"
+
+echo "KUAL handoff: unavailable or unready booklet"
+r=$(booted kualmissing)
+KUAL_WAIT=1 run "$r" open-kual.sh
+check "missing booklet: no launch request" "[ $? = 1 ] && ! called $r 'lipc-set-prop com.lab126.appmgrd start'"
+mkdir -p "$r/opt/amazon/ebook/booklet"
+: > "$r/opt/amazon/ebook/booklet/KUALBooklet.jar"
+KUAL_WAIT=1 run "$r" open-kual.sh
+check "framework not ready: bounded fallback to stock" "[ $? = 1 ] && ! called $r 'lipc-set-prop com.lab126.appmgrd start'"
+: > "$r/framework-ready"
+FAKE_ACTIVE_APP_PID=0 KUAL_WAIT=1 run "$r" open-kual.sh
+check "no active stock app yet: no premature launch" "[ $? = 1 ] && ! called $r 'lipc-set-prop com.lab126.appmgrd start'"
+FAKE_KUAL_START_FAIL=1 KUAL_WAIT=1 run "$r" open-kual.sh
+check "app manager rejects launch: bounded failure" "[ $? = 1 ] && grep -q 'Kindle interface stays active' $r.out"
+t0=$(date +%s)
+FAKE_LIPC_HANG=1 KUAL_WAIT=1 run "$r" open-kual.sh
+check "hung LIPC command is killed within the budget" "[ $? = 1 ] && [ \$((\$(date +%s) - t0)) -le 3 ]"
+KUAL_WAIT=not-a-number run "$r" open-kual.sh
+check "invalid wait budget is rejected" "[ $? = 1 ] && grep -q 'invalid KUAL wait budget' $r.out"
+
+echo "KUAL handoff: confirm the active application, not request acceptance"
+: > "$r/calls"
+echo com.mobileread.ixtab.kindlelauncher > "$r/active-app"
+FAKE_ACTIVE_APP_PID=99999999 KUAL_WAIT=1 run "$r" open-kual.sh
+check "stale PID never confirms KUAL or sends a premature request" "[ $? = 1 ] && ! called $r 'lipc-set-prop com.lab126.appmgrd start' && ! grep -q 'KUAL launch confirmed' $r.out"
+echo com.lab126.booklet.home > "$r/active-app"
+FAKE_APP_ID_FAIL=1 KUAL_WAIT=1 run "$r" open-kual.sh
+check "unavailable active-app identity does not launch blindly" "[ $? = 1 ] && ! called $r 'lipc-set-prop com.lab126.appmgrd start'"
+FAKE_KUAL_IGNORE_ALWAYS=1 KUAL_WAIT=1 run "$r" open-kual.sh
+check "accepted but ignored request is not reported as success" "[ $? = 1 ] && ! grep -q 'KUAL launch confirmed' $r.out"
+rm -f "$r/kual-requests"
+: > "$r/calls"
+FAKE_KUAL_DELAY_POLLS=2 KUAL_WAIT=5 run "$r" open-kual.sh
+check "delayed activation is confirmed without duplicate pending requests" "[ $? = 0 ] && grep -q 'KUAL launch confirmed' $r.out && [ \"\$(cat $r/kual-requests)\" = 1 ]"
+echo com.lab126.booklet.home > "$r/active-app"
+rm "$r/kual-requests"
+FAKE_KUAL_IGNORE_FIRST=1 KUAL_WAIT=8 run "$r" open-kual.sh
+check "cold-start ignored request is retried and confirmed" "[ $? = 0 ] && grep -q 'KUAL launch confirmed' $r.out && [ \"\$(cat $r/kual-requests)\" = 2 ]"
+: > "$r/calls"
+KUAL_WAIT=1 run "$r" open-kual.sh
+check "already active KUAL succeeds without relaunch" "[ $? = 0 ] && grep -q 'KUAL launch confirmed' $r.out && ! called $r 'lipc-set-prop com.lab126.appmgrd start'"
+
+echo "KUAL handoff: manual runner"
+r=$(booted kualmanual)
+fake_app "$r"
+mkdir -p "$r/opt/amazon/ebook/booklet"
+: > "$r/opt/amazon/ebook/booklet/KUALBooklet.jar"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" FAKE_RC=20 FAKE_KUAL_READY=1 KUAL_WAIT=5 \
+    ARISTOTLE_LOG=$r/app.log sh "$r/mnt/us/aristotle/run-aristotle.sh" > "$r.out" 2>&1
+check "KUAL request is a successful exit" "[ $? = 0 ]"
+check "manual runner observes KUAL becoming active" "grep -q 'KUAL launch confirmed' $r/app.log"
+stock_line=$(awk '/^start lab126_gui$/ {print NR; exit}' "$r/calls")
+kual_line=$(awk '/^lipc-set-prop com.lab126.appmgrd start app:\/\/com.mobileread.ixtab.kindlelauncher$/ {print NR; exit}' "$r/calls")
+check "stock restored before KUAL launch" "[ -n '$stock_line' ] && [ -n '$kual_line' ] && [ '$stock_line' -lt '$kual_line' ]"
+rm "$r/mnt/us/aristotle/open-kual.sh"
+: > "$r/calls"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" ARISTOTLE_LOG=$r/app.log \
+    sh "$r/mnt/us/aristotle/run-aristotle.sh" > "$r.out" 2>&1
+check "missing helper is not advertised to the app" "[ $? = 0 ] && called $r 'launcher-capability 0'"
+
+echo "KUAL handoff: boot runner"
+r=$(autostarted kualboot)
+printf 'fsp %s/mnt/us fuse.fsp rw 0 0\n' "$r" > "$r/proc/mounts"
+mkdir -p "$r/opt/amazon/ebook/booklet"
+: > "$r/opt/amazon/ebook/booklet/KUALBooklet.jar"
+FAKE_RC=20 FAKE_KUAL_READY=1 KUAL_WAIT=5 ui_boot "$r"
+done_ui "$r"
+check "one clean launch, no crash retry" "[ \"\$(grep -c '^app' $r/calls)\" = 1 ] && [ \"\$(cat $r/var/local/aristotle/ui-fails)\" = 0 ]"
+check "boot runner observes KUAL becoming active" "grep -q 'KUAL launch confirmed' $r/var/local/aristotle/ui.log"
+stock_line=$(awk '/^start lab126_gui$/ {print NR; exit}' "$r/calls")
+kual_line=$(awk '/^lipc-set-prop com.lab126.appmgrd start app:\/\/com.mobileread.ixtab.kindlelauncher$/ {print NR; exit}' "$r/calls")
+check "boot runner restores stock before KUAL" "[ -n '$stock_line' ] && [ -n '$kual_line' ] && [ '$stock_line' -lt '$kual_line' ]"
+
+# --- KUAL items -------------------------------------------------------------
+
+# No fake app may still run: the KUAL item looks for one by name.
+cleanup
+sleep 1
+
+echo "KUAL: Start Aristotle detaches"
+r=$(device kual "$PW4_SN" 5.13.6)
+fake_app "$r"
+# The launcher leaves a mark with its session id.
+cat > "$r/mnt/us/aristotle/run-aristotle.sh" << 'EOF'
+#!/bin/sh
+ps -o sid= -p $$ > "$AGENT_TEST_ROOT/launcher-sid"
+echo "log=$ARISTOTLE_LOG" >> "$AGENT_TEST_ROOT/launcher-sid"
+sleep 2
+echo finished >> "$AGENT_TEST_ROOT/launcher-sid"
+EOF
+t0=$(date +%s)
+run "$r" bin/aristotle-start.sh
+check "returns at once" "[ $? = 0 ] && [ \$((\$(date +%s) - $t0)) -lt 2 ]"
+wait_for "$r/launcher-sid" log=
+check "in a session of its own" "[ \"\$(head -n 1 $r/launcher-sid | tr -d ' ')\" != \"\$(ps -o sid= -p \$\$ | tr -d ' ')\" ]"
+check "log on the USB drive" "grep -q 'log=$r/mnt/us/.aristotle/app.log' $r/launcher-sid"
+wait_for "$r/launcher-sid" finished
+check "outlives its caller" "grep -q finished $r/launcher-sid"
+
+# tap ROOT N: one KUAL tap. Backgrounded by the caller when it should run
+# beside another one.
+tap() {
+    AGENT_TEST_ROOT=$1 FAKE_SECS=${FAKE_SECS:-4} PATH="$WORK/bin:$PATH" \
+        sh "$1/mnt/us/extensions/aristotle/bin/aristotle-start.sh" > "$1.tap$2.out" 2>&1
+}
+
+echo "KUAL: three taps start one instance"
+r=$(device kual3 "$PW4_SN" 5.13.6)
+fake_app "$r"
+tap "$r" 1 &
+tap "$r" 2 &
+tap "$r" 3 &
+wait
+check "the app runs once and the stock GUI comes back once" "wait_for $r/calls '^start lab126_gui' && [ \"\$(grep -c '^app ' $r/calls)\" = 1 ] && [ \"\$(grep -c '^start lab126_gui' $r/calls)\" = 1 ]"
+check "one takeover, so the stock GUI is stopped once" "[ \"\$(grep -c '^stop -n lab126_gui' $r/calls)\" = 1 ]"
+check "only one tap starts a launch" "[ \"\$(cat $r.tap*.out | grep -c 'Starting Aristotle')\" = 1 ]"
+i=0
+while [ -e "$r/var/tmp/aristotle-launch.lock" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+check "the lock is released when the app has gone" "[ ! -e $r/var/tmp/aristotle-launch.lock ]"
+
+echo "KUAL: a lock left by a launch that died is taken over"
+r=$(device kualstale "$PW4_SN" 5.13.6)
+fake_app "$r"
+mkdir -p "$r/var/tmp/aristotle-launch.lock"
+echo 99999999 > "$r/var/tmp/aristotle-launch.lock/pid"
+echo $(( $(date +%s) - 60 )) > "$r/var/tmp/aristotle-launch.lock/created"
+FAKE_SECS=2 tap "$r" 1
+check "starts anyway" "wait_for $r/calls '^app '"
+
+echo "KUAL: a launch that is still taking the lock is respected"
+r=$(device kualhandoff "$PW4_SN" 5.13.6)
+fake_app "$r"
+mkdir -p "$r/var/tmp/aristotle-launch.lock"
+date +%s > "$r/var/tmp/aristotle-launch.lock/created"
+tap "$r" 1
+sleep 2
+check "no second instance before the runner owns the lock" "! called $r 'app' && grep -q 'aristotle: already starting' $r.tap1.out"
+
+echo "run-aristotle: a refused takeover leaves the stock GUI alone"
+r=$(device refuserun "$PW4_SN" 5.16.2)
+fake_app "$r"
+AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" ARISTOTLE_LOG=$r/app.log \
+    sh "$r/mnt/us/aristotle/run-aristotle.sh" > "$r.out" 2>&1
+check "exit status 1" "[ $? = 1 ]"
+check "the app is not started" "! called $r 'app'"
+check "the stock GUI is not restarted" "! called $r 'start lab126_gui'"
+check "the log says the takeover was refused" "grep -q '=== takeover refused' $r/app.log"
+
+echo "KUAL: Return to the Kindle interface"
+r=$(autostarted kualstop)
+printf 'fsp %s/mnt/us fuse.fsp rw 0 0\n' "$r" > "$r/proc/mounts"
+FAKE_SECS=60 ui_boot "$r"
+i=0
+until [ -s "$r/var/local/aristotle/app.pid" ] || [ $i -ge 50 ]; do sleep 0.2; i=$((i + 1)); done
+run "$r" bin/aristotle-stop.sh
+check "stops Aristotle started at boot, the stock GUI back" "called $r 'app saved' && called $r 'start lab126_gui' && [ \"\$(cat $r/var/local/aristotle/ui-fails)\" = 0 ]"
+
+echo "uninstall: Aristotle at boot and the OTA block"
+r=$(autostarted uninst)
+job "$r" aristotle-ota main
+sleep 300 > /dev/null 2>&1 &
+echo $! > "$r/jobs/otav3.pid"
+: > "$r/calls"
+run "$r" agent/uninstall.sh
+check "exit status 0" "[ $? = 0 ]"
+check "all three job files removed, one window" "[ -z \"\$(ls $r/etc/upstart)\" ] && [ \"\$(grep '^mntroot' $r/calls | tr '\n' ' ')\" = 'mntroot rw mntroot ro ' ]"
+check "stubs unmounted" "called $r 'umount $r/usr/bin/otav3' && called $r 'umount $r/usr/bin/otaupd'"
+check "the running daemon restarted for real" "called $r 'stop otav3' && called $r 'start otav3'"
+check "state and app copy gone" "[ ! -e $r/var/local/aristotle ]"
+
+if [ $failures = 0 ]; then
+    echo "agent: all checks passed"
+else
+    echo "agent: $failures checks failed (output in $WORK)"
+    exit 1
+fi

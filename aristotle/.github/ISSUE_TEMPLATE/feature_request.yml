@@ -1,0 +1,16 @@
+name: Feature request
+description: Something Aristotle should do but does not.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What do you want to do?
+      description: The situation, and what gets in the way today on Aristotle or the stock UI.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How could it work?
+      description: Optional. Aristotle works offline, and each screen change costs an e-ink refresh.

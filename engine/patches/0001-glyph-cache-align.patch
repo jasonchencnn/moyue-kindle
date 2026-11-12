@@ -1,0 +1,43 @@
+From: Leader <leader@readest.org>
+Subject: [PATCH 1/2] lvfntman: align glyph cache allocation to alignof(LVFontGlyphCacheItem)
+
+On 32-bit musl Linux (armv7-unknown-linux-musleabihf), standard malloc only
+guarantees 8-byte alignment. However, LVFontGlyphCacheItem contains member
+'bmp' with alignas(16), so the structure requires 16-byte alignment.
+Clang on ARM generates 16-byte aligned NEON store instructions (e.g.
+`vst1.64 {d16-d17}, [r2 :128]`). When malloc returns an 8-byte aligned address
+that is not 16-byte aligned, executing this instruction triggers a SIGBUS crash.
+
+This patch replaces malloc with posix_memalign using alignof(LVFontGlyphCacheItem),
+guaranteeing 16-byte alignment on 32-bit musl.
+
+diff --git a/crengine/include/lvfntman.h b/crengine/include/lvfntman.h
+index 86e449f..e2acf67 100644
+--- a/crengine/include/lvfntman.h
++++ b/crengine/include/lvfntman.h
+@@ -153,8 +153,10 @@ struct LVFontGlyphCacheItem
+     static LVFontGlyphCacheItem * newItem( LVFontLocalGlyphCache * local_cache, lChar32 ch, int w, int h, int pitch = 0, lUInt8 pixfmt = 1 )
+     {
+         if (!pitch) pitch = w * pixfmt;
+-        LVFontGlyphCacheItem * item = (LVFontGlyphCacheItem *)malloc( offsetof(LVFontGlyphCacheItem, bmp)
+-                                                                        + (pitch * h) );
++        void * mem = NULL;
++        if (posix_memalign(&mem, alignof(LVFontGlyphCacheItem), offsetof(LVFontGlyphCacheItem, bmp) + (pitch * h)) != 0)
++            mem = NULL;
++        LVFontGlyphCacheItem * item = (LVFontGlyphCacheItem *)mem;
+ 	if (item) {
+ 	    item->data.ch = ch;
+ 	    item->bmp_width = (lUInt16)w;
+@@ -176,8 +178,10 @@ struct LVFontGlyphCacheItem
+     static LVFontGlyphCacheItem *newItem(LVFontLocalGlyphCache* local_cache, lUInt32 glyph_index, int w, int h, int pitch = 0, lUInt8 pixfmt = 1)
+     {
+         if (!pitch) pitch = w * pixfmt;
+-        LVFontGlyphCacheItem * item = (LVFontGlyphCacheItem *)malloc( offsetof(LVFontGlyphCacheItem, bmp)
+-                                                                        + (pitch * h) );
++        void * mem = NULL;
++        if (posix_memalign(&mem, alignof(LVFontGlyphCacheItem), offsetof(LVFontGlyphCacheItem, bmp) + (pitch * h)) != 0)
++            mem = NULL;
++        LVFontGlyphCacheItem * item = (LVFontGlyphCacheItem *)mem;
+         if (item) {
+             item->data.gindex = glyph_index;
+             item->bmp_width = (lUInt16) w;

@@ -1,0 +1,54 @@
+[package]
+name = "aristotle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Aristotle's reader app for the PW4: library, Plato-rendered pages, menu, progress"
+# Links Plato's C libraries, so not a default member of the workspace.
+# Build with tools/build-render.sh.
+
+[[bin]]
+name = "aristotle"
+path = "src/main.rs"
+
+[features]
+default = []
+# HTTPS for progress sync and catalogs (aristotle-net's rustls and ring).
+# tools/build-render.sh turns it on for the device bundle.
+tls = ["aristotle-net/tls"]
+# Lay EPUBs out with crengine-ng instead of Plato's engine. The renderer
+# crate links the readest engine, which brings crengine-ng's sources along.
+crengine = ["aristotle-render/crengine"]
+
+[dependencies]
+aristotle-hal = { path = "../aristotle-hal" }
+aristotle-i18n = { path = "../aristotle-i18n" }
+aristotle-library = { path = "../aristotle-library" }
+aristotle-net = { path = "../aristotle-net" }
+aristotle-render = { path = "../aristotle-render" }
+aristotle-screen = { path = "../aristotle-screen" }
+# Neither the embedded UI font (the app maps Literata from the renderer's
+# data directory) nor the preview binary and its PNG encoder.
+aristotle-ui = { path = "../aristotle-ui", default-features = false }
+inkread-core = { path = "../../../core" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Page snapshots (src/snapshot.rs). Same version and features as zip's, so
+# it adds no new C build.
+zstd = { version = "0.14", default-features = false }
+# Same versions as plato-core: dictzip chunks and Unicode folding for the
+# dictionary.
+flate2 = "1.1.5"
+unicode-normalization = "0.1.25"
+# PNGs of the host preview (`--preview`); plato-core links the same version.
+png = "0.18"
+
+[dev-dependencies]
+# Same version as plato-core; the export test runs a clippings parser's regexes.
+regex = "1.12.2"
+# As aristotle-render has it: the open test writes a small EPUB.
+zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2"] }
+encoding_rs = "0.8"

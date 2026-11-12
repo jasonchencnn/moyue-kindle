@@ -1,0 +1,370 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Aristotle's Wi-Fi policy (device/README.md, "Network"). Two modes, kept in
+# /var/local/aristotle/net-mode:
+#
+#   off     the default: Aristotle adds no rules; the stock firewall applies.
+#   scoped  on wlan0, outbound traffic only to the hosts listed in
+#           /var/local/aristotle/net-allow (one host[:port][/udp] per line,
+#           port 443 and TCP by default), DNS to the configured resolvers and
+#           DHCP; every other packet on wlan0 is dropped, in and out.
+#
+# The rules live in Aristotle's own chains, ARISTOTLE_IN and ARISTOTLE_OUT,
+# jumped to from INPUT and OUTPUT for wlan0 only. The stock rules and usb0 are
+# never touched, so "off" (removing the chains) is the stock firewall again.
+#
+#   net.sh apply          apply the mode now (aristotlectl net does this)
+#   net.sh tick           from boot.sh: re-apply in scoped mode when the
+#                         address, the resolvers or the allowlist change, and
+#                         every REFRESH_SECS to follow DNS changes
+#   net.sh status         mode, what the hosts resolved to, the chains with
+#                         their packet counters
+#   net.sh allow add|remove ENTRY FEATURE
+#                         add "ENTRY   # aristotle:FEATURE" to net-allow, or
+#                         remove the lines with that entry and that tag
+#                         (lines without the tag stay); aristotlectl net
+#                         allow calls this, then applies in scoped mode
+#
+# Pure pieces, also run by the host-side test (device/tests/net.sh):
+#
+#   net.sh parse          net-allow on stdin -> "HOST PORT PROTO" lines
+#   net.sh resolve        "HOST PORT PROTO" lines on stdin -> "allow IP PORT
+#                         PROTO HOST" lines (getent, else busybox nslookup)
+#   net.sh resolvers      the IPv4 resolvers in /etc/resolv.conf -> "dns IP"
+#   net.sh rules MODE     "dns IP" and "allow IP PORT PROTO" lines on stdin ->
+#                         the iptables commands for MODE, one per line
+set -u
+# Words from net-allow are split, never globbed.
+set -f
+
+R=${AGENT_TEST_ROOT:-}
+# The agent's directory, through /proc when the agent or aristotlectl runs
+# us (see boot.sh).
+S=${ARISTOTLE_DIR:-$R/var/local/aristotle}
+umask 077
+IF=wlan0
+RESOLV=$R/etc/resolv.conf
+REFRESH_SECS=${REFRESH_SECS:-900}
+IN=ARISTOTLE_IN
+OUT=ARISTOTLE_OUT
+LOCK=$S/net-policy.lock
+
+log() {
+    printf '%s net: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$S/log"
+}
+
+mode() {
+    case "$(cat "$S/net-mode" 2> /dev/null)" in
+    scoped) echo scoped ;;
+    *) echo off ;;
+    esac
+}
+
+is_ipv4() {
+    echo "$1" | awk -F. 'NF != 4 { exit 1 }
+        { for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]+$/ || $i > 255) exit 1 }'
+}
+
+# net-allow -> "HOST PORT PROTO". Bad lines go to stderr and are skipped.
+parse() {
+    while read -r line || [ -n "$line" ]; do
+        line=${line%%#*}
+        set -- $line
+        [ $# = 0 ] && continue
+        entry=$1
+        proto=tcp
+        case "$entry" in
+        */udp) proto=udp entry=${entry%/udp} ;;
+        */tcp) entry=${entry%/tcp} ;;
+        esac
+        host=${entry%%:*}
+        port=443
+        [ "$host" != "$entry" ] && port=${entry#*:}
+        case "$host" in
+        '' | -* | *[!A-Za-z0-9.-]*)
+            echo "net-allow: bad host in '$1'" >&2
+            continue
+            ;;
+        esac
+        case "$port" in
+        '' | *[!0-9]*)
+            echo "net-allow: bad port in '$1'" >&2
+            continue
+            ;;
+        esac
+        if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            echo "net-allow: bad port in '$1'" >&2
+            continue
+        fi
+        echo "$host $port $proto"
+    done
+}
+
+# One host -> its IPv4 addresses, one per line.
+lookup() {
+    if is_ipv4 "$1"; then
+        echo "$1"
+    elif command -v getent > /dev/null; then
+        getent ahostsv4 "$1" | awk '{ print $1 }'
+    else
+        nslookup "$1" 2> /dev/null | awk '/^Name:/ { name = 1; next }
+            name && /^Address/ { for (i = 2; i <= NF; i++) if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i }'
+    fi | while read -r ip; do
+        is_ipv4 "$ip" && echo "$ip"
+    done | sort -u
+}
+
+resolve() {
+    while read -r host port proto; do
+        ips=$(lookup "$host")
+        [ -n "$ips" ] || { echo "net: $host did not resolve" >&2; continue; }
+        for ip in $ips; do
+            echo "allow $ip $port $proto $host"
+        done
+    done
+}
+
+# The resolvers in resolv.conf, as "dns IP". A local stub (127.x) is not on
+# wlan0 and needs no rule.
+resolvers() {
+    awk '$1 == "nameserver" { print $2 }' "$RESOLV" 2> /dev/null | while read -r ip; do
+        is_ipv4 "$ip" || continue
+        case "$ip" in 127.*) continue ;; esac
+        echo "dns $ip"
+    done | awk '!seen[$0]++'
+}
+
+# teardown CHAIN HOOK -i|-o: commands that remove CHAIN and every jump to it
+# from HOOK; they may fail harmlessly.
+teardown() {
+    echo "while iptables -D $2 $3 $IF -j $1 2> /dev/null; do :; done"
+    echo "iptables -F $1 2> /dev/null || true"
+    echo "iptables -X $1 2> /dev/null || true"
+}
+
+# Input: "dns IP" and "allow IP PORT PROTO [HOST]" lines. Output: commands
+# for `sh -e`.
+rules() {
+    input=$(cat)
+    echo "# Aristotle network policy: $1 (generated by net.sh)"
+    teardown ${IN}_NEW INPUT -i
+    teardown ${OUT}_NEW OUTPUT -o
+    if [ "$1" = off ]; then
+        teardown $IN INPUT -i
+        teardown $OUT OUTPUT -o
+        return
+    fi
+    # Build the new chains beside the old ones and switch over by inserting
+    # their jumps first: some complete rule set covers wlan0 at every moment.
+    echo "iptables -N ${IN}_NEW"
+    echo "iptables -A ${IN}_NEW -m state --state ESTABLISHED,RELATED -j ACCEPT"
+    echo "iptables -A ${IN}_NEW -p udp --sport 67 --dport 68 -j ACCEPT"
+    echo "iptables -A ${IN}_NEW -j DROP"
+    echo "iptables -N ${OUT}_NEW"
+    echo "iptables -A ${OUT}_NEW -p udp --sport 68 --dport 67 -j ACCEPT"
+    echo "$input" | awk '$1 == "dns" { print $2 }' | sort -u | while read -r ip; do
+        echo "iptables -A ${OUT}_NEW -d $ip -p udp --dport 53 -j ACCEPT"
+        echo "iptables -A ${OUT}_NEW -d $ip -p tcp --dport 53 -j ACCEPT"
+    done
+    echo "$input" | awk '$1 == "allow" { print $2, $3, $4 }' | sort -u | while read -r ip port proto; do
+        echo "iptables -A ${OUT}_NEW -d $ip -p $proto --dport $port -j ACCEPT"
+    done
+    echo "iptables -A ${OUT}_NEW -j DROP"
+    echo "iptables -I INPUT 1 -i $IF -j ${IN}_NEW"
+    echo "iptables -I OUTPUT 1 -o $IF -j ${OUT}_NEW"
+    teardown $IN INPUT -i
+    teardown $OUT OUTPUT -o
+    echo "iptables -E ${IN}_NEW $IN"
+    echo "iptables -E ${OUT}_NEW $OUT"
+}
+
+# Generate and run the rules for MODE from the lines on stdin.
+run_rules() {
+    rules "$1" > "$S/net-rules.sh.new" && mv -f "$S/net-rules.sh.new" "$S/net-rules.sh"
+    sh -e "$S/net-rules.sh" 2>> "$S/log"
+}
+
+# What a DHCP renewal or an edit can change.
+signature() {
+    {
+        cat "$R/proc/sys/kernel/random/boot_id" 2> /dev/null
+        ifconfig $IF 2> /dev/null | grep 'inet addr'
+        resolvers
+        cksum < "$S/net-allow" 2> /dev/null
+    } | cksum
+}
+
+uptime_seconds() {
+    awk '{ sub(/\..*/, "", $1); print $1; exit }' "$R/proc/uptime"
+}
+
+# No kernel IPv6 on the PW4 5.13.x (CONFIG_IPV6 is unset, read from the
+# firmware's kernel config). Should a kernel have it, scoped mode switches
+# IPv6 off on wlan0 rather than leave it unfiltered.
+ipv6() {
+    f=$R/proc/sys/net/ipv6/conf/$IF/disable_ipv6
+    [ -w "$f" ] && echo "$1" > "$f"
+}
+
+apply() {
+    mkdir -p "$S" || return 1
+    apply_locked "${1:-wait}" 9>> "$LOCK"
+}
+
+apply_locked() {
+    # The kernel releases the lock when its last holder exits, even on SIGKILL.
+    if [ "$1" = try ]; then
+        flock -n 9
+    else
+        flock 9
+    fi
+    if [ $? != 0 ]; then
+        log "policy update busy: retry after it finishes"
+        echo "net: policy update busy; retry after it finishes" >&2
+        return 1
+    fi
+    if [ "$(mode)" = off ]; then
+        echo | run_rules off || { log "removing the rules failed"; return 1; }
+        iptables -L INPUT -n > /dev/null 2>> "$S/log" || return 1
+        for chain in "$IN" "$OUT" "${IN}_NEW" "${OUT}_NEW"; do
+            if iptables -L "$chain" -n > /dev/null 2>&1; then
+                log "removing the rules failed: $chain still exists"
+                return 1
+            fi
+        done
+        ipv6 0
+        rm -f "$S/net-resolved" "$S/net-sig" "$S/net-applied" "$S/net-refreshed"
+        log "off: stock firewall"
+        return 0
+    fi
+    ipv6 1
+    # No list is an empty list: only DHCP and DNS.
+    touch "$S/net-allow"
+    applied_signature=$(signature)
+    parse < "$S/net-allow" 2>> "$S/log" > "$S/net-wanted"
+    touch "$S/net-resolved"
+    # Revoke removed entries before DNS, which may be slow or fail.
+    awk 'FILENAME == ARGV[1] { want[$1 " " $2 " " $3] = 1; next }
+        ($5 " " $3 " " $4) in want' \
+        "$S/net-wanted" "$S/net-resolved" > "$S/net-retained"
+    { resolvers; cat "$S/net-retained"; } | run_rules scoped ||
+        { log "scoped: applying rules failed"; return 1; }
+    resolve < "$S/net-wanted" 2>> "$S/log" > "$S/net-resolved.new"
+    # A host that fails to resolve this time (a DNS hiccup) keeps the
+    # addresses it had, so a refresh never cuts off a working server.
+    awk 'FILENAME == ARGV[1] { got[$5 " " $3 " " $4] = 1; print; next }
+        FILENAME == ARGV[2] { want[$1 " " $2 " " $3] = 1; next }
+        ($5 " " $3 " " $4) in want && !(($5 " " $3 " " $4) in got)' \
+        "$S/net-resolved.new" "$S/net-wanted" "$S/net-resolved" > "$S/net-resolved.merged"
+    mv -f "$S/net-resolved.merged" "$S/net-resolved"
+    { resolvers; cat "$S/net-resolved"; } | run_rules scoped ||
+        { log "scoped: applying rules failed"; return 1; }
+    printf '%s\n' "$applied_signature" > "$S/net-sig"
+    uptime_seconds > "$S/net-refreshed"
+    date +%s > "$S/net-applied"
+    log "scoped: $(grep -c . "$S/net-resolved") allowed address(es), resolvers: $(resolvers | awk '{ printf "%s ", $2 }')"
+}
+
+tick() {
+    [ "$(mode)" = scoped ] || return 0
+    last=$(cat "$S/net-refreshed" 2> /dev/null)
+    case "$last" in '' | *[!0-9]*) apply try; return $? ;; esac
+    now=$(uptime_seconds) || return 1
+    if [ "$(signature)" != "$(cat "$S/net-sig" 2> /dev/null)" ] ||
+        [ "$now" -lt "$last" ] || [ $((now - last)) -ge "$REFRESH_SECS" ]; then
+        apply try
+    fi
+}
+
+# allow add|remove ENTRY FEATURE: what the app's settings do when a sync
+# server or a catalog is saved or deleted. Only lines the feature added
+# carry its tag, so removing never touches a line the user wrote. Adding
+# an entry the feature already has changes nothing.
+allow() {
+    action=$1 entry=$2 feature=$3
+    case "$feature" in
+    '' | *[!a-z0-9-]*)
+        echo "net: bad feature '$feature' (a-z, 0-9, -)" >&2
+        return 2
+        ;;
+    esac
+    # One word that parse() takes as it is.
+    case "$entry" in
+    '' | *' '* | *'	'* | *'#'*)
+        echo "net: bad entry '$entry'" >&2
+        return 2
+        ;;
+    esac
+    if [ "$(echo "$entry" | parse 2> /dev/null | grep -c .)" != 1 ]; then
+        echo "net: bad entry '$entry'" >&2
+        return 2
+    fi
+    mkdir -p "$S"
+    touch "$S/net-allow"
+    tag="aristotle:$feature"
+    # Lines whose first word is the entry and whose comment is the tag.
+    tagged() {
+        awk -v e="$entry" -v t="$tag" '{
+            c = ""; i = index($0, "#"); if (i) c = substr($0, i + 1)
+            gsub(/^[ \t]+|[ \t]+$/, "", c)
+            line = $0; if (i) line = substr($0, 1, i - 1)
+            split(line, w, /[ \t]+/); first = w[1]; if (first == "") first = w[2]
+            print ((first == e && c == t) ? "y" : "n") "\t" $0
+        }' "$S/net-allow"
+    }
+    case "$action" in
+    add)
+        if tagged | grep -q '^y'; then
+            echo "$entry is already allowed for $feature"
+            return 0
+        fi
+        # A file without a final newline gets one first.
+        [ -n "$(tail -c 1 "$S/net-allow")" ] && echo >> "$S/net-allow"
+        printf '%-27s # %s\n' "$entry" "$tag" >> "$S/net-allow"
+        echo "allowed $entry for $feature"
+        log "allow: $entry added for $feature"
+        ;;
+    remove)
+        if ! tagged | grep -q '^y'; then
+            echo "$entry was not allowed for $feature"
+            return 0
+        fi
+        tagged | awk -F '\t' '$1 == "n" { sub(/^n\t/, ""); print }' > "$S/net-allow.new" &&
+            mv -f "$S/net-allow.new" "$S/net-allow"
+        echo "removed $entry for $feature"
+        log "allow: $entry removed for $feature"
+        ;;
+    *)
+        echo "usage: net.sh allow add|remove ENTRY FEATURE" >&2
+        return 2
+        ;;
+    esac
+}
+
+status() {
+    echo "mode: $(mode)"
+    if [ "$(mode)" = scoped ]; then
+        echo "applied: $(date -d "@$(cat "$S/net-applied" 2> /dev/null || echo 0)" 2> /dev/null)"
+        echo "allowed:"
+        sed 's/^allow /  /' "$S/net-resolved" 2> /dev/null
+    else
+        return 0
+    fi
+    iptables -L $IN -n -v 2> /dev/null
+    iptables -L $OUT -n -v 2> /dev/null
+}
+
+case "${1:-status}" in
+parse) parse ;;
+resolve) resolve ;;
+resolvers) resolvers ;;
+rules) rules "${2:-off}" ;;
+apply) apply ;;
+tick) tick ;;
+status) status ;;
+allow) allow "${2:-}" "${3:-}" "${4:-}" ;;
+*)
+    sed -n '16,35p' "$0"
+    exit 2
+    ;;
+esac

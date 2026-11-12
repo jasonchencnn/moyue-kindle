@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] lvfntman: allow clearing fallback fonts and support semicolon delimiter
+
+Why this patch is necessary:
+1. Semicolon delimiter support: koreader/crengine hardcoded '|' as delimiter
+   in SetFallbackFontFaces(). Aristotle / inkread-engine and standard crengine
+   use ';' as font face delimiter. Normalizing ';' to '|' allows both.
+2. Clearing fallback fonts on empty string: koreader/crengine prevented
+   clearing _fallbackFontFaces when facesString was empty ("if (!has_valid_face)
+   return false;"). In a multi-book environment, switching to a book without
+   fallback fonts failed to clear the global font manager's fallback font,
+   causing subsequent books to leak fallback glyphs from prior books.
+3. Accurate reporting: GetFallbackFontFaces() now returns the list of
+   actually validated and active fallback font faces joined by ';', rather than
+   the raw unvalidated input string. If no valid fallback faces were found,
+   it correctly returns an empty string.
+---
+ crengine/src/lvfntman.cpp | 34 ++++++++++++++++++++++------------
+ 1 file changed, 22 insertions(+), 12 deletions(-)
+
+diff --git a/crengine/src/lvfntman.cpp b/crengine/src/lvfntman.cpp
+index 3384ef5..123b2b6 100644
+--- a/crengine/src/lvfntman.cpp
++++ b/crengine/src/lvfntman.cpp
+@@ -6261,24 +6261,30 @@ public:
+     virtual bool SetFallbackFontFaces( lString8 facesString ) {
+         FONT_MAN_GUARD
+         if ( facesString != _fallbackFontFacesString ) {
+-            // Multiple fallback font names can be provided, separated by '|'
+-            lString8Collection faces = lString8Collection(facesString, lString8("|"));
++            _fallbackFontFaces.clear();
++            _fallbackFontFacesString.clear();
++            if ( facesString.empty() ) {
++                _instance_cache.forEachFont([](LVFontRef& f) { f->setFallbackFont(LVFontRef()); });
++                gc();
++                clearGlyphCache();
++                return false;
++            }
++            // Multiple fallback font names can be provided, separated by '|' or ';'
++            lString8 normalized = facesString;
++            normalized.replace(';', '|');
++            lString8Collection faces = lString8Collection(normalized, lString8("|"));
+             bool has_valid_face = false;
+             for (int i = 0; i < faces.length(); i++) {
+-                lString8 face = faces[i];
++                lString8 face = faces[i].trim();
++                if ( face.empty() ) continue;
+                 CRLog::trace("Looking for fallback font %s", face.c_str());
+                 if ( !_registry.findFamily(face) ) { // not registered
+                     continue;
+                 }
+-                if ( !has_valid_face ) {
+-                    has_valid_face = true;
+-                    // One valid font: clear previous set of fallback fonts
+-                    _fallbackFontFaces.clear();
+-                }
+                 // Check if duplicate (to avoid fallback font loops)
+                 bool is_duplicate = false;
+-                for ( int i=0; i < _fallbackFontFaces.length(); i++ ) {
+-                    if ( face == _fallbackFontFaces[i] ) {
++                for ( int j=0; j < _fallbackFontFaces.length(); j++ ) {
++                    if ( face == _fallbackFontFaces[j] ) {
+                         is_duplicate = true;
+                         break;
+                     }
+@@ -6287,13 +6293,11 @@ public:
+                     continue;
+                 }
+                 _fallbackFontFaces.add(face);
++                has_valid_face = true;
+             }
+-            if ( !has_valid_face ) {
+-                // Don't clear previous fallbacks and cache if this one has
+-                // not a single found and valid font
+-                return false;
++            if ( has_valid_face ) {
++                _fallbackFontFacesString = facesString;
+             }
+-            _fallbackFontFacesString = facesString;
+             // Somehow, with Fedra Serif (only!), changing the fallback font does
+             // not prevent glyphs from previous fallback font to be re-used...
+             // So let's clear glyphs caches too.
+@@ -6320,7 +6324,15 @@ public:
+     }
+ 
+     /// get fallback font face (returns empty string if no fallback font is set)
+-    virtual lString8 GetFallbackFontFaces() { return _fallbackFontFacesString; }
++    virtual lString8 GetFallbackFontFaces() {
++        if (_fallbackFontFaces.length() == 0) return lString8::empty_str;
++        lString8 res;
++        for (int i = 0; i < _fallbackFontFaces.length(); i++) {
++            if (i > 0) res << ";";
++            res << _fallbackFontFaces[i];
++        }
++        return res;
++    }
+ 
+     /// returns fallback font for specified size
+     virtual LVFontRef GetFallbackFont(int size) {
+-- 

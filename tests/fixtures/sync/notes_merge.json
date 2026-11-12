@@ -1,0 +1,161 @@
+{
+  "contract_version": "v2",
+  "suite": "notes_merge",
+  "description": "DBBookNote 笔记按 id 去重与合并测试用例：涵盖多设备笔记并集、同 id 更新替换、删除墓碑传播及同刻墓碑决胜",
+  "cases": [
+    {
+      "name": "notes_disjoint_ids_union",
+      "description": "两端分别创建了不同 id 的笔记，合并后取两边并集",
+      "table": "book_notes",
+      "input": {
+        "local": [
+          {
+            "user_id": "usr-01",
+            "book_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "id": "ko-note-001",
+            "type": "annotation",
+            "xpointer0": "/body/DocFragment[1]/body/p[2]/text()[1].10",
+            "xpointer1": "/body/DocFragment[1]/body/p[2]/text()[1].25",
+            "text": "给岁月以文明，而不是给文明以岁月",
+            "note": "经典语录",
+            "color": "yellow",
+            "style": "highlight",
+            "created_at": "2026-11-05T08:00:00.000Z",
+            "updated_at": "2026-11-05T08:00:00.000Z",
+            "deleted_at": null
+          }
+        ],
+        "remote": [
+          {
+            "user_id": "usr-01",
+            "book_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "id": "rd-note-002",
+            "type": "bookmark",
+            "cfi": "epubcfi(/6/4!/4/10/1:0)",
+            "xpointer0": "/body/DocFragment[2]/body/h2[1]/text().0",
+            "xpointer1": null,
+            "text": "第二章 面壁者",
+            "note": "",
+            "created_at": "2026-11-05T09:00:00.000Z",
+            "updated_at": "2026-11-05T09:00:00.000Z",
+            "deleted_at": null
+          }
+        ]
+      },
+      "expected": {
+        "total": 2,
+        "ids": ["ko-note-001", "rd-note-002"]
+      }
+    },
+    {
+      "name": "note_same_id_newer_content_replaces_older",
+      "description": "相同 id 的笔记在另一端被修改批注（note: '大刘名言' -> '大刘代表性金句'），updated_at 较新的记录替换旧记录",
+      "table": "book_notes",
+      "input": {
+        "local": [
+          {
+            "user_id": "usr-01",
+            "book_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "id": "ko-note-001",
+            "type": "annotation",
+            "xpointer0": "/body/DocFragment[1]/body/p[2]/text()[1].10",
+            "xpointer1": "/body/DocFragment[1]/body/p[2]/text()[1].25",
+            "text": "给岁月以文明，而不是给文明以岁月",
+            "note": "大刘代表性金句",
+            "color": "yellow",
+            "style": "highlight",
+            "created_at": "2026-11-05T08:00:00.000Z",
+            "updated_at": "2026-11-05T11:00:00.000Z",
+            "deleted_at": null
+          }
+        ],
+        "remote": [
+          {
+            "user_id": "usr-01",
+            "book_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "id": "ko-note-001",
+            "type": "annotation",
+            "xpointer0": "/body/DocFragment[1]/body/p[2]/text()[1].10",
+            "xpointer1": "/body/DocFragment[1]/body/p[2]/text()[1].25",
+            "text": "给岁月以文明，而不是给文明以岁月",
+            "note": "大刘名言",
+            "color": "yellow",
+            "style": "highlight",
+            "created_at": "2026-11-05T08:00:00.000Z",
+            "updated_at": "2026-11-05T09:00:00.000Z",
+            "deleted_at": null
+          }
+        ]
+      },
+      "expected": {
+        "total": 1,
+        "result": [
+          {
+            "user_id": "usr-01",
+            "book_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "id": "ko-note-001",
+            "type": "annotation",
+            "xpointer0": "/body/DocFragment[1]/body/p[2]/text()[1].10",
+            "xpointer1": "/body/DocFragment[1]/body/p[2]/text()[1].25",
+            "text": "给岁月以文明，而不是给文明以岁月",
+            "note": "大刘代表性金句",
+            "color": "yellow",
+            "style": "highlight",
+            "created_at": "2026-11-05T08:00:00.000Z",
+            "updated_at": "2026-11-05T11:00:00.000Z",
+            "deleted_at": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "note_tombstone_propagation_deletes_live_note",
+      "description": "远端删除了该笔记（deleted_at=12:00:00 > 本地 updated_at=10:00:00），本地存活笔记被墓碑覆盖并置为删除状态",
+      "table": "book_notes",
+      "input": {
+        "local": [
+          {
+            "user_id": "usr-01",
+            "book_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "id": "ko-note-001",
+            "type": "annotation",
+            "text": "给岁月以文明",
+            "note": "笔记",
+            "created_at": "2026-11-05T08:00:00.000Z",
+            "updated_at": "2026-11-05T10:00:00.000Z",
+            "deleted_at": null
+          }
+        ],
+        "remote": [
+          {
+            "user_id": "usr-01",
+            "book_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "id": "ko-note-001",
+            "type": "annotation",
+            "text": "给岁月以文明",
+            "note": "笔记",
+            "created_at": "2026-11-05T08:00:00.000Z",
+            "updated_at": "2026-11-05T10:00:00.000Z",
+            "deleted_at": "2026-11-05T12:00:00.000Z"
+          }
+        ]
+      },
+      "expected": {
+        "total": 1,
+        "result": [
+          {
+            "user_id": "usr-01",
+            "book_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "id": "ko-note-001",
+            "type": "annotation",
+            "text": "给岁月以文明",
+            "note": "笔记",
+            "created_at": "2026-11-05T08:00:00.000Z",
+            "updated_at": "2026-11-05T10:00:00.000Z",
+            "deleted_at": "2026-11-05T12:00:00.000Z"
+          }
+        ]
+      }
+    }
+  ]
+}

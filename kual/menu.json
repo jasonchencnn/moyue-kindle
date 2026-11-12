@@ -1,0 +1,15 @@
+{
+  "items": [
+    {
+      "name": "InkRead",
+      "items": [
+        {
+          "name": "Run device probe (writes /mnt/us/inkread-probe.txt)",
+          "action": "sh ./probe.sh",
+          "exitmenu": false,
+          "status": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>墨阅 Kindle · Moyue Kindle</title>
+<meta name="description" content="墨阅 Kindle：跑在越狱 Kindle 上的原生阅读器。Rust + Aristotle + koreader/crengine，兼容 Readest 账号同步。">
+<meta property="og:title" content="墨阅 Kindle · Moyue Kindle">
+<meta property="og:description" content="把吃灰的越狱 Kindle 变成你的个人书城：原生阅读器，中文排版，Readest 同步。">
+<meta property="og:image" content="assets/screenshots/01-home.png">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%23f6f4ee'/><text y='72' x='50' font-size='64' text-anchor='middle' font-family='serif' fill='%23111'>墨</text></svg>">
+<style>
+:root {
+  --paper: #f6f4ee;
+  --ink: #16150f;
+  --muted: #6b675c;
+  --line: #d8d3c6;
+  --accent: #8a2b1f;
+  --card: #fffdf8;
+  --max: 1080px;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Noto Serif SC", "Songti SC", "SimSun", "Source Han Serif SC", Georgia, serif;
+  line-height: 1.75;
+  font-size: 17px;
+}
+a { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(138,43,31,.35); }
+a:hover { border-bottom-color: var(--accent); }
+.wrap { max-width: var(--max); margin: 0 auto; padding: 0 24px; }
+header.site {
+  border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 10;
+  background: rgba(246,244,238,.94);
+  backdrop-filter: blur(6px);
+}
+header.site .bar { display: flex; align-items: center; gap: 18px; padding: 14px 0; }
+.brand { font-size: 20px; font-weight: 700; letter-spacing: .06em; border: 0; color: var(--ink); }
+nav { margin-left: auto; display: flex; gap: 16px; flex-wrap: wrap; }
+nav a { color: var(--muted); border: 0; font-size: 14px; }
+nav a:hover { color: var(--ink); }
+.lang-btn {
+  border: 1px solid var(--line); background: transparent; color: var(--ink);
+  font: inherit; font-size: 13px; padding: 2px 10px; cursor: pointer; border-radius: 2px;
+}
+.lang-btn:hover { border-color: var(--ink); }
+.hero { display: grid; grid-template-columns: 1.15fr .85fr; gap: 48px; align-items: center; padding: 72px 0 56px; }
+.hero h1 { font-size: 58px; line-height: 1.15; margin: 0 0 8px; letter-spacing: .04em; }
+.hero h1 small { display: block; font-size: 17px; letter-spacing: .22em; color: var(--muted); margin-top: 10px; font-weight: 400; }
+.hero .lead { font-size: 20px; margin: 18px 0 26px; color: #2f2d25; }
+.tags { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 26px; }
+.tag { font-size: 12.5px; letter-spacing: .04em; color: var(--muted); border: 1px solid var(--line); padding: 3px 9px; border-radius: 2px; }
+.btn-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.btn { display: inline-block; border: 1px solid var(--ink); padding: 10px 22px; font-size: 15px; letter-spacing: .04em; }
+.btn.primary { background: var(--ink); color: var(--paper); }
+.btn:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
+.hero figure { margin: 0; }
+.hero figure img { width: 100%; border: 1px solid var(--line); box-shadow: 0 18px 40px rgba(22,21,15,.12); }
+section { padding: 56px 0; border-top: 1px solid var(--line); }
+h2 { font-size: 30px; margin: 0 0 6px; letter-spacing: .06em; }
+.sub { color: var(--muted); margin: 0 0 30px; font-size: 15.5px; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+.grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+.card { background: var(--card); border: 1px solid var(--line); padding: 20px 22px; }
+.card h3 { margin: 0 0 6px; font-size: 17.5px; }
+.card p { margin: 0; color: var(--muted); font-size: 14.5px; }
+.gallery { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.gallery figure { margin: 0; }
+.gallery img { width: 100%; border: 1px solid var(--line); display: block; }
+.gallery figcaption { font-size: 13px; color: var(--muted); padding-top: 6px; }
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; }
+ol.steps { margin: 0; padding-left: 22px; }
+ol.steps li { margin-bottom: 10px; }
+pre.code {
+  background: #17150e; color: #eee8da; padding: 18px 20px; overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13.5px;
+  line-height: 1.65; border-radius: 2px;
+}
+.note { border-left: 3px solid var(--accent); padding: 10px 16px; background: #fbf7ef; color: #4a463c; font-size: 15px; }
+footer { border-top: 1px solid var(--line); padding: 36px 0 56px; color: var(--muted); font-size: 13.5px; }
+footer a { color: var(--muted); }
+.small { font-size: 13px; color: var(--muted); }
+.zh-hide, body[data-lang="en"] .zh { display: none; }
+body[data-lang="en"] .en { display: block; }
+.en { display: none; }
+@media (max-width: 860px) {
+  .hero { grid-template-columns: 1fr; gap: 28px; padding: 44px 0 36px; }
+  .hero h1 { font-size: 40px; }
+  .grid-3, .grid-4, .gallery, .split { grid-template-columns: 1fr 1fr; }
+  nav { display: none; }
+}
+@media (max-width: 560px) {
+  .grid-3, .grid-4, .gallery, .split { grid-template-columns: 1fr; }
+  body { font-size: 16px; }
+}
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap bar">
+    <a class="brand" href="#">墨阅 Kindle</a>
+    <nav>
+      <a href="#features" class="zh">功能</a><a href="#features" class="en">Features</a>
+      <a href="#shots" class="zh">截图</a><a href="#shots" class="en">Screenshots</a>
+      <a href="#install" class="zh">安装</a><a href="#install" class="en">Install</a>
+      <a href="#sync" class="zh">同步</a><a href="#sync" class="en">Sync</a>
+      <a href="#build" class="zh">构建</a><a href="#build" class="en">Build</a>
+      <a href="https://github.com/jasonchencnn/moyue-kindle">GitHub</a>
+    </nav>
+    <button class="lang-btn" id="langBtn" onclick="toggleLang()">EN</button>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <div class="hero">
+    <div>
+      <h1 class="zh">墨阅 Kindle<small>MOYUE · KINDLE</small></h1>
+      <h1 class="en">Moyue Kindle<small>墨阅 · KINDLE</small></h1>
+      <p class="lead zh">把吃灰的越狱 Kindle 变成你的个人书城。原生 Rust 阅读器，中文排版，兼容 Readest 账号同步。</p>
+      <p class="lead en">Turn a jailbroken Kindle into your personal library. A native Rust e-reader with CJK typography and Readest sync.</p>
+      <div class="tags">
+        <span class="tag">Rust</span>
+        <span class="tag">Kindle Oasis 2</span>
+        <span class="tag">Aristotle</span>
+        <span class="tag">koreader/crengine</span>
+        <span class="tag">Readest sync</span>
+        <span class="tag">AGPL-3.0</span>
+      </div>
+      <div class="btn-row">
+        <a class="btn primary" href="https://github.com/jasonchencnn/moyue-kindle">GitHub</a>
+        <a class="btn zh" href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/INSTALL.md">安装说明</a>
+        <a class="btn en" href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/INSTALL.md">Install guide</a>
+        <a class="btn zh" href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/BUILD.md">源码构建</a>
+        <a class="btn en" href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/BUILD.md">Build from source</a>
+      </div>
+      <p class="small zh" style="margin-top:18px">预览版 / 实验性软件 · 需已越狱 + KUAL · 非亚马逊官方产品</p>
+      <p class="small en" style="margin-top:18px">Preview / experimental · jailbreak + KUAL required · not affiliated with Amazon</p>
+    </div>
+    <figure>
+      <img src="assets/screenshots/01-home.png" alt="墨阅首页（Kindle Oasis 2 真机截图）">
+    </figure>
+  </div>
+</main>
+
+<section id="features">
+  <div class="wrap">
+    <h2 class="zh">它是什么</h2><h2 class="en">What it is</h2>
+    <p class="sub zh">直接跑在 Kindle 硬件上的原生阅读器。不是浏览器套壳，不经过安卓，不依赖亚马逊服务。</p>
+    <p class="sub en">A native reader running directly on Kindle hardware. No browser shell, no Android, no Amazon services.</p>
+    <div class="grid-3">
+      <div class="card">
+        <h3 class="zh">原生性能</h3><h3 class="en">Native performance</h3>
+        <p class="zh">Rust 编写，单个静态 ARM 可执行文件。启动约 4 秒，翻页提交 4–6 ms。</p>
+        <p class="en">Written in Rust, shipped as one static ARM binary. ~4 s launch, 4–6 ms page-turn submit.</p>
+      </div>
+      <div class="card">
+        <h3 class="zh">KOReader 同源排版</h3><h3 class="en">crengine layout</h3>
+        <p class="zh">EPUB / TXT 使用 KOReader 的 crengine 引擎，中文排版成熟；改字号先排当前页，后台补全书。</p>
+        <p class="en">EPUB/TXT via KOReader's crengine, with mature CJK typography and local reflow on font changes.</p>
+      </div>
+      <div class="card">
+        <h3 class="zh">Readest 同步</h3><h3 class="en">Readest sync</h3>
+        <p class="zh">同一个 Readest 账号：阅读进度、高亮笔记、云端书库。进度用 XPointer，与 KOReader 互通。</p>
+        <p class="en">Same Readest account: progress, highlights, notes and cloud library. XPointer positions, KOReader compatible.</p>
+      </div>
+      <div class="card">
+        <h3 class="zh">为墨水屏设计</h3><h3 class="en">Made for e-ink</h3>
+        <p class="zh">无动画、高对比、局部刷新；实体翻页键和重力旋转都可用；前光跟随原系统。</p>
+        <p class="en">No animations, high contrast, partial refresh; page buttons and rotation; stock frontlight control.</p>
+      </div>
+      <div class="card">
+        <h3 class="zh">中文优先</h3><h3 class="en">Chinese-first</h3>
+        <p class="zh">简体中文界面与内嵌中文字体，支持 GBK/GB18030 TXT、拼音排序与拼音输入。</p>
+        <p class="en">Simplified Chinese UI, bundled CJK font, GBK/GB18030 TXT, pinyin sorting and input.</p>
+      </div>
+      <div class="card">
+        <h3 class="zh">开源、可自建</h3><h3 class="en">Open source</h3>
+        <p class="zh">AGPL-3.0-or-later；同步协议兼容 Readest，服务端地址可配置；代码与构建脚本全部开放。</p>
+        <p class="en">AGPL-3.0-or-later; compatible sync protocol with configurable endpoints; all code and build scripts public.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="shots">
+  <div class="wrap">
+    <h2 class="zh">真机截图</h2><h2 class="en">Screenshots</h2>
+    <p class="sub zh">Kindle Oasis 2 实拍，1264 × 1680，300 ppi。</p>
+    <p class="sub en">Captured on a Kindle Oasis 2, 1264 × 1680, 300 ppi.</p>
+    <div class="gallery">
+      <figure><img src="assets/screenshots/02-reader.png" alt="阅读页"><figcaption class="zh">阅读页 · 中文正文与页脚</figcaption><figcaption class="en">Reader · CJK body text</figcaption></figure>
+      <figure><img src="assets/screenshots/03-reader-menu.png" alt="阅读菜单"><figcaption class="zh">阅读菜单 · 目录、排版、前光</figcaption><figcaption class="en">Reader menu · TOC, typography, frontlight</figcaption></figure>
+      <figure><img src="assets/screenshots/04-library-list.png" alt="书库列表"><figcaption class="zh">书库 · 本地列表</figcaption><figcaption class="en">Library · list view</figcaption></figure>
+      <figure><img src="assets/screenshots/05-library-grid.png" alt="书库网格"><figcaption class="zh">书库 · 网格与封面墙</figcaption><figcaption class="en">Library · grid view</figcaption></figure>
+      <figure><img src="assets/screenshots/06-cloud-library.png" alt="云端书库"><figcaption class="zh">云端书库 · Readest 账号</figcaption><figcaption class="en">Cloud library · Readest account</figcaption></figure>
+      <figure><img src="assets/screenshots/08-calendar.png" alt="阅读日历"><figcaption class="zh">阅读日历与统计</figcaption><figcaption class="en">Reading calendar and stats</figcaption></figure>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2 class="zh">安装</h2><h2 class="en">Install</h2>
+    <p class="sub zh">只支持 Kindle Oasis 2（第 9 代，2017）+ 固件 5.16.x + 已越狱 + KUAL。安装包由源码构建，详见仓库文档。</p>
+    <p class="sub en">Kindle Oasis 2 (9th gen, 2017), firmware 5.16.x, jailbroken with KUAL. Build the package from source.</p>
+    <div class="split">
+      <div>
+        <ol class="steps zh">
+          <li>备份 Kindle 上的 <code>.aristotle/</code>、<code>documents/</code> 与 <code>My Clippings.txt</code>。</li>
+          <li>按 <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/BUILD.md">BUILD.md</a> 构建设备包，得到 <code>aristotle/</code> 与 <code>extensions/</code>。</li>
+          <li>把两个文件夹复制到 Kindle USB 盘根目录，合并覆盖同名文件。</li>
+          <li>安全弹出，打开 KUAL → 墨阅 → 启动墨阅。</li>
+          <li>打开一本书，检查正文、翻页键与触摸；需要时在设置里登录 Readest 账号。</li>
+        </ol>
+        <ol class="steps en">
+          <li>Back up <code>.aristotle/</code>, <code>documents/</code> and <code>My Clippings.txt</code> on the Kindle.</li>
+          <li>Build the device bundle as described in <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/BUILD.md">BUILD.md</a>.</li>
+          <li>Copy <code>aristotle/</code> and <code>extensions/</code> to the Kindle's USB root.</li>
+          <li>Eject safely, then start it from KUAL → 墨阅 → 启动墨阅.</li>
+          <li>Open a book and check reading, page buttons and touch; sign in to Readest in Settings if needed.</li>
+        </ol>
+      </div>
+      <div>
+        <p class="note zh">预览版没有验证过整机救砖路径，请先备份。不要写入启动分区、bootloader 或系统分区；不要在别人的设备上试未经确认的操作。完整步骤、风险与卸载恢复见 <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/INSTALL.md">docs/INSTALL.md</a>。</p>
+        <p class="note en">This preview has no verified full-recovery path. Back up first; never write to boot partitions, the bootloader or the system partition. Full steps and risks: <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/INSTALL.md">docs/INSTALL.md</a>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="sync">
+  <div class="wrap">
+    <h2 class="zh">与手机、电脑同步</h2><h2 class="en">Sync with phone and desktop</h2>
+    <p class="sub zh">实现 Readest 的同步协议，用同一个账号，无需另建服务。</p>
+    <p class="sub en">Implements the Readest sync protocol; one account, no extra server needed.</p>
+    <div class="grid-4">
+      <div class="card"><h3 class="zh">进度</h3><h3 class="en">Progress</h3><p class="zh">XPointer 存档，与 KOReader 互通；拉到更新的进度会先提示再跳转。</p><p class="en">Stored as XPointer, KOReader compatible; newer remote positions prompt before jumping.</p></div>
+      <div class="card"><h3 class="zh">高亮与笔记</h3><h3 class="en">Highlights &amp; notes</h3><p class="zh">按 id 合并、墓碑删除；拉取与推送都支持手动与自动。</p><p class="en">Merged by id with tombstones; manual and automatic pull/push.</p></div>
+      <div class="card"><h3 class="zh">云端书库</h3><h3 class="en">Cloud library</h3><p class="zh">列出 Readest 云端书籍，流式下载、哈希校验后入库。</p><p class="en">List cloud books, download with hash verification.</p></div>
+      <div class="card"><h3 class="zh">登录</h3><h3 class="en">Sign-in</h3><p class="zh">邮箱密码登录，默认走官方认证中转；密码不落日志。</p><p class="en">Email/password via the official auth relay; passwords never logged.</p></div>
+    </div>
+    <p class="small zh" style="margin-top:18px">已知限制：TXT 进度不跨端；同一本书 book_hash 不同时按百分比同步；超长文本节点与 &lt;pre&gt; 首行定位可能偏一页。详见 <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/SYNC.md">docs/SYNC.md</a>。</p>
+    <p class="small en" style="margin-top:18px">Known limits: TXT progress is local-only; different book_hash syncs by percentage; very long text nodes / &lt;pre&gt; first lines may land a page off. See <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/SYNC.md">docs/SYNC.md</a>.</p>
+  </div>
+</section>
+
+<section id="build">
+  <div class="wrap">
+    <h2 class="zh">从源码构建</h2><h2 class="en">Build from source</h2>
+    <p class="sub zh">需要 Rust、Zig 交叉工具链与 CMake。首次构建会下载并编译第三方 C/C++ 库，约 10–20 分钟。</p>
+    <p class="sub en">Requires Rust, Zig cross toolchain and CMake. The first build downloads and compiles the C/C++ stack (10–20 min).</p>
+    <pre class="code">git clone --recursive https://github.com/jasonchencnn/moyue-kindle.git
+cd moyue-kindle
+./scripts/check.sh                    # pure-Rust checks (fmt / clippy / tests)
+
+. aristotle/tools/env.sh              # ARISTOTLE_CACHE + build cache
+export CARGO_TARGET_DIR="$ARISTOTLE_CACHE/target"
+cd aristotle
+tools/fetch-tools.sh                  # pinned Zig toolchain
+tools/build-plato.sh                  # Plato C libraries
+tools/build-render.sh device          # static ARM app + device bundle
+tools/package.sh                      # zip with aristotle/ + extensions/</pre>
+    <p class="small"><a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/BUILD.md" class="zh">完整构建文档 →</a><a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/BUILD.md" class="en">Full build guide →</a></p>
+  </div>
+</section>
+
+<section id="status">
+  <div class="wrap">
+    <h2 class="zh">状态与限制</h2><h2 class="en">Status and limitations</h2>
+    <div class="split">
+      <div>
+        <p class="zh">当前是 <strong>预览版 / 实验性</strong>。已真机验证：排版引擎、翻页、选词高亮、目录链接、休眠唤醒、前光、Wi-Fi 传书、中文界面、局部重排。仍在验收：扫描导入流程、手动同步与自动推送、长时阅读内存、真实账号跨端同步。</p>
+        <p class="en">Currently a <strong>preview / experimental</strong> build. Verified on hardware: layout engine, page turns, selection and highlights, TOC/links, sleep and wake, frontlight, Wi-Fi transfer, Chinese UI, local reflow. Still under acceptance: scan/import flow, manual sync and auto-push, long-session memory, cross-device sync with a real account.</p>
+      </div>
+      <div>
+        <p class="zh">已知问题：部分 SVG 封面显示为黑框白页、英文两端对齐词距异常、大书缓存超限、快速连点翻页合并、阅读页不能给划线加笔记、PDF 封面仅支持首图。完整列表见 <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/KNOWN-ISSUES.md">KNOWN-ISSUES</a>。</p>
+        <p class="en">Known issues: SVG-only covers render blank, English justification spacing, large-book cache overflow, rapid taps coalesce, no notes on existing highlights, PDF cover limited to the first page image. Full list: <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/KNOWN-ISSUES.md">KNOWN-ISSUES</a>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p class="zh" style="margin-top:0">墨阅 Kindle 是开源项目，以 <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/LICENSE">AGPL-3.0-or-later</a> 发布。基于 Aristotle、Plato、KOReader/crengine 与 Readest 等开源项目，详见仓库的 <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/THIRD_PARTY.md">第三方清单</a>。不是亚马逊官方产品；仅支持无 DRM 书籍。</p>
+    <p class="en" style="margin-top:0">Moyue Kindle is open source under <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/LICENSE">AGPL-3.0-or-later</a>, built on Aristotle, Plato, KOReader/crengine and Readest. See the <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/THIRD_PARTY.md">third-party notices</a>. Not affiliated with Amazon; DRM-free books only.</p>
+    <p><a href="https://github.com/jasonchencnn/moyue-kindle">GitHub</a> · <a href="https://github.com/readest/readest">Readest</a> · <a href="https://github.com/koreader/koreader">KOReader</a> · <a href="https://github.com/piotrkowski/aristotle">Aristotle</a></p>
+  </div>
+</footer>
+
+<script>
+function toggleLang() {
+  var html = document.documentElement;
+  var zh = html.getAttribute('data-lang') === 'zh';
+  html.setAttribute('data-lang', zh ? 'en' : 'zh');
+  html.setAttribute('lang', zh ? 'en' : 'zh-CN');
+  document.getElementById('langBtn').textContent = zh ? '中文' : 'EN';
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,165 @@
+{
+  "contract_version": "v2",
+  "suite": "lww_ties",
+  "description": "同毫秒时间戳平局处理用例：涵盖整行平局服务端胜、阅读状态平局客户端胜、元数据平局随行胜者、分组平局有值者胜",
+  "cases": [
+    {
+      "name": "whole_row_tie_server_wins",
+      "description": "本地与远端 updated_at 完全同刻，整行平局判定 clientIsNewer=false，远端（服务端）胜出",
+      "table": "books",
+      "input": {
+        "local": {
+          "user_id": "usr-01",
+          "book_hash": "c3d4e5f6a1b20718293a4b5c6d7e8f92",
+          "format": "EPUB",
+          "title": "围城（本地客户端修改）",
+          "author": "钱钟书",
+          "updated_at": "2026-11-05T12:00:00.000Z",
+          "deleted_at": null
+        },
+        "remote": {
+          "user_id": "usr-01",
+          "book_hash": "c3d4e5f6a1b20718293a4b5c6d7e8f92",
+          "format": "EPUB",
+          "title": "围城",
+          "author": "钱钟书",
+          "updated_at": "2026-11-05T12:00:00.000Z",
+          "deleted_at": null
+        }
+      },
+      "expected": {
+        "winner": "remote",
+        "result": {
+          "user_id": "usr-01",
+          "book_hash": "c3d4e5f6a1b20718293a4b5c6d7e8f92",
+          "format": "EPUB",
+          "title": "围城",
+          "author": "钱钟书",
+          "updated_at": "2026-11-05T12:00:00.000Z",
+          "deleted_at": null
+        }
+      }
+    },
+    {
+      "name": "reading_status_tie_client_wins",
+      "description": "reading_status_updated_at 同刻平局，依据 resolveReadingStatusMerge 规则 (client >= server) 客户端胜出",
+      "table": "books",
+      "input": {
+        "local": {
+          "user_id": "usr-01",
+          "book_hash": "c3d4e5f6a1b20718293a4b5c6d7e8f92",
+          "format": "EPUB",
+          "title": "围城",
+          "author": "钱钟书",
+          "reading_status": "finished",
+          "reading_status_updated_at": "2026-11-05T12:00:00.000Z",
+          "updated_at": "2026-11-05T12:00:00.000Z"
+        },
+        "remote": {
+          "user_id": "usr-01",
+          "book_hash": "c3d4e5f6a1b20718293a4b5c6d7e8f92",
+          "format": "EPUB",
+          "title": "围城",
+          "author": "钱钟书",
+          "reading_status": "reading",
+          "reading_status_updated_at": "2026-11-05T12:00:00.000Z",
+          "updated_at": "2026-11-05T12:00:00.000Z"
+        }
+      },
+      "expected": {
+        "reading_status_winner": "client",
+        "result": {
+          "user_id": "usr-01",
+          "book_hash": "c3d4e5f6a1b20718293a4b5c6d7e8f92",
+          "format": "EPUB",
+          "title": "围城",
+          "author": "钱钟书",
+          "reading_status": "finished",
+          "reading_status_updated_at": "2026-11-05T12:00:00.000Z",
+          "updated_at": "2026-11-05T12:00:00.000Z"
+        }
+      }
+    },
+    {
+      "name": "metadata_tie_follows_row_winner",
+      "description": "metadata_updated_at 同刻平局（含未打戳的 0===0 情况），依据 resolveMetadataMerge 规则跟随整行胜者",
+      "table": "books",
+      "input": {
+        "local": {
+          "user_id": "usr-01",
+          "book_hash": "c3d4e5f6a1b20718293a4b5c6d7e8f92",
+          "format": "EPUB",
+          "title": "围城（客户端改名）",
+          "author": "钱钟书",
+          "metadata_updated_at": "2026-11-05T10:00:00.000Z",
+          "updated_at": "2026-11-05T10:00:00.000Z"
+        },
+        "remote": {
+          "user_id": "usr-01",
+          "book_hash": "c3d4e5f6a1b20718293a4b5c6d7e8f92",
+          "format": "EPUB",
+          "title": "围城",
+          "author": "钱钟书",
+          "metadata_updated_at": "2026-11-05T10:00:00.000Z",
+          "updated_at": "2026-11-05T11:00:00.000Z"
+        }
+      },
+      "expected": {
+        "row_winner": "remote",
+        "metadata_winner": "remote",
+        "result": {
+          "user_id": "usr-01",
+          "book_hash": "c3d4e5f6a1b20718293a4b5c6d7e8f92",
+          "format": "EPUB",
+          "title": "围城",
+          "author": "钱钟书",
+          "metadata_updated_at": "2026-11-05T10:00:00.000Z",
+          "updated_at": "2026-11-05T11:00:00.000Z"
+        }
+      }
+    },
+    {
+      "name": "group_tie_side_with_group_wins",
+      "description": "group_updated_at 同刻平局（如均为 null 或相等），有分组的一侧胜出，避免旧客户端覆盖分组",
+      "table": "books",
+      "input": {
+        "local": {
+          "user_id": "usr-01",
+          "book_hash": "c3d4e5f6a1b20718293a4b5c6d7e8f92",
+          "format": "EPUB",
+          "title": "围城",
+          "author": "钱钟书",
+          "group_id": "grp-literature",
+          "group_name": "中国文学",
+          "group_updated_at": null,
+          "updated_at": "2026-11-05T10:00:00.000Z"
+        },
+        "remote": {
+          "user_id": "usr-01",
+          "book_hash": "c3d4e5f6a1b20718293a4b5c6d7e8f92",
+          "format": "EPUB",
+          "title": "围城",
+          "author": "钱钟书",
+          "group_id": null,
+          "group_name": null,
+          "group_updated_at": null,
+          "updated_at": "2026-11-05T11:00:00.000Z"
+        }
+      },
+      "expected": {
+        "group_winner": "local",
+        "result": {
+          "user_id": "usr-01",
+          "book_hash": "c3d4e5f6a1b20718293a4b5c6d7e8f92",
+          "format": "EPUB",
+          "title": "围城",
+          "author": "钱钟书",
+          "group_id": "grp-literature",
+          "group_name": "中国文学",
+          "group_updated_at": null,
+          "updated_at": "2026-11-05T11:00:00.000Z"
+        }
+      }
+    }
+  ]
+}

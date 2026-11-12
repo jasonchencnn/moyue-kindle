@@ -1,0 +1,47 @@
+name: Bug report
+description: Something in Aristotle does not work as documented.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you expected instead, and the steps to reproduce it if you know them.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Aristotle version
+      description: The commit you built, or the version under Settings > About.
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device and firmware
+      description: The model and firmware version (Settings > Device info on the stock UI).
+      placeholder: Kindle Paperwhite 4 (2018), firmware 5.13.6
+    validations:
+      required: true
+  - type: input
+    id: jailbreak
+    attributes:
+      label: Jailbreak and tools
+      description: The jailbreak you used, and the KUAL, MRPI and KOReader versions.
+      placeholder: LanguageBreak; KUAL, MRPI and KOReader versions
+  - type: textarea
+    id: log
+    attributes:
+      label: App log
+      description: |
+        The lines around the problem from `/var/tmp/aristotle.log` on the device.
+        `run-aristotle.sh` prints it when the app exits. For the SSH agent, use
+        `/var/local/aristotle/log`, or `aristotle-agent.log` on the USB drive after
+        Remove agent. Remove anything private, such as book titles.
+
+        Never attach the probe output (`aristotle-probe/` on the USB drive) as it
+        is. It contains your serial number, MAC addresses and Wi-Fi networks. If a
+        maintainer asks for part of it, paste only those lines, with identifiers
+        removed. Never share the e-ink waveform files.
+      render: text

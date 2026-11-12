@@ -1,0 +1,176 @@
+{
+  "contract_version": "v2",
+  "suite": "field_level_lww",
+  "description": "books 行字段级 LWW 合并测试用例：涵盖阅读状态、封面、元数据（含 metadata 保全）、分组与整行更新时间戳解耦",
+  "cases": [
+    {
+      "name": "reading_status_survives_pageturn_row_update",
+      "description": "客户端翻页使本地 updated_at(16:00:00) 领先远端(14:00:00)；但远端在 15:00:00 标记为 finished（reading_status_updated_at=15:00:00 > 本地 10:00:00）。本地赢得整行，但远端 reading_status 被嫁接进最终记录",
+      "table": "books",
+      "input": {
+        "local": {
+          "user_id": "usr-01",
+          "book_hash": "e5f6a1b2c3d40718293a4b5c6d7e8f94",
+          "format": "EPUB",
+          "title": "百年孤独",
+          "author": "加西亚·马尔克斯",
+          "progress": [210, 400],
+          "reading_status": "reading",
+          "reading_status_updated_at": "2026-11-05T10:00:00.000Z",
+          "updated_at": "2026-11-05T16:00:00.000Z"
+        },
+        "remote": {
+          "user_id": "usr-01",
+          "book_hash": "e5f6a1b2c3d40718293a4b5c6d7e8f94",
+          "format": "EPUB",
+          "title": "百年孤独",
+          "author": "加西亚·马尔克斯",
+          "progress": [200, 400],
+          "reading_status": "finished",
+          "reading_status_updated_at": "2026-11-05T15:00:00.000Z",
+          "updated_at": "2026-11-05T14:00:00.000Z"
+        }
+      },
+      "expected": {
+        "row_winner": "local",
+        "result": {
+          "user_id": "usr-01",
+          "book_hash": "e5f6a1b2c3d40718293a4b5c6d7e8f94",
+          "format": "EPUB",
+          "title": "百年孤独",
+          "author": "加西亚·马尔克斯",
+          "progress": [210, 400],
+          "reading_status": "finished",
+          "reading_status_updated_at": "2026-11-05T15:00:00.000Z",
+          "updated_at": "2026-11-05T16:00:00.000Z"
+        }
+      }
+    },
+    {
+      "name": "cover_fresher_on_client_grafted_to_server_row",
+      "description": "服务端 updated_at(17:00:00) 领先客户端(12:00:00)，服务端赢得整行；但客户端有更新的封面（cover_updated_at=16:30:00 > 服务端 10:00:00）。客户端封面被嫁接到服务端行，且不改动服务端 updated_at",
+      "table": "books",
+      "input": {
+        "local": {
+          "user_id": "usr-01",
+          "book_hash": "e5f6a1b2c3d40718293a4b5c6d7e8f94",
+          "format": "EPUB",
+          "title": "百年孤独",
+          "author": "加西亚·马尔克斯",
+          "cover_hash": "cov-new-custom-cover-hash",
+          "cover_updated_at": "2026-11-05T16:30:00.000Z",
+          "updated_at": "2026-11-05T12:00:00.000Z"
+        },
+        "remote": {
+          "user_id": "usr-01",
+          "book_hash": "e5f6a1b2c3d40718293a4b5c6d7e8f94",
+          "format": "EPUB",
+          "title": "百年孤独",
+          "author": "加西亚·马尔克斯",
+          "cover_hash": "cov-default-cover-hash",
+          "cover_updated_at": "2026-11-05T10:00:00.000Z",
+          "updated_at": "2026-11-05T17:00:00.000Z"
+        }
+      },
+      "expected": {
+        "row_winner": "remote",
+        "result": {
+          "user_id": "usr-01",
+          "book_hash": "e5f6a1b2c3d40718293a4b5c6d7e8f94",
+          "format": "EPUB",
+          "title": "百年孤独",
+          "author": "加西亚·马尔克斯",
+          "cover_hash": "cov-new-custom-cover-hash",
+          "cover_updated_at": "2026-11-05T16:30:00.000Z",
+          "updated_at": "2026-11-05T17:00:00.000Z"
+        }
+      }
+    },
+    {
+      "name": "metadata_absent_blob_guard_preserves_existing_description",
+      "description": "客户端元数据时间戳较新（改了书名 title），但客户端未存详细 metadata 字符串（null）；依据 resolveMetadataMerge 保全规则，保留远端原本存在的 metadata 详情，避免整库简介被抹空（issue #5912）",
+      "table": "books",
+      "input": {
+        "local": {
+          "user_id": "usr-01",
+          "book_hash": "e5f6a1b2c3d40718293a4b5c6d7e8f94",
+          "format": "EPUB",
+          "title": "百年孤独（50周年纪念版）",
+          "author": "加西亚·马尔克斯",
+          "tags": ["魔幻现实主义", "经典"],
+          "metadata": null,
+          "metadata_updated_at": "2026-11-05T18:00:00.000Z",
+          "updated_at": "2026-11-05T18:00:00.000Z"
+        },
+        "remote": {
+          "user_id": "usr-01",
+          "book_hash": "e5f6a1b2c3d40718293a4b5c6d7e8f94",
+          "format": "EPUB",
+          "title": "百年孤独",
+          "author": "加西亚·马尔克斯",
+          "tags": ["文学"],
+          "metadata": "{\"isbn\":\"9787544253994\",\"description\":\"布恩迪亚家族七代人的传奇故事\"}",
+          "metadata_updated_at": "2026-11-05T10:00:00.000Z",
+          "updated_at": "2026-11-05T10:00:00.000Z"
+        }
+      },
+      "expected": {
+        "metadata_winner": "local",
+        "result": {
+          "user_id": "usr-01",
+          "book_hash": "e5f6a1b2c3d40718293a4b5c6d7e8f94",
+          "format": "EPUB",
+          "title": "百年孤独（50周年纪念版）",
+          "author": "加西亚·马尔克斯",
+          "tags": ["魔幻现实主义", "经典"],
+          "metadata": "{\"isbn\":\"9787544253994\",\"description\":\"布恩迪亚家族七代人的传奇故事\"}",
+          "metadata_updated_at": "2026-11-05T18:00:00.000Z",
+          "updated_at": "2026-11-05T18:00:00.000Z"
+        }
+      }
+    },
+    {
+      "name": "group_lww_explicit_removal_propagates",
+      "description": "用户在客户端主动移出分组（group_id=null, group_name=null），但带有较新的 group_updated_at(19:00:00)；因其时间戳晚于服务端的 11:00:00，移出分组的操作合法胜出并生效",
+      "table": "books",
+      "input": {
+        "local": {
+          "user_id": "usr-01",
+          "book_hash": "e5f6a1b2c3d40718293a4b5c6d7e8f94",
+          "format": "EPUB",
+          "title": "百年孤独",
+          "author": "加西亚·马尔克斯",
+          "group_id": null,
+          "group_name": null,
+          "group_updated_at": "2026-11-05T19:00:00.000Z",
+          "updated_at": "2026-11-05T19:00:00.000Z"
+        },
+        "remote": {
+          "user_id": "usr-01",
+          "book_hash": "e5f6a1b2c3d40718293a4b5c6d7e8f94",
+          "format": "EPUB",
+          "title": "百年孤独",
+          "author": "加西亚·马尔克斯",
+          "group_id": "grp-latam",
+          "group_name": "拉美文学",
+          "group_updated_at": "2026-11-05T11:00:00.000Z",
+          "updated_at": "2026-11-05T11:00:00.000Z"
+        }
+      },
+      "expected": {
+        "group_winner": "local",
+        "result": {
+          "user_id": "usr-01",
+          "book_hash": "e5f6a1b2c3d40718293a4b5c6d7e8f94",
+          "format": "EPUB",
+          "title": "百年孤独",
+          "author": "加西亚·马尔克斯",
+          "group_id": null,
+          "group_name": null,
+          "group_updated_at": "2026-11-05T19:00:00.000Z",
+          "updated_at": "2026-11-05T19:00:00.000Z"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+[package]
+name = "inkread-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "墨阅排版引擎接口与 crengine-ng 实现"
+
+[features]
+default = []
+# 打开后才链接 crengine-ng，需要先跑 engine/fetch.sh 把源码拉到 engine/vendor/。
+# 默认关闭，这样没有引擎源码的机器也能跑 scripts/check.sh。
+crengine = ["dep:cc", "dep:cmake"]
+
+[dependencies]
+inkread-platform = { path = "../platform" }
+thiserror = "2"
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+cmake = { version = "0.1", optional = true }
+
+[dev-dependencies]
+png = "0.17"
+
+[[example]]
+name = "render_page"
+required-features = ["crengine"]
+
+[[example]]
+name = "xpointer_probe"
+required-features = ["crengine"]
+
+[[example]]
+name = "xpointer_oracle"
+required-features = ["crengine"]

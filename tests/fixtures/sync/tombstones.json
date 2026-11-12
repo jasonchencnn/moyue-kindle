@@ -1,0 +1,161 @@
+{
+  "contract_version": "v2",
+  "suite": "tombstones",
+  "description": "deleted_at 墓碑机制测试用例：涵盖 deleted_at 参与整行 LWW、同刻墓碑优先、以及合法的重激活/复活判定",
+  "cases": [
+    {
+      "name": "client_deleted_at_newer_beats_server_live_row",
+      "description": "客户端删除书籍（设置 deleted_at=12:00:00），虽然客户端 updated_at 较旧，但 clientDeletedAt > serverDeletedAt，删除墓碑胜出整行",
+      "table": "books",
+      "input": {
+        "local": {
+          "user_id": "usr-01",
+          "book_hash": "d4e5f6a1b2c30718293a4b5c6d7e8f93",
+          "format": "EPUB",
+          "title": "红楼梦",
+          "author": "曹雪芹",
+          "updated_at": "2026-11-05T09:00:00.000Z",
+          "deleted_at": "2026-11-05T12:00:00.000Z"
+        },
+        "remote": {
+          "user_id": "usr-01",
+          "book_hash": "d4e5f6a1b2c30718293a4b5c6d7e8f93",
+          "format": "EPUB",
+          "title": "红楼梦",
+          "author": "曹雪芹",
+          "updated_at": "2026-11-05T11:00:00.000Z",
+          "deleted_at": null
+        }
+      },
+      "expected": {
+        "winner": "local",
+        "result": {
+          "user_id": "usr-01",
+          "book_hash": "d4e5f6a1b2c30718293a4b5c6d7e8f93",
+          "format": "EPUB",
+          "title": "红楼梦",
+          "author": "曹雪芹",
+          "updated_at": "2026-11-05T09:00:00.000Z",
+          "deleted_at": "2026-11-05T12:00:00.000Z"
+        }
+      }
+    },
+    {
+      "name": "server_deleted_at_newer_beats_client_live_row",
+      "description": "服务端虽有删除时间(12:00:00)，但依据上游 sync.ts:729-738 判定公式 clientDeleted > serverDeleted || clientUpdated > serverUpdated，客户端 updated_at(10:00:00) > 服务端 updated_at(08:00:00)，clientIsNewer 为 true，客户端活记录胜出并复活书籍，deleted_at 维持 null",
+      "table": "books",
+      "input": {
+        "local": {
+          "user_id": "usr-01",
+          "book_hash": "d4e5f6a1b2c30718293a4b5c6d7e8f93",
+          "format": "EPUB",
+          "title": "红楼梦",
+          "author": "曹雪芹",
+          "updated_at": "2026-11-05T10:00:00.000Z",
+          "deleted_at": null
+        },
+        "remote": {
+          "user_id": "usr-01",
+          "book_hash": "d4e5f6a1b2c30718293a4b5c6d7e8f93",
+          "format": "EPUB",
+          "title": "红楼梦",
+          "author": "曹雪芹",
+          "updated_at": "2026-11-05T08:00:00.000Z",
+          "deleted_at": "2026-11-05T12:00:00.000Z"
+        }
+      },
+      "expected": {
+        "winner": "local",
+        "result": {
+          "user_id": "usr-01",
+          "book_hash": "d4e5f6a1b2c30718293a4b5c6d7e8f93",
+          "format": "EPUB",
+          "title": "红楼梦",
+          "author": "曹雪芹",
+          "updated_at": "2026-11-05T10:00:00.000Z",
+          "deleted_at": null
+        }
+      }
+    },
+    {
+      "name": "undelete_fresh_updated_at_clears_tombstone",
+      "description": "用户重新导入或恢复已删除书籍，updated_at(14:00:00) 晚于之前删除的 deleted_at(12:00:00)，deleted_at 被置 null，书籍成功复活",
+      "table": "books",
+      "input": {
+        "local": {
+          "user_id": "usr-01",
+          "book_hash": "d4e5f6a1b2c30718293a4b5c6d7e8f93",
+          "format": "EPUB",
+          "title": "红楼梦",
+          "author": "曹雪芹",
+          "updated_at": "2026-11-05T14:00:00.000Z",
+          "deleted_at": null
+        },
+        "remote": {
+          "user_id": "usr-01",
+          "book_hash": "d4e5f6a1b2c30718293a4b5c6d7e8f93",
+          "format": "EPUB",
+          "title": "红楼梦",
+          "author": "曹雪芹",
+          "updated_at": "2026-11-05T08:00:00.000Z",
+          "deleted_at": "2026-11-05T12:00:00.000Z"
+        }
+      },
+      "expected": {
+        "winner": "local",
+        "result": {
+          "user_id": "usr-01",
+          "book_hash": "d4e5f6a1b2c30718293a4b5c6d7e8f93",
+          "format": "EPUB",
+          "title": "红楼梦",
+          "author": "曹雪芹",
+          "updated_at": "2026-11-05T14:00:00.000Z",
+          "deleted_at": null
+        }
+      }
+    },
+    {
+      "name": "note_same_ms_tombstone_beats_live_edit",
+      "description": "同一毫秒内笔记出现更新与删除竞争（at===best.at），依据 dedupeLatest 规则，墓碑(!rec.deleted_at 输给 rec.deleted_at)胜出，防止笔记被意外复活",
+      "table": "book_notes",
+      "input": {
+        "records": [
+          {
+            "user_id": "usr-01",
+            "book_hash": "d4e5f6a1b2c30718293a4b5c6d7e8f93",
+            "id": "note-101",
+            "type": "annotation",
+            "text": "满纸荒唐言，一把辛酸泪",
+            "note": "名句",
+            "updated_at": "2026-11-05T15:00:00.123Z",
+            "deleted_at": null
+          },
+          {
+            "user_id": "usr-01",
+            "book_hash": "d4e5f6a1b2c30718293a4b5c6d7e8f93",
+            "id": "note-101",
+            "type": "annotation",
+            "text": "满纸荒唐言，一把辛酸泪",
+            "note": "名句",
+            "updated_at": "2026-11-05T15:00:00.123Z",
+            "deleted_at": "2026-11-05T15:00:00.123Z"
+          }
+        ]
+      },
+      "expected": {
+        "result": [
+          {
+            "user_id": "usr-01",
+            "book_hash": "d4e5f6a1b2c30718293a4b5c6d7e8f93",
+            "id": "note-101",
+            "type": "annotation",
+            "text": "满纸荒唐言，一把辛酸泪",
+            "note": "名句",
+            "updated_at": "2026-11-05T15:00:00.123Z",
+            "deleted_at": "2026-11-05T15:00:00.123Z"
+          }
+        ]
+      }
+    }
+  ]
+}

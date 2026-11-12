@@ -1,0 +1,105 @@
+/* Inkread built-in stylesheet.
+ *
+ * Compiled into the binary and applied to every document as the BASE
+ * stylesheet. A book's own CSS is NOT dropped: crengine's embedded styles
+ * (PROP_EMBEDDED_STYLES, enabled by default and set explicitly by the
+ * shim) layer the book's <style> blocks, linked stylesheets and inline
+ * style attributes on top of this base. Rules that must always win belong
+ * here with !important.
+ *
+ * Only properties crengine understands are used; the list lives in
+ * crengine/src/lvstsheet.cpp (css_decl_name).
+ *
+ * Line height is deliberately NOT set here: it is driven by the engine's
+ * setDefaultInterlineSpace(), so the reader's line-height setting takes
+ * effect immediately instead of being overridden by CSS.
+ */
+
+/* Body text: 2em first-line indent, justified, no extra space around it. */
+body {
+    margin: 0em;
+    padding: 0em;
+    text-indent: 2em;
+    text-align: justify;
+}
+
+p {
+    margin-top: 0em;
+    margin-bottom: 0.6em;
+    text-indent: 2em;
+    text-align: justify;
+}
+
+/* Headings: bold and larger, centered, and never indented. */
+h1 {
+    font-size: 160%;
+    font-weight: bold;
+    text-align: center;
+    text-indent: 0em;
+    margin-top: 0.4em;
+    margin-bottom: 0.8em;
+}
+
+h2 {
+    font-size: 130%;
+    font-weight: bold;
+    text-align: center;
+    text-indent: 0em;
+    margin-top: 0.6em;
+    margin-bottom: 0.6em;
+}
+
+h3 {
+    font-size: 115%;
+    font-weight: bold;
+    text-indent: 0em;
+    margin-top: 0.5em;
+    margin-bottom: 0.5em;
+}
+
+h4,
+h5,
+h6 {
+    font-size: 105%;
+    font-weight: bold;
+    text-indent: 0em;
+    margin-top: 0.4em;
+    margin-bottom: 0.4em;
+}
+
+/* Quotes: indented block, no first-line indent. */
+blockquote {
+    margin-left: 2em;
+    margin-right: 2em;
+    margin-top: 0.4em;
+    margin-bottom: 0.4em;
+    text-indent: 0em;
+    text-align: justify;
+}
+
+/* Preformatted text: keep spaces, no indent, no justification. */
+pre {
+    font-family: monospace;
+    white-space: pre;
+    text-indent: 0em;
+    text-align: left;
+    margin-top: 0.4em;
+    margin-bottom: 0.4em;
+}
+
+/* Lists: no first-line indent. */
+ul,
+ol {
+    margin-top: 0.3em;
+    margin-bottom: 0.3em;
+    text-indent: 0em;
+}
+
+/* Tables and images: no first-line indent. */
+table {
+    text-indent: 0em;
+}
+
+img {
+    text-indent: 0em;
+}

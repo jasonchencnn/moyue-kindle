@@ -1,0 +1,13 @@
+[package]
+name = "aristotle-hal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Hardware layer for Aristotle on the Kindle Paperwhite 4 (Rex) and Oasis 2 (Zelda)"
+
+[dependencies]
+# The model table: which Kindle this is, and what its panel and keys are.
+aristotle-screen = { path = "../aristotle-screen" }
+libc.workspace = true

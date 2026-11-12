@@ -1,0 +1,262 @@
+# UI framework: aristotle-ui
+
+`crates/aristotle-ui` stores screens as a tree and draws them into an 8-bit gray canvas. It reports changed rectangles with [waveform](glossary.md#waveform) hints that describe how the e-ink panel should update, and recognizes touch gestures.
+
+It has no [HAL](glossary.md#hal) dependency, so the host preview draws the same screens as the app without a device.
+
+## Model
+
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"primaryColor": "#ffffff", "primaryTextColor": "#1f2328", "primaryBorderColor": "#8c959f", "lineColor": "#8c959f", "secondaryColor": "#ffffff", "tertiaryColor": "#ffffff", "edgeLabelBackground": "#ffffff", "fontFamily": "-apple-system, Segoe UI, Helvetica, Arial, sans-serif"}}}%%
+flowchart TD
+    Touch["HAL touch events"] --> Handle["Ui::handle_touch"]
+    Handle --> Gesture["aristotle-ui: GestureRecognizer"]
+    Gesture --> Dispatch["Ui::on_gesture"]
+    Dispatch --> Feedback["Press feedback"]
+    Dispatch --> Event["UiEvent"]
+    Event --> App["aristotle: screen handlers"]
+    App --> Tree["Tree changes"]
+    Feedback --> Render["Ui::render: layout, paint, pixel diff"]
+    Tree --> Render
+    Render --> Damage["Canvas and Damage rectangles"]
+    Damage --> Preview["Host preview: PNG"]
+    Damage --> Present["aristotle: Panel::present"]
+    Present -->|Partial UI updates| Display["HAL Display::damage"]
+    Display --> Worker["epdc-display thread: merge and submit"]
+    Present -->|Full-screen updates| Full["Wait for idle, blit, submit"]
+    Page["Rendered book page"] --> Show["Panel::show_page"]
+    Show --> Full
+    Overlay["Reader menu"] --> Sequence["Panel::present_overlay: panel-sequence thread"]
+    Worker --> EPDC["EPDC driver and panel"]
+    Full --> EPDC
+    Sequence --> EPDC
+```
+
+`Ui::render` produces pixels and hints, not hardware requests. `crates/aristotle/src/panel.rs` maps those hints to requests for the [EPDC](glossary.md#epdc) display controller. `crates/aristotle-hal/src/display.rs` owns the partial-update worker.
+
+| Module | Contents |
+| --- | --- |
+| `canvas` | Gray pixels, clipping, pixel differences, and 16-level quantization |
+| `geom` | `Rect`, `Size`, `Insets`, and units at 300 DPI |
+| `waveform` | [`A2`](glossary.md#a2), [`DU`](glossary.md#du), [`GL16`](glossary.md#gl16), `GLKW16`, [`GC16`](glossary.md#gc16), with Zelda mode numbers 6, 1, 3, 9, 2 |
+| `text` | Fonts, shaping, rasterization, and line breaks |
+| `tree` | Nodes, layout, painting, hit tests, and changes |
+| `ui` | Tree, canvas, previous pixels, damage, and gesture dispatch |
+| `icons`, `widgets`, `theme` | Icons, controls, and style constants |
+| `screens` | Library, settings, network, sleep, and reader menu |
+
+### Tree and layout
+
+A `NodeId` addresses a node in a `Vec<Node>`. Containers include `Column`, `Row`, `Stack`, `Padding`, `Align`, `Fixed`, and `MinSize`. Leaves include text, icons, rules, progress, spacers, and custom widgets.
+
+Parents pass size limits to their children, then place them at the sizes the children choose. Paragraph layouts are cached by width.
+
+`Pages` shows the children that fit on one page, and `set_page` changes the visible page. There is no scrolling container.
+
+Tree setters such as `set_text`, `set_hidden`, and `set_progress` record *damage*, the changed rectangles, with a `Refresh` class. After `widget_mut`, call `invalidate`, because direct field changes record no damage.
+
+### Damage and waveforms
+
+`Ui::render()` collects rectangles for changed nodes and the old and new positions of moved nodes, then repaints those areas into the canvas.
+
+It compares the canvas with `front`, the previous pixels, to keep only the changed pixels' bounding boxes. The result is a `Vec<Damage>` with a waveform hint for each rectangle.
+
+An identical automatic repaint produces no damage. Explicit full refreshes bypass the pixel comparison. Press feedback uses A2. Black-and-white changes use DU, gray changes use GL16, and full refreshes use GC16 hints.
+
+A2 is only an acknowledgement. `Ui` remembers what A2 showed. The next render with any other damage adds that area as a GLKW16 hint, a cleaning update. A partial DU or GL16 update would skip pixels whose value did not change, and A2 over gray text leaves residue in exactly those pixels. `request_clean_refresh` sends the whole screen as GLKW16, and `render_clean` sends one frame's changes as GLKW16.
+
+The app maps GC16 to a full-screen mode-8 flash. GLKW16 becomes mode 9 in full mode, the stock page-turn update, for the rectangle or for the whole screen when it covers half of it. GL16 over book content, including completed gray popups, becomes a full-screen page refresh. Other partial hints go to `Display::damage`, which queues work without waiting for the panel. See [E-ink rendering](#e-ink-rendering).
+
+`panel::GhostBudget` counts partial updates since the last full-screen update. After 6 DU or GL16 updates,[^1] or partial and cleaning updates adding up to 3 screens,[^2] the next settled update is a mode-8 flash. A2 never becomes a flash.
+
+## Input
+
+`GestureRecognizer` accepts `(phase, id, x, y, time_us)`. Defaults in `GestureConfig` are:
+
+- 4 mm tap slop.
+- A 500 ms hold.
+- An 8 mm swipe.
+
+A swipe axis must dominate the other by 1.5 times. A second finger cancels a press.
+
+A2 feedback starts on touch-down and stops if the finger moves. Hit tests expand small targets to `geom::min_target(density)`, which is `MIN_TARGET` (9 mm, 106 px at 300 DPI) at the screen density. Buttons get the same height, so the painted target and the hit area agree.
+
+The book page uses `crates/aristotle/src/turns.rs`. Taps turn on release. The top 12 % opens the menu, the left 30 % goes back, and the remaining area goes forward. A hold selects text without turning.
+
+## Transitions
+
+The app draws a complete frame before it submits an update.
+
+| Change | Update policy |
+| --- | --- |
+| Touch-down on a control | Partial A2 inversion, or an outline around covers |
+| Release after a touch-down | One full-mode mode-9 update of the control and the change, full screen when it covers half of it |
+| Library or settings change without a touch | Partial DU or GL16, within the ghost budget |
+| Screen switch | One full mode-8 flash |
+| List page (library, settings, catalogs) | One full-screen mode-9 update, or a mode-8 flash with covers or cards |
+| Page turn, menu close, popup close, restyle | One full mode-9 update |
+| Reader menu open | One full-screen mode-9 update |
+| Dictionary or footnote popup open, list in the reader | One full mode-9 update |
+| Popup page, dictionary tab, suggestion | One full-mode mode-9 update of the popup |
+| Selection by a hold, dictionary still looking | One full-mode mode-9 update of the selection |
+| Selection drag | Partial A2 per step, then one full mode-9 update on lift |
+| Ghost budget spent | The next settled update is one full mode-8 flash |
+| Night-mode switch | One flash into the new state |
+
+`mask_extents` places menu edges between text lines. `Panel::present_overlay` runs the menu's update on `panel-sequence`. Only the bars are copied to the framebuffer, so the page between them stays as it is. The menu used to appear as A2 followed by a full-mode GL16 update per bar, and GL16 did not clear what A2 left over gray text.
+
+`tests/transitions.rs` checks UI hints. Tests in `panel.rs` check hardware requests. `tools/scenarios/aristotle-ui.txt` exercises screens on the device. [Benchmarks](benchmarks.md) records measured interactions, including older menu behavior.
+
+## Night mode
+
+`App::set_night` updates both `Panel` and `Ui`. Software inversion is the default: `Ui::set_night` inverts UI pixels, and `Framebuffer::blit_inverted` inverts book pages in the [framebuffer](glossary.md#framebuffer). `--night-method hardware` uses `EPDC_FLAG_ENABLE_INVERSION` instead. Software inversion keeps screenshots consistent with the panel.
+
+Snapshots and page caches store day pixels. EPUB images keep their day colors through `Page::images` and `panel::night_page`. MuPDF pages, including PDF, invert as a whole.
+
+Turns stay full mode 9 and flashes full mode 8, while partial gray UI updates use [GLKW16](glossary.md#glkw16) instead of GL16 at night.
+
+## Text
+
+[Swash](https://github.com/dfrg/swash) shapes text into glyphs and rasterizes them into pixels. Hinting aligns text to the pixel grid. `TextEngine::set_darkening` applies `coverage^0.8` by default to make thin strokes darker.
+
+Literata is the default font. The `embedded-fonts` feature compiles it into the UI. The app disables that feature and loads Literata from `data/serif/`.
+
+`text::layout_paragraph` uses Unicode line-break rules. Justified text uses Knuth-Plass, which chooses breaks across a paragraph, with simpler fallbacks. Ragged text uses first fit. Soft hyphens mark possible breaks. A one-letter word or initial does not end a line. `max_lines` truncates with an ellipsis.
+
+The UI's `Hyphenator` supports Polish syllable rules. Book pages use [Plato](glossary.md#plato)'s Liang hyphenation patterns ([Hyphenation](reader.md#hyphenation)). There is no bidirectional text support, and shaping uses the Latin script.
+
+## Design system
+
+`theme.rs` defines type sizes, spacing, and grays. Screens use Literata, 6 mm side margins, and black-and-white controls.
+
+| Type token | Size | Use |
+| --- | --- | --- |
+| `DISPLAY` | 15 pt bold | Screen title |
+| `HEADLINE` | 12 pt bold | Continue-reading card, shelf name |
+| `TITLE` | 11 pt bold | Screensaver caption |
+| `ITEM` | 9.5 pt bold | List row title |
+| `UI` | 8.5 pt | Controls and labels |
+| `SMALL` | 7.5 pt | Secondary text and pager |
+
+Spacing uses multiples of 8 px. Theme grays are multiples of 17, matching the panel's 16 levels.
+
+| Token | Day | Night |
+| --- | --- | --- |
+| `INK` | `0x00` | `0xff` |
+| `INK_2` | `0x44` | `0xbb` |
+| `INK_3` | `0x66` | `0x99` |
+| `RULE` | `0xaa` | `0x55` |
+| `TONE` | `0xdd` | `0x22` |
+| `PAPER` | `0xff` | `0x00` |
+
+## Adding a screen
+
+1. Add a builder in `src/screens/` that returns `(Tree, Ids)`. Use the shared controls in `screens/mod.rs`.
+2. Define `ActionId` constants in a `pub mod action`.
+3. For paged screens, add `Ids::sync` and `Ids::handle`. Call `ui.layout()` before syncing page counts.
+4. Add a `Screen` variant and event handlers in `crates/aristotle/src/main.rs`.
+5. Use `Refresh::Full` for a screen switch and `Refresh::Auto` to rebuild the current screen. Render once per action.
+6. Add preview data in `src/bin/preview.rs` and a transition test.
+
+## Adding a widget
+
+Implement `tree::Widget`:
+
+```rust
+pub trait Widget: Any {
+	fn measure(&mut self, c: Constraints, text: &mut TextEngine) -> Size;
+	fn paint(&self, rect: Rect, cx: &mut PaintCx);
+}
+```
+
+Add it with `tree.custom(w)`. Change it through `tree.widget_mut::<T>(id)`, then call `tree.invalidate(id, Refresh::Auto)`. Use theme grays and a 9 mm minimum touch target. `Slider` responds to taps through `value_at`, not drags.
+
+## Languages
+
+English is the default. `crates/aristotle-i18n/locales/en.json` defines the message keys. The build checks each locale's keys, placeholders, and plural forms. Debug builds also check arguments to `tf!`.
+
+`set_language` changes the process-wide language. `with_language` overrides it on one thread for tests. Book text and metadata are not translated. [`My Clippings.txt`](glossary.md#my-clippingstxt) keeps `en_GB` labels in every language.
+
+### Adding a language
+
+1. Copy `crates/aristotle-i18n/locales/en.json` to `<code>.json`.
+2. Translate messages without changing `{placeholder}` names. Fill in `@locale`, including names, months, weekdays, quotation marks, and date and time patterns.
+3. If needed, add plural rules and tests in `crates/aristotle-i18n/src/plural.rs`.
+4. Run `cargo test -p aristotle-i18n`. An incomplete catalog can set `"complete": false` and fall back to English.
+5. Check all screens with `aristotle-ui-preview --lang <code>` and the app's `--preview` mode.
+
+## Previews and tests
+
+```sh
+. tools/env.sh
+export CARGO_TARGET_DIR="$ARISTOTLE_CACHE/target-ui"
+cargo run --release -p aristotle-ui --bin aristotle-ui-preview
+cargo run --release -p aristotle-ui --bin aristotle-ui-preview -- --lang all OUT_DIR
+cargo run --release -p aristotle-ui --bin aristotle-ui-preview -- --size 1236x1648 OUT_DIR
+cargo run --release -p aristotle-ui --bin aristotle-ui-preview -- --size 600x800 --dpi 167 OUT_DIR
+cargo run --release -p aristotle-ui --example render-bench
+cargo test -p aristotle-ui
+```
+
+Previews include day and night PNGs, `*-damage.png` overlays, and `targets.txt` with control coordinates. `ARISTOTLE_STOCK_HOME=capture.png` adds a stock-library comparison. Check all languages after label changes.
+
+`--size WIDTHxHEIGHT` and `--dpi DPI` select the canvas, native text density, prototype pagination, and gesture thresholds. For UI and real reader checks across several profiles, run the [host geometry matrix](reader.md#check-other-screen-sizes-on-the-host).
+
+### Reference units and native pixels
+
+`aristotle-screen::Screen` holds native pixel dimensions and a validated `Density`. `Ui::with_screen` applies that density when it installs a tree. Fonts are rasterized at their native size, not resized from a 300 DPI bitmap.
+
+Node gaps, padding, borders, icons, and fixed dimensions are authored in reference pixels at 300 DPI. `Styles::with_density` also makes text measurements use the selected density. Custom widgets use `TextEngine::density()` for their intrinsic dimensions and drawing constants. Millimetres and points retain their physical size across profiles.
+
+Dimensions measured from native text or book pages must not be converted again. Use `Tree::fixed_pixels`, `Tree::gap_pixels`, or `Node::in_pixels` for those values. A replacement tree is converted once when installed. The UI and reader recognizers use millimetre-based movement thresholds, while their time limits are unchanged.
+
+## E-ink rendering
+
+The EPDC reads pixels from the framebuffer only when asked to update. `MXCFB_SEND_UPDATE` submits a rectangle and waveform. `MXCFB_WAIT_FOR_UPDATE_COMPLETE` waits for a marker to finish.
+
+### Waveforms
+
+The PW4 uses Zelda mode numbers from [FBInk](glossary.md#fbink)'s `mxcfb-kindle.h`, not PW2 numbers. The [device reference](pw4-reference.md#waveform-modes-and-timings) lists every measured mode. These timings come from `aristotle-observe bench latency` on our device:[^3]
+
+| Waveform | Mode | Time for a 120 × 120 region |
+| --- | --- | --- |
+| A2 | 6 | 120 to 144 ms |
+| DU | 1 | 309 ms |
+| GL16 | 3 | 544 ms |
+| GC16 | 2 | 544 ms |
+| GLKW16 | 9 | 544 ms |
+
+A2 is fast but leaves residue, while DU handles black and white. Gray updates take longer, and book pages use full mode 9 to avoid [ghosting](glossary.md#ghosting) ([Page-turn experiment](benchmarks.md#page-turn-strategy-experiment)). The stock UI sends its controls as mode 257 (AUTO) and flashes with mode 8.[^3] Aristotle cleans with mode 9 in full mode; that this clears A2 residue on a region is an inference from the page-turn results.
+
+### Display thread
+
+Measurements on our PW4 show that the driver processes one update at a time.[^3] A submit blocks behind an earlier update even when regions do not overlap. Deeper queues and smaller tiles did not help.
+
+`Display::damage` merges pending rectangles and keeps the most faithful requested waveform. Only `epdc-display` waits in the submit call. Pixels drawn while the panel is busy go out in the next update.
+
+`Completions` waits for markers on another thread. Only one thread can wait for a given marker because the driver forgets it after completion.
+
+### Code map
+
+| Code | Role |
+| --- | --- |
+| `crates/aristotle-hal/src/framebuffer.rs` | Framebuffer and update calls |
+| `crates/aristotle-hal/src/display.rs` | Display worker and completion tracking |
+| `crates/aristotle-hal/src/input.rs` | Touch input and timestamps |
+| `crates/aristotle/src/panel.rs` | App update policy and page path |
+| `crates/aristotle-observe/src/bench/` | Panel benchmarks |
+
+## Traps
+
+- Queue partial UI updates through `Display`, not the input loop.
+- Wait for previous page updates before replacing the page's framebuffer pixels.
+- Call `ui.layout()` before reading rectangles or page counts.
+- Use `ui.next_deadline(now)` for the poll timeout and call `ui.tick(now)` after each poll, so holds fire without another touch event.
+- Change nodes through setters. After changing a custom widget, invalidate it.
+- `set_tree` flashes. Use `set_tree_with(tree, Refresh::Auto)` to rebuild the current screen.
+- Use `Feedback::Outline` for covers and other large targets.
+- Change night mode through `App::set_night`.
+
+[^1]: KOReader's default full-refresh interval.
+[^2]: An inference.
+[^3]: Measured on the device.

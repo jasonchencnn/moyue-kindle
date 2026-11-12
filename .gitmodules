@@ -1,0 +1,4 @@
+[submodule "aristotle/third_party/plato"]
+	path = aristotle/third_party/plato
+	url = https://github.com/piotrkowski/plato.git
+	branch = aristotle

@@ -1,0 +1,61 @@
+{
+  "contract_version": "v2",
+  "suite": "pagination_boundary",
+  "description": "服务端分页拉取与边界完整性测试用例：涵盖 limit 边界同毫秒补齐机制、以及 since<1000 首拉无书时的 Dummy Book 热修复",
+  "cases": [
+    {
+      "name": "books_paged_pull_timestamp_tie_expansion",
+      "description": "当 limit=2 时，第 2 条与第 3 条书籍具有完全相同的 synced_at 时间戳（同一批次 upsert 产生）；服务端自动执行补齐查询，将同毫秒内的所有书籍一并包含在当前页返回（返回 3 条），避免客户端后续 >cursor 查询跳过同刻记录",
+      "endpoint": "GET /api/sync?since=0&type=books&limit=2",
+      "table": "books",
+      "server_db_records": [
+        {
+          "user_id": "usr-01",
+          "book_hash": "hash-book-01",
+          "title": "书籍一",
+          "synced_at": "2026-11-05T10:00:00.100Z"
+        },
+        {
+          "user_id": "usr-01",
+          "book_hash": "hash-book-02",
+          "title": "书籍二",
+          "synced_at": "2026-11-05T10:00:00.200Z"
+        },
+        {
+          "user_id": "usr-01",
+          "book_hash": "hash-book-03",
+          "title": "书籍三",
+          "synced_at": "2026-11-05T10:00:00.200Z"
+        },
+        {
+          "user_id": "usr-01",
+          "book_hash": "hash-book-04",
+          "title": "书籍四",
+          "synced_at": "2026-11-05T10:00:00.300Z"
+        }
+      ],
+      "expected": {
+        "page_records_count": 3,
+        "returned_hashes": ["hash-book-01", "hash-book-02", "hash-book-03"],
+        "next_cursor_synced_at": "2026-11-05T10:00:00.200Z"
+      }
+    },
+    {
+      "name": "initial_pull_dummy_book_injection",
+      "description": "当 since<1000 且用户书库为空时，服务端注入一条已删除的 dummy book（hash=00000000000000000000000000000000），消除前端并发竞态条件（sync.ts:416-434）",
+      "endpoint": "GET /api/sync?since=0&type=books",
+      "table": "books",
+      "server_db_records": [],
+      "expected": {
+        "books_count": 1,
+        "first_book": {
+          "user_id": "usr-01",
+          "book_hash": "00000000000000000000000000000000",
+          "title": "Dummy Book",
+          "format": "EPUB",
+          "author": ""
+        }
+      }
+    }
+  ]
+}
