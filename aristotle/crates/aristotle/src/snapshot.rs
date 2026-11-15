@@ -92,11 +92,23 @@ pub struct Key {
     pub locator: Locator,
     #[serde(default)]
     pub night: bool,
+    /// The guide under every line of body text the page was rendered with
+    /// (KO2-UNDERLINE-001): a page saved with a guide must not come back
+    /// as current without one.
+    #[serde(default)]
+    pub underline: u8,
 }
 
 impl Key {
     /// The key for pages drawn now: in the UI language in use.
-    pub fn new(book: &str, stamp: (u64, i64), style: &Style, locator: Locator, night: bool) -> Key {
+    pub fn new(
+        book: &str,
+        stamp: (u64, i64),
+        style: &Style,
+        locator: Locator,
+        night: bool,
+        underline: u8,
+    ) -> Key {
         Key {
             book: book.to_string(),
             size: stamp.0,
@@ -105,6 +117,7 @@ impl Key {
             language: aristotle_i18n::language().to_string(),
             locator,
             night,
+            underline,
         }
     }
 }
@@ -543,7 +556,9 @@ mod tests {
     const AT: Locator = Locator::Kindle { position: 7510 };
 
     fn key(style: &Style) -> Key {
-        aristotle_i18n::with_language("en", || Key::new("0123abcd", (1000, 42), style, AT, false))
+        aristotle_i18n::with_language("en", || {
+            Key::new("0123abcd", (1000, 42), style, AT, false, 0)
+        })
     }
 
     fn info(location: usize, locator: Locator) -> PageInfo {
@@ -624,8 +639,8 @@ mod tests {
                 },
                 ..k.clone()
             },
-            Key::new("0123abcd", (1000, 42), &bigger, AT, false),
-            Key::new("0123abcd", (1000, 42), &german, AT, false),
+            Key::new("0123abcd", (1000, 42), &bigger, AT, false, 0),
+            Key::new("0123abcd", (1000, 42), &german, AT, false, 0),
             // Saved with Polish chrome, opened after a switch to English.
             Key {
                 language: "pl".into(),
@@ -696,7 +711,7 @@ mod tests {
         let s = Style::pw4();
         for book in ["aaaa", "bbbb"] {
             let snap = Snapshot {
-                key: Key::new(book, (1, 1), &s, AT, false),
+                key: Key::new(book, (1, 1), &s, AT, false, 0),
                 pages: vec![(info(1, AT), page(&s, 5))],
             };
             store(&dir, &snap).unwrap();

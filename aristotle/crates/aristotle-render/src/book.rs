@@ -16,13 +16,15 @@ use plato_core::metadata::TextAlign;
 
 use plato_core::geom::CycleDir;
 
+#[cfg(feature = "crengine")]
+use crate::crengine::ChapterAnchor;
 use crate::lang;
 use crate::mobi::MobiInfo;
 use crate::notes;
 use crate::page::{Chrome, Folio, Page};
 use crate::position::{PosMap, Spine};
 use crate::richtext::RichText;
-use crate::style::Style;
+use crate::style::{Style, Underline, UNDERLINE_GRAY};
 
 /// A reading position in units that outlive one layout (see
 /// [`crate::position`]): what the library index stores.
@@ -123,6 +125,8 @@ pub struct Book {
     toc_locations: HashMap<usize, Option<usize>>,
     /// Whether night mode image inversion is active.
     night: bool,
+    /// The guide drawn under every line of body text.
+    underline: Underline,
 }
 
 /// A rectangle on the screen, in pixels: `x0..x1`, `y0..y1`.
@@ -218,6 +222,35 @@ fn flatten(entries: &[TocEntry], depth: usize, out: &mut Vec<(usize, TocEntry)>)
     for e in entries {
         out.push((depth, e.clone()));
         flatten(&e.children, depth + 1, out);
+    }
+}
+
+/// Collect the table of contents anchors that crengine must turn into page
+/// breaks.
+///
+/// An entry names a spine file and an optional fragment. Entries without a
+/// fragment are already covered by the body rule that starts every spine
+/// item. The fragment is matched to its spine item through the OPF spine, so
+/// the CSS names the same `_doc_fragment_N_ id` crengine builds in its DOM.
+#[cfg(feature = "crengine")]
+fn collect_chapter_anchors(entries: &[TocEntry], spine: &Spine, out: &mut Vec<ChapterAnchor>) {
+    for entry in entries {
+        if let Location::Uri(uri) = &entry.location {
+            if let Some((path, id)) = uri.split_once('#') {
+                if !id.is_empty() {
+                    if let Some(item) = spine.item_of(path) {
+                        let anchor = ChapterAnchor {
+                            spine: item,
+                            id: id.to_string(),
+                        };
+                        if !out.contains(&anchor) {
+                            out.push(anchor);
+                        }
+                    }
+                }
+            }
+        }
+        collect_chapter_anchors(&entry.children, spine, out);
     }
 }
 
@@ -328,7 +361,8 @@ impl Book {
             if epub_engine_is_crengine() {
                 let default_cache = std::env::temp_dir().join("aristotle-cache");
                 let dir = cache_dir.unwrap_or(&default_cache);
-                match crate::txt::cached_epub(path, dir) {
+                match crate::txt::cached_epub_with_progress(path, dir, progress.map(|p| p.as_ref()))
+                {
                     Ok(epub) => {
                         source = epub;
                         kind = "epub".into();
@@ -399,12 +433,34 @@ impl Book {
             Engine::Crengine => {}
         }
 
-        // The table of contents comes from the engine that lays the book
-        // out: crengine-ng knows the pages of its own entries, Plato's
-        // engine only knows where in the text they start.
+        // crengine lays the whole book out as one document and prefixes the
+        // ids of every spine item. Read the navigation anchors before the
+        // open, so the chapter rules are part of the sheet it lays out with.
+        #[cfg(feature = "crengine")]
+        let chapter_spine = if engine == Engine::Crengine {
+            Spine::read(path).ok()
+        } else {
+            None
+        };
+        #[cfg(feature = "crengine")]
+        let chapter_anchors = match (&chapter_spine, engine) {
+            (Some(spine), Engine::Crengine) => {
+                let mut anchors = Vec::new();
+                if let Some(toc) = doc.toc() {
+                    collect_chapter_anchors(&toc, spine, &mut anchors);
+                }
+                anchors
+            }
+            _ => Vec::new(),
+        };
         #[cfg(feature = "crengine")]
         let (crengine, crengine_toc) = if engine == Engine::Crengine {
-            let doc = crate::crengine::CrengineDoc::open_with_progress(path, style, progress)?;
+            let doc = crate::crengine::CrengineDoc::open_with_progress_and_chapters(
+                path,
+                style,
+                progress,
+                &chapter_anchors,
+            )?;
             let toc = doc.toc();
             (Some(doc), toc)
         } else {
@@ -423,7 +479,7 @@ impl Book {
                 .ok()
                 .filter(|s| s.total() == doc.pages_count()),
             #[cfg(feature = "crengine")]
-            Engine::Crengine => Spine::read(path).ok(),
+            Engine::Crengine => chapter_spine,
             _ => None,
         };
         Ok(Book {
@@ -446,6 +502,7 @@ impl Book {
             notes: None,
             toc_locations: HashMap::new(),
             night: false,
+            underline: Underline::Off,
         })
     }
 
@@ -1044,6 +1101,19 @@ impl Book {
         self.night
     }
 
+    /// Set the guide drawn under every line of body text.
+    ///
+    /// The guide is a render option, not a typographic one: changing it
+    /// needs no new layout, only a new render of the page.
+    pub fn set_underline(&mut self, underline: Underline) {
+        self.underline = underline;
+    }
+
+    /// The guide drawn under every line of body text.
+    pub fn underline(&self) -> Underline {
+        self.underline
+    }
+
     /// Render the page at `location` as crengine-ng laid it out.
     ///
     /// crengine-ng hands out the page as a gray buffer the size of the text
@@ -1064,6 +1134,12 @@ impl Book {
                 .ok_or_else(|| format_err!("the book is not laid out by crengine"))?;
             let options = inkread_engine::RenderOptions {
                 invert_images: self.night,
+                underline: match self.underline {
+                    Underline::Off => inkread_engine::Underline::Off,
+                    Underline::Solid => inkread_engine::Underline::Solid,
+                    Underline::Dotted => inkread_engine::Underline::Dotted,
+                },
+                underline_gray: UNDERLINE_GRAY,
             };
             (doc.render_page_with_options(location, &options)?, doc.top())
         };

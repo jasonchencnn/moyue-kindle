@@ -1574,7 +1574,13 @@ const WIFI_POLL: Duration = Duration::from_millis(500);
 /// has come. Only crengine-ng does; Plato's own engine and MuPDF lay the
 /// book out in silence.
 fn reports_progress(format: aristotle_library::Format) -> bool {
-    format == aristotle_library::Format::Epub && aristotle_render::book::epub_engine_is_crengine()
+    // TXT books are converted to an EPUB first and then laid out by
+    // crengine, so both formats have a percentage to show while the worker
+    // converts or lays them out.
+    matches!(
+        format,
+        aristotle_library::Format::Epub | aristotle_library::Format::Txt
+    ) && aristotle_render::book::epub_engine_is_crengine()
 }
 
 /// The line of the status bar for a book being laid out.
@@ -3708,6 +3714,7 @@ impl App {
             // not offered; old reader.json fields are still read.
             script_index: 0,
             gap_index: self.prefs.cjk_gap.min(2),
+            underline_index: self.prefs.underline.min(2),
             trim_index: 0,
             anim_enabled: false,
             anim_speed: 1,
@@ -3823,6 +3830,14 @@ impl App {
                 if idx < ui_typeset::GAP_RATIO.len() {
                     view.gap_index = idx;
                     self.prefs.cjk_gap = idx;
+                    prefs_changed = true;
+                }
+            }
+            i if (a::UNDERLINE_BASE..a::UNDERLINE_BASE + 3).contains(&i) => {
+                let idx = (i - a::UNDERLINE_BASE) as usize;
+                if idx < 3 {
+                    view.underline_index = idx;
+                    self.prefs.underline = idx;
                     prefs_changed = true;
                 }
             }
@@ -5010,6 +5025,7 @@ impl App {
                 &style,
                 &self.mobi_cache,
                 self.speed.secs_per_page(),
+                self.prefs.underline(),
             );
         }
         if let Screen::Reader(r) = &mut self.screen {
@@ -6652,6 +6668,7 @@ impl App {
             Ok(mut s) => {
                 s.secs_per_page = self.speed.secs_per_page();
                 s.night = self.prefs.night;
+                s.underline = self.prefs.underline();
                 s
             }
             Err(e) => {
@@ -6663,8 +6680,9 @@ impl App {
         let jumping = src.jump.is_some();
         if !jumping {
             if let Some(snap) = open::find_snapshot(&src, &style) {
-                if let aristotle_render::handoff::Action::CancelAndBoost(job) =
-                    self.prewarm.on_open(&rec.id, &style)
+                if let aristotle_render::handoff::Action::CancelAndBoost(job) = self
+                    .prewarm
+                    .on_open(&rec.id, &style, self.prefs.underline())
                 {
                     job.worker.cancel();
                     crate::pagecache::restore_priority(job.worker.tid());
@@ -6673,33 +6691,37 @@ impl App {
             }
         }
 
-        let (worker, adopted_prewarm) = match self.prewarm.on_open(&rec.id, &style) {
-            aristotle_render::handoff::Action::Adopt(job) if !jumping => {
-                crate::pagecache::restore_priority(job.worker.tid());
-                perf!(
-                    "open: \"{}\": no snapshot, adopting in-progress prewarm",
-                    rec.meta.title
-                );
-                (job.worker, true)
-            }
-            aristotle_render::handoff::Action::Adopt(job)
-            | aristotle_render::handoff::Action::CancelAndBoost(job) => {
-                job.worker.cancel();
-                crate::pagecache::restore_priority(job.worker.tid());
-                perf!(
-                    "open: \"{}\": no snapshot, opening in the background (prewarm cancelled)",
-                    rec.meta.title
-                );
-                (open::spawn_with(src, style, false), false)
-            }
-            aristotle_render::handoff::Action::Normal => {
-                perf!(
-                    "open: \"{}\": no snapshot, opening in the background",
-                    rec.meta.title
-                );
-                (open::spawn_with(src, style, false), false)
-            }
-        };
+        let (worker, adopted_prewarm) =
+            match self
+                .prewarm
+                .on_open(&rec.id, &style, self.prefs.underline())
+            {
+                aristotle_render::handoff::Action::Adopt(job) if !jumping => {
+                    crate::pagecache::restore_priority(job.worker.tid());
+                    perf!(
+                        "open: \"{}\": no snapshot, adopting in-progress prewarm",
+                        rec.meta.title
+                    );
+                    (job.worker, true)
+                }
+                aristotle_render::handoff::Action::Adopt(job)
+                | aristotle_render::handoff::Action::CancelAndBoost(job) => {
+                    job.worker.cancel();
+                    crate::pagecache::restore_priority(job.worker.tid());
+                    perf!(
+                        "open: \"{}\": no snapshot, opening in the background (prewarm cancelled)",
+                        rec.meta.title
+                    );
+                    (open::spawn_with(src, style, false), false)
+                }
+                aristotle_render::handoff::Action::Normal => {
+                    perf!(
+                        "open: \"{}\": no snapshot, opening in the background",
+                        rec.meta.title
+                    );
+                    (open::spawn_with(src, style, false), false)
+                }
+            };
 
         // Nothing to show before the layout: the tapped card stays inverted
         // as the acknowledgement, the book opens on a worker, and the
@@ -6836,6 +6858,7 @@ impl App {
             ms(snap.decode)
         );
         let (title, id, stamp) = (src.title.clone(), src.id.clone(), src.stamp);
+        let txt_version = src.txt_version;
         // Open exactly where the snapshot is, not where its locator maps.
         src.exact = Some(snap.info.location);
         let worker = open::spawn(src, style.clone());
@@ -6868,6 +6891,7 @@ impl App {
             progress,
             settings,
             gestures: TurnGestures::with_density(self.ui.bounds(), self.ui.profile().density),
+            txt_version,
         }));
         Ok(())
     }
@@ -7040,7 +7064,8 @@ impl App {
         }
         let (info, page) = o.shown().clone();
         let now = aristotle_library::library::now();
-        let progress = progress::progress_for(info.locator.clone(), info.fraction, now);
+        let progress =
+            progress::progress_for_source(info.locator.clone(), info.fraction, now, o.txt_version);
         self.lib.set_progress(&o.id, progress);
         if info.last {
             self.lib.set_status(&o.id, Status::Finished);
@@ -7051,6 +7076,7 @@ impl App {
             &o.style,
             info.locator.clone(),
             self.prefs.night,
+            self.prefs.underline().index() as u8,
         );
         self.snapshots.save(key, (info, page), None);
     }
@@ -7157,11 +7183,14 @@ impl App {
                 &o.style,
                 o.current.0.locator.clone(),
                 self.prefs.night,
+                self.prefs.underline().index() as u8,
             );
             let next = o.next.as_ref().map(|(i, _)| i.location);
             self.snapshots.already_saved(key, page.clone(), next);
         }
-        if o.turned || !right {
+        // A translated converter-1 position is rewritten once, so later
+        // opens and snapshots use the current pointer without translating.
+        if o.turned || !right || session.txt_migrated() > 0 {
             let now = aristotle_library::library::now();
             self.lib.set_progress(&session.id, session.progress(now));
             self.debounce.changed(Instant::now());
@@ -7318,6 +7347,7 @@ impl App {
             &s.style,
             progress.locator,
             self.prefs.night,
+            self.prefs.underline().index() as u8,
         );
         let here = s.current;
         let current = s.page(here).ok()?;
@@ -7958,6 +7988,19 @@ pub(crate) fn testdir(name: &str) -> PathBuf {
         .join(format!("{name}-{}-{n}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+#[cfg(test)]
+mod ko2_eng_tests {
+    use super::*;
+
+    #[test]
+    fn txt_progress_is_reported_when_crengine_lays_it_out() {
+        let enabled = aristotle_render::book::epub_engine_is_crengine();
+        assert_eq!(reports_progress(aristotle_library::Format::Txt), enabled);
+        assert_eq!(reports_progress(aristotle_library::Format::Epub), enabled);
+        assert!(!reports_progress(aristotle_library::Format::Pdf));
+    }
 }
 
 #[cfg(test)]

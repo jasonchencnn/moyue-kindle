@@ -1,8 +1,8 @@
 # 墨阅预览版：安装、卸载与恢复
 
-> 适用版本：墨阅预览版 0.3.0（Kindle Oasis 2）
+> 适用版本：墨阅预览版 0.3.1（Kindle Oasis 2）
 >
-> 当前仓库尚未发布预编译安装包；发布前请先按 [BUILD.md](BUILD.md) 从源码构建设备包，或等待 GitHub Releases。
+> 从 [GitHub Releases](https://github.com/jasonchencnn/moyue-kindle/releases/tag/v0.3.1) 下载本版安装包和校验文件。源码构建见 [BUILD.md](BUILD.md)。
 >
 > 本文只写已经实现、能够按步骤复现的内容。这是预览版，不是稳定版；安装前请先读“风险”和“已知限制”。
 
@@ -32,8 +32,8 @@ Paperwhite 4 的代码仍在仓库里，但本预览版没有在 PW4 上验证�
 1. 一台已越狱并装好 KUAL 的 Oasis 2。
 2. 一台电脑和 USB 数据线。
 3. 本次发布的以下文件（来自同一个发布页）：
-   - `moyue-preview-0.3.0.zip`
-   - `moyue-preview-0.3.0-source.tar.gz`（源码包；日常安装不需要）
+   - `moyue-preview-0.3.1.zip`
+   - `moyue-preview-0.3.1-source.tar.gz`（源码包；日常安装不需要）
    - `SHA256SUMS`
 4. 如果设备上装过旧版 Aristotle/墨阅，先按“更新”一节的顺序备份。
 
@@ -60,7 +60,7 @@ zip 那一行必须显示 `OK`。校验值不一致就不要安装，重新下�
    - 在设置里选择“返回 Kindle 系统”；或
    - 在 KUAL 里选择“墨阅 > 返回 Kindle 系统”。
 2. 用 USB 线连接 Kindle，让电脑能看到 Kindle 的磁盘。
-3. 把 `moyue-preview-0.3.0.zip` **解压到 Kindle 磁盘根目录**，和 `documents/` 同级。不要只把 zip 放进去。
+3. 把 `moyue-preview-0.3.1.zip` **解压到 Kindle 磁盘根目录**，和 `documents/` 同级。不要只把 zip 放进去。
 4. 解压后根目录应出现：
    - `aristotle/`：程序和随包许可证、`SOURCE.txt`
    - `extensions/aristotle/`：KUAL 菜单
@@ -85,6 +85,8 @@ zip 那一行必须显示 `OK`。校验值不一致就不要安装，重新下�
 - 排版面板只显示**已经安装**的字体；没有放进去的字体不会出现在选项里。
 
 ## 7. 更新到新预览版
+
+0.3.0 首次升级到 0.3.1 时请按以下 USB 步骤安装。0.3.1 起，后续版本可从 **KUAL > 墨阅 > 检查更新** 安装，更新器会校验版本、大小和 SHA-256，并保留中断恢复入口。
 
 1. 先备份：退出墨阅，连接 USB，复制 `.aristotle/`、`documents/`、`aristotle-notes/`（如有）和 `fonts/`、`dictionaries/` 到电脑。
 2. 保持墨阅停止，重新连接 USB。
@@ -145,13 +147,12 @@ sh /mnt/us/extensions/aristotle/agent/uninstall.sh
 
 本预览版不包含或尚未完成：
 
-- Readest 账号登录、进度/笔记云同步、云端书库、统计同步；
-- “我的划线与笔记”浏览页（划线本身仍会写入 `My Clippings.txt` 和 Markdown）；
+- 云端统计同步；Readest 登录、进度/笔记同步与云端下书已经实现，真实账号跨端验收仍在进行；
 - 书库长按“移到文件夹”；
 - 设置里的字体、日期时间、预览项（会进入“即将推出”页）；
 - 书内全文搜索（现有搜索只查书库，不搜正文）；
 - 每日目标不能修改，固定 30 分钟，只在“我的”里显示进度；
-- 云端功能（账号、同步、云端书库、统计同步）都还没有。
+- 运行中自动旋转、重力开关和手动四向选择。
 
 本版不提供翻页动画、标点挤压、繁简转换。
 
@@ -165,7 +166,7 @@ sh /mnt/us/extensions/aristotle/agent/uninstall.sh
 - 电池续航没有验证数据；
 - Paperwhite 4 不在本预览版支持范围。
 
-完整的功能范围和已知问题见[发布说明草稿](releases/预览版-0.3.0.md)。
+完整的功能范围和已知问题见[版本记录](RELEASE-NOTES.md)与[已知问题](KNOWN-ISSUES.md)。
 
 ## 12. 反馈
 
@@ -175,5 +176,7 @@ sh /mnt/us/extensions/aristotle/agent/uninstall.sh
 - 复现步骤和出现频率；
 - 日志：KUAL 启动的日志在 `/mnt/us/.aristotle/app.log`，上一次运行在 `app.log.1`；
 - 如果是启动或 agent 问题，再附 `/var/local/aristotle/log` 和 `/mnt/us/aristotle-agent.log`（如有）。
+
+0.3.1 可在 **KUAL > 墨阅 > 诊断日志 > 采集日志** 生成诊断报告，采集后通过 USB 取出报告反馈。上传功能需要另行配置有效支持凭据，公开安装包不含凭据。
 
 不要提交账号密码、设备序列号或版权书籍。

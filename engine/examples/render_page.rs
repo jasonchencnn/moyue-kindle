@@ -47,11 +47,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cache: Option<PathBuf> = None;
     let mut partial_demo: Option<u32> = None;
     let mut new_face: Option<String> = None;
+    let mut underline = inkread_engine::Underline::Off;
+    let mut night = false;
     let mut new_fallback_face: Option<String> = None;
+    let mut page_size = (PAGE_WIDTH, PAGE_HEIGHT);
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--underline" => {
+                let v = args.next().ok_or("--underline 需要一个参数")?;
+                underline = match v.as_str() {
+                    "off" | "none" => inkread_engine::Underline::Off,
+                    "solid" => inkread_engine::Underline::Solid,
+                    "dotted" => inkread_engine::Underline::Dotted,
+                    _ => return Err(format!("未知的引导线样式：{v}").into()),
+                };
+            }
+            "--night" => {
+                // 夜间模式：整页反色，和 App 在面板上做的事一样
+                // （aristotle-render 的 Page::invert_images）。
+                night = true;
+            }
             "--partial" => {
                 partial_demo = Some(56);
             }
@@ -79,6 +96,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--cache" => {
                 cache = Some(PathBuf::from(args.next().ok_or("--cache 需要一个参数")?));
+            }
+            "--width" => {
+                let value: u32 = args.next().ok_or("--width 需要一个参数")?.parse()?;
+                page_size.0 = value;
+            }
+            "--height" => {
+                let value: u32 = args.next().ok_or("--height 需要一个参数")?.parse()?;
+                page_size.1 = value;
             }
             "--font" => {
                 fonts.push(PathBuf::from(args.next().ok_or("--font 需要一个参数")?));
@@ -168,7 +193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let open_start = Instant::now();
-    let mut doc = engine.open(&input, (PAGE_WIDTH, PAGE_HEIGHT), &layout)?;
+    let mut doc = engine.open(&input, page_size, &layout)?;
     let open_elapsed = open_start.elapsed();
     let pages = doc.page_count();
     println!("书名：{}", doc.title());
@@ -180,7 +205,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("页码越界：请求第 {page} 页，文档只有 {pages} 页").into());
     }
 
-    let mut buffer = GrayBuffer::new(PAGE_WIDTH, PAGE_HEIGHT);
+    let mut buffer = GrayBuffer::new(page_size.0, page_size.1);
+    let options = inkread_engine::RenderOptions {
+        invert_images: false,
+        underline,
+        underline_gray: 0x60,
+    };
+    println!("正文引导线：{underline:?}");
     let render_elapsed;
 
     if let Some(new_font_size) = partial_demo {
@@ -214,7 +245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let render_start = Instant::now();
-            doc.render_page(page, &mut buffer)?;
+            doc.render_page_with_options(page, &mut buffer, &options)?;
             render_elapsed = render_start.elapsed();
             println!(
                 "局部排版 + 渲染当前第 {page} 页耗时：{:.2} ms",
@@ -232,17 +263,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             println!("当前文档不支持局部重排（需多分片且启用缓存），退回全量渲染");
             let render_start = Instant::now();
-            doc.render_page(page, &mut buffer)?;
+            doc.render_page_with_options(page, &mut buffer, &options)?;
             render_elapsed = render_start.elapsed();
             println!("渲染耗时：{:.1} ms", render_elapsed.as_secs_f64() * 1000.0);
         }
     } else {
         let render_start = Instant::now();
-        doc.render_page(page, &mut buffer)?;
+        doc.render_page_with_options(page, &mut buffer, &options)?;
         render_elapsed = render_start.elapsed();
         println!("渲染耗时：{:.1} ms", render_elapsed.as_secs_f64() * 1000.0);
     }
 
+    if night {
+        // 夜间模式：整页反色，和 App 在面板上做的事一样
+        // （aristotle-render 的 Page::invert_images）。
+        for p in buffer.pixels_mut() {
+            *p = 255 - *p;
+        }
+    }
     write_png(&output, &buffer)?;
 
     let xpointer = doc.page_xpointer(page)?;

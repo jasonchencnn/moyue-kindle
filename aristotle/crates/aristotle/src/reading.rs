@@ -987,13 +987,17 @@ impl App {
             return;
         };
         let raw_hl: Vec<(Option<usize>, Position, Position)> =
-            marks::ours(rec, AnnotationKind::Highlight)
+            marks::ours_versioned(rec, AnnotationKind::Highlight)
                 .into_iter()
-                .map(|(id, s, e)| (Some(id), s, e))
+                .filter_map(|(id, s, e, version)| {
+                    let s = r.session.map_stored_position(&s, version)?;
+                    let e = r.session.map_stored_position(&e, version)?;
+                    Some((Some(id), s, e))
+                })
                 .collect();
-        let raw_bm: Vec<Position> = marks::ours(rec, AnnotationKind::Bookmark)
+        let raw_bm: Vec<Position> = marks::ours_versioned(rec, AnnotationKind::Bookmark)
             .into_iter()
-            .map(|(_, s, _)| s)
+            .filter_map(|(_, s, _, version)| r.session.map_stored_position(&s, version))
             .collect();
         let book = r.session.book();
         let hl = raw_hl
@@ -1074,6 +1078,7 @@ impl App {
             return Ok(());
         };
         let (s, e) = (words[sel.start].offset, words[sel.end].offset);
+        let txt_version = r.session.txt_version();
         let book = r.session.book();
         let start = match &words[sel.start].start_xpointer {
             Some(xp) => Position::XPointer {
@@ -1099,6 +1104,7 @@ impl App {
             end_bytes: bytes(&end, e) + words[sel.end].text.len() as u64,
             start,
             end,
+            txt_version,
             page: fixed.then_some(page_idx + 1),
             chapter: book.chapter_title(page_idx),
             created,
@@ -1159,15 +1165,20 @@ impl App {
         match r.session.bookmarked(loc) {
             Some(b) => {
                 let book = r.session.book();
-                let pos = marks::encode(&book.position_at(b));
+                let at = book.position_at(b);
                 self.lib.remove_annotations(&id, |a| {
                     a.source == marks::SOURCE
                         && a.kind == AnnotationKind::Bookmark
-                        && a.position.as_ref().map(|p| &p.0) == Some(&pos)
+                        && a.position
+                            .as_ref()
+                            .and_then(|p| marks::decode(&p.0))
+                            .as_ref()
+                            == Some(&at)
                 });
                 perf!("bookmark removed");
             }
             None => {
+                let txt_version = r.session.txt_version();
                 let book = r.session.book();
                 let at = book.position_at(loc);
                 let bytes = match at {
@@ -1175,8 +1186,10 @@ impl App {
                     _ => loc as u64,
                 };
                 let chapter = book.chapter_title(loc);
-                self.lib
-                    .add_annotation(&id, marks::bookmark(&at, bytes, chapter, created));
+                self.lib.add_annotation(
+                    &id,
+                    marks::bookmark(&at, bytes, chapter, created, txt_version),
+                );
                 perf!("bookmark added");
             }
         }
@@ -1469,6 +1482,7 @@ impl App {
             // read, but they no longer shape the preview.
             script_index: 0,
             gap_index: self.prefs.cjk_gap.min(2),
+            underline_index: self.prefs.underline.min(2),
             trim_index: 0,
             anim_enabled: false,
             anim_speed: 1,
@@ -1494,6 +1508,9 @@ impl App {
         }
 
         let mut prefs_changed = false;
+        // The guide is a render option: the book needs no new layout, only a
+        // new render of the page.
+        let mut underline_changed = false;
 
         match id {
             a::PREV_CJK_PAGE | a::NEXT_CJK_PAGE | a::PREV_LATIN_PAGE | a::NEXT_LATIN_PAGE => {
@@ -1710,11 +1727,33 @@ impl App {
                     prefs_changed = true;
                 }
             }
+            i if (a::UNDERLINE_BASE..a::UNDERLINE_BASE + 3).contains(&i) => {
+                let idx = (i - a::UNDERLINE_BASE) as usize;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if idx <= 2 && idx != view.underline_index {
+                    view.underline_index = idx;
+                    self.prefs.underline = idx;
+                    prefs_changed = true;
+                    underline_changed = true;
+                }
+            }
             _ => return Ok(()),
         }
 
         if prefs_changed {
             let _ = self.prefs.save(self.lib.data_dir());
+        }
+        if underline_changed {
+            let Screen::Reader(r) = &mut self.screen else {
+                return Ok(());
+            };
+            r.session.book().set_underline(self.prefs.underline());
+            r.session.clear_pages();
         }
 
         self.rebuild_reader(Refresh::Auto)?;

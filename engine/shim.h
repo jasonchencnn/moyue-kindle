@@ -269,9 +269,14 @@ int cr_doc_page_count(const CrDoc *doc);
  *
  * invert_images 为非 0 时仅对图片区域执行反色（供夜间模式抵消全屏反色使用）。
  *
+ * underline 是正文每行下方的引导线：0 不画、1 实线、2 点状虚线。
+ * 引导线用引擎自己的行几何画在正文文字行下面，图片、页眉页脚不画。
+ * underline_gray 是引导线的灰度（0 黑、255 白），0 表示用默认灰度。
+ *
  * 成功返回 0，失败返回非 0，err 里是原因。 */
 int cr_doc_render_page(CrDoc *doc, int page, uint8_t *dst, size_t dst_len, int dst_width,
-                        int dst_height, int invert_images, char *err, size_t err_len);
+                        int dst_height, int invert_images, int underline, int underline_gray,
+                        char *err, size_t err_len);
 
 /* 换一套排版参数并重新排版。
  *
@@ -280,6 +285,22 @@ int cr_doc_render_page(CrDoc *doc, int page, uint8_t *dst, size_t dst_len, int d
 int cr_doc_set_layout(CrDoc *doc, const CrLayout *layout,
                       cr_progress_cb progress_cb, void *user_data,
                       char *err, size_t err_len);
+
+/* 换一套排版参数，并按新的页面尺寸重新排版。
+ *
+ * width / height 是新的页面尺寸（像素）。文档不重开：DOM、目录、书签、
+ * 进度都在，只是按新尺寸重新分页。
+ *
+ * 尺寸变了以后，排好版的分片全部失效（它们是按旧宽度排的），必须整本重排。
+ * 这里会临时关掉局部重排、排完再恢复，免得新旧两种分页混在一起。
+ *
+ * 尺寸非法（<= 0、小于 80 或超过上限）时直接报错，文档一个字节都没动。
+ * 中途抛异常或重排出不了页时，视口、输出缓冲、宽高和局部重排开关一起回滚；
+ * 已经套上的排版参数保留（与 cr_doc_set_layout 失败时一致），调用方可以用
+ * 有效参数重试。成功返回 0，失败返回非 0，err 里是原因。 */
+int cr_doc_set_viewport(CrDoc *doc, int width, int height, const CrLayout *layout,
+                        cr_progress_cb progress_cb, void *user_data,
+                        char *err, size_t err_len);
 
 /* 取第 page 页（0 起）起始位置的 XPointer（UTF-8）。
  *

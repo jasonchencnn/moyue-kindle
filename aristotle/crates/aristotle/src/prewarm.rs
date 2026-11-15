@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use aristotle_library::{BookRecord, Library};
 use aristotle_render::handoff::{Action, Handoff};
 use aristotle_render::plato_core::anyhow::{format_err, Error};
-use aristotle_render::style::Style;
+use aristotle_render::style::{Style, Underline};
 
 use crate::session::{Prepared, Session, Source, OPEN_GATE};
 use crate::snapshot::{self, Key, Snapshot};
@@ -66,7 +66,7 @@ pub struct Job {
 }
 
 pub struct Prewarm {
-    handoff: Handoff<(String, Style), Job>,
+    handoff: Handoff<(String, Style, Underline), Job>,
     /// Books tried in this run, by id, style, UI language and position.
     tried: HashSet<String>,
     quiet_since: Instant,
@@ -97,8 +97,9 @@ impl Prewarm {
 
     /// Reader opens a book: handoff state machine determines whether to
     /// adopt, cancel & boost, or proceed normally.
-    pub fn on_open(&mut self, id: &str, style: &Style) -> Action<Job> {
-        self.handoff.open(&(id.to_string(), style.clone()))
+    pub fn on_open(&mut self, id: &str, style: &Style, underline: Underline) -> Action<Job> {
+        self.handoff
+            .open(&(id.to_string(), style.clone(), underline))
     }
 
     /// Explicitly cancel the in-progress prewarm (e.g. sleep or screen change).
@@ -122,7 +123,14 @@ impl Prewarm {
     /// opening: reaps a finished job and starts the next one when quiet.
     /// `secs_per_page` is the reading speed the progress line uses, as for
     /// a real open, or the footers would differ.
-    pub fn tick(&mut self, lib: &Library, style: &Style, mobi_cache: &Path, secs_per_page: f32) {
+    pub fn tick(
+        &mut self,
+        lib: &Library,
+        style: &Style,
+        mobi_cache: &Path,
+        secs_per_page: f32,
+        underline: Underline,
+    ) {
         if let Some(job) = self.handoff.prewarming_task_mut() {
             match job.worker.poll() {
                 Some(Ok(prepared)) => {
@@ -160,12 +168,13 @@ impl Prewarm {
             if self.quiet_since.elapsed() < required_quiet {
                 return;
             }
-            let Some((src, key)) = job_for(lib, rec, style, mobi_cache, secs_per_page) else {
+            let Some((src, key)) = job_for(lib, rec, style, mobi_cache, secs_per_page, underline)
+            else {
                 continue;
             };
             if !self.tried.insert(format!(
-                "{} {} {} {:?}",
-                rec.id, key.look, key.language, key.locator
+                "{} {} {} {:?} {}",
+                rec.id, key.look, key.language, key.locator, key.underline
             )) {
                 continue;
             }
@@ -173,7 +182,8 @@ impl Prewarm {
                 continue;
             }
             if let Some(job) = start(src, style.clone(), key) {
-                self.handoff.start((rec.id.clone(), style.clone()), job);
+                self.handoff
+                    .start((rec.id.clone(), style.clone(), underline), job);
                 return;
             }
         }
@@ -182,9 +192,19 @@ impl Prewarm {
 }
 
 /// Whether a book record uses crengine-ng.
+///
+/// TXT books count too: they are converted to a cached EPUB and then laid
+/// out by crengine, so prewarming several of them would queue several
+/// multi-second layouts against the same engine lock.
 pub fn is_crengine(rec: &BookRecord) -> bool {
-    rec.format == aristotle_library::Format::Epub
-        && aristotle_render::book::epub_engine_is_crengine()
+    format_uses_crengine(rec.format)
+}
+
+fn format_uses_crengine(format: aristotle_library::Format) -> bool {
+    matches!(
+        format,
+        aristotle_library::Format::Epub | aristotle_library::Format::Txt
+    ) && aristotle_render::book::epub_engine_is_crengine()
 }
 
 /// The source (without background pagination) and the key of a snapshot
@@ -196,14 +216,31 @@ pub fn job_for(
     style: &Style,
     mobi_cache: &Path,
     secs_per_page: f32,
+    underline: Underline,
 ) -> Option<(Source, Key)> {
     let progress = rec.progress.as_ref()?;
     if !snapshot::compatible_progress(progress) {
         return None;
     }
     let mut src = Source::new(lib, rec, mobi_cache).ok()?;
+    // A converter-1 pointer is not a key this build can snap; it would also
+    // make `Source::new` read the TXT here, on the library thread.
+    if src.saved_needs_txt_migration() {
+        return None;
+    }
     src.secs_per_page = secs_per_page;
-    let key = Key::new(&rec.id, src.stamp, style, progress.locator.clone(), false);
+    src.underline = underline;
+    // The key names the locator the open will actually place, which for a
+    // TXT book is the translated converter-2 pointer, not the stored one.
+    let locator = src.saved.as_ref()?.locator.clone();
+    let key = Key::new(
+        &rec.id,
+        src.stamp,
+        style,
+        locator,
+        false,
+        src.underline.index() as u8,
+    );
     src.paginate = false;
     Some((src, key))
 }
@@ -349,4 +386,35 @@ pub fn make(
     }
     let n = snapshot::store(&data_dir, &Snapshot { key, pages })?;
     Ok(Some(n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changed_underline_cannot_adopt_a_prewarmed_page() {
+        let mut handoff = Handoff::new();
+        let style = Style::pw4();
+        handoff.start(("book".to_string(), style.clone(), Underline::Off), ());
+        assert!(matches!(
+            handoff.open(&("book".to_string(), style, Underline::Solid)),
+            Action::CancelAndBoost(())
+        ));
+    }
+
+    #[test]
+    fn txt_and_epub_share_the_crengine_prewarm_policy() {
+        let enabled = aristotle_render::book::epub_engine_is_crengine();
+        assert_eq!(
+            format_uses_crengine(aristotle_library::Format::Txt),
+            enabled
+        );
+        assert_eq!(
+            format_uses_crengine(aristotle_library::Format::Epub),
+            enabled
+        );
+        assert!(!format_uses_crengine(aristotle_library::Format::Mobi));
+        assert!(!format_uses_crengine(aristotle_library::Format::Pdf));
+    }
 }

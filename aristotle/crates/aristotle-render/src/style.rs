@@ -6,6 +6,51 @@
 pub const CHROME_FAMILY: &str = "Literata";
 pub const CHROME_DIR: &str = "serif";
 
+/// The gray of the guide drawn under every line of body text (0 black,
+/// 255 white).
+///
+/// Night mode inverts the whole page, so the guide becomes the light gray
+/// 159 there: still easy to see, never as heavy as the text itself.
+pub const UNDERLINE_GRAY: u8 = 0x60;
+
+/// The guide drawn under every line of body text.
+///
+/// It is a reading guide (like the ruled lines of a schoolbook), not the
+/// underline of an annotation: every line of body text gets one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Underline {
+    /// No guide.
+    #[default]
+    Off,
+    /// One solid horizontal line.
+    Solid,
+    /// A dotted horizontal line.
+    Dotted,
+}
+
+impl Underline {
+    /// Every style, in the order the picker shows them.
+    pub const ALL: [Underline; 3] = [Underline::Off, Underline::Solid, Underline::Dotted];
+
+    /// Turn a picker index into a style. Anything out of range means "off".
+    pub fn from_index(index: usize) -> Underline {
+        match index {
+            1 => Underline::Solid,
+            2 => Underline::Dotted,
+            _ => Underline::Off,
+        }
+    }
+
+    /// The picker's index for this style.
+    pub fn index(self) -> usize {
+        match self {
+            Underline::Off => 0,
+            Underline::Solid => 1,
+            Underline::Dotted => 2,
+        }
+    }
+}
+
 /// Everything that decides how a page looks. [`Style::pw4`] holds the
 /// defaults; the CLI can override the typographic ones.
 ///

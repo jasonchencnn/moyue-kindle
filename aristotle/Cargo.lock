@@ -34,7 +34,7 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
 name = "aristotle"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aristotle-hal",
  "aristotle-i18n",
@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "aristotle-hal"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aristotle-screen",
  "libc",
@@ -66,14 +66,14 @@ dependencies = [
 
 [[package]]
 name = "aristotle-i18n"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "aristotle-library"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aristotle-i18n",
  "encoding_rs",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "aristotle-net"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "inkread-core",
  "libc",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "aristotle-observe"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aristotle-hal",
  "libc",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "aristotle-render"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aristotle-hal",
  "aristotle-library",
@@ -130,11 +130,11 @@ dependencies = [
 
 [[package]]
 name = "aristotle-screen"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "aristotle-ui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aristotle-i18n",
  "aristotle-screen",

@@ -261,6 +261,8 @@ fn image_inversion_inverts_images_and_preserves_text() {
         &mut buf_normal,
         &inkread_engine::RenderOptions {
             invert_images: false,
+            underline: inkread_engine::Underline::Off,
+            underline_gray: 0,
         },
     )
     .expect("渲染普通页面失败");
@@ -270,6 +272,8 @@ fn image_inversion_inverts_images_and_preserves_text() {
         &mut buf_inverted,
         &inkread_engine::RenderOptions {
             invert_images: true,
+            underline: inkread_engine::Underline::Off,
+            underline_gray: 0,
         },
     )
     .expect("渲染图片反色页面失败");

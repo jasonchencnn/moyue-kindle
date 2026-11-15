@@ -75,6 +75,9 @@ pub mod action {
     pub const PREV_LATIN_PAGE: ActionId = 742;
     /// Next page of Latin fonts.
     pub const NEXT_LATIN_PAGE: ActionId = 743;
+
+    /// 正文每行下方的引导线：0 无、1 实线、2 虚线（KO2-UNDERLINE-001）。
+    pub const UNDERLINE_BASE: ActionId = 750;
 }
 
 /// A font family option in the typography sheet.
@@ -101,6 +104,8 @@ pub struct TypesetView {
     pub indent_index: usize,
     pub script_index: usize,
     pub gap_index: usize,
+    /// 正文每行下方的引导线：0 无、1 实线、2 虚线。
+    pub underline_index: usize,
     pub trim_index: usize,
     pub anim_enabled: bool,
     pub anim_speed: usize,
@@ -133,13 +138,14 @@ impl Default for TypesetView {
             ],
             selected_latin_font: 0,
             latin_page: 0,
-            size_index: 3,    // 44 px (prototype default)
-            spacing_index: 1, // 标准 (1.7)
-            margin_index: 1,  // 标准 (88 px)
-            indent_index: 0,  // 2 字
-            script_index: 0,  // 简体
-            gap_index: 2,     // 大 (0.6)
-            trim_index: 0,    // 开
+            size_index: 3,      // 44 px (prototype default)
+            spacing_index: 1,   // 标准 (1.7)
+            margin_index: 1,    // 标准 (88 px)
+            indent_index: 0,    // 2 字
+            script_index: 0,    // 简体
+            gap_index: 2,       // 大 (0.6)
+            underline_index: 0, // 无
+            trim_index: 0,      // 开
             anim_enabled: false,
             anim_speed: 1, // 标准
         }
@@ -209,6 +215,11 @@ pub fn script_is_traditional(index: usize) -> bool {
 /// Paragraph gap ratio (0: 无 0.0, 1: 小 0.3, 2: 大 0.6).
 pub fn gap_ratio(index: usize) -> f32 {
     GAP_RATIO[index.min(GAP_RATIO.len() - 1)]
+}
+
+/// The guide under every line of body text (0: 无, 1: 实线, 2: 虚线).
+pub fn underline_index(index: usize) -> usize {
+    index.min(2)
 }
 
 /// Whether punctuation trim is enabled (0: 开, 1: 关).
@@ -702,6 +713,34 @@ pub fn build_typeset_screen(t: &mut Tree, st: &Styles, v: &TypesetView) -> (Node
 
     let cjk_row_settings = t.add(Node::row(32).cross(Cross::Center), [col_indent, col_gap]);
 
+    // 下划线 (无 / 实线 / 虚线)：正文每一行下方的引导线。
+    let underline_label = make_label(t, tr(Msg::TypesetUnderline), 224);
+    let underline_names = [
+        tr(Msg::TypesetUnderlineOff),
+        tr(Msg::TypesetUnderlineSolid),
+        tr(Msg::TypesetUnderlineDotted),
+    ];
+    let mut underline_buttons = Vec::new();
+    for (i, name) in underline_names.iter().enumerate() {
+        let active = i == v.underline_index;
+        underline_buttons.push(chip_button(
+            t,
+            st,
+            name,
+            action::UNDERLINE_BASE + i as ActionId,
+            active,
+            None,
+            72,
+            None,
+        ));
+    }
+    let underline_chips = t.add(Node::row(10).flex(1), underline_buttons);
+    let col_underline = t.add(
+        Node::row(14).cross(Cross::Center).flex(1),
+        [underline_label, underline_chips],
+    );
+    let underline_row = t.add(Node::row(32).cross(Cross::Center), [col_underline]);
+
     // Assemble the bottom sheet
     let gap_24 = t.gap_pixels(1, 24);
     let sheet_content = t.add(
@@ -720,6 +759,8 @@ pub fn build_typeset_screen(t: &mut Tree, st: &Styles, v: &TypesetView) -> (Node
             cjk_section_title,
             gap_14_sub,
             cjk_row_settings,
+            gap_20,
+            underline_row,
         ],
     );
     let sheet_pad = t.pad(Insets::new(24, 88, 32, 88), sheet_content);

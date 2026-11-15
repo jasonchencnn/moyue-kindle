@@ -42,6 +42,7 @@ use aristotle_render::page::Page;
 use aristotle_render::plato_core::anyhow::{format_err, Error};
 use aristotle_render::plato_core::document::html::layout::HYPHENATION_PATTERNS;
 use aristotle_render::style::Style;
+use aristotle_render::style::Underline;
 use aristotle_ui::screens::library as ui_lib;
 use aristotle_ui::screens::reader::{Menu, Settings};
 use aristotle_ui::text::{FamilyId, TextEngine};
@@ -300,6 +301,9 @@ pub struct Opening {
     pub progress: crate::ProgressNodes,
     pub settings: Settings,
     pub gestures: TurnGestures,
+    /// The TXT converter version of the book being opened, for progress
+    /// written while the snapshot is shown.
+    pub txt_version: Option<u32>,
 }
 
 impl Opening {
@@ -319,8 +323,21 @@ pub fn find_snapshot(src: &Source, style: &Style) -> Option<snapshot::Loaded> {
     if !snapshot::compatible_progress(saved) {
         return None;
     }
+    // A converter-1 pointer names another split. Its snapshot must not be
+    // shown, and translating it here would read the TXT on the UI thread;
+    // the open worker translates it and the next save stores a current key.
+    if src.saved_needs_txt_migration() {
+        return None;
+    }
     let locator = saved.locator.clone();
-    let key = snapshot::Key::new(&src.id, src.stamp, style, locator, src.night);
+    let key = snapshot::Key::new(
+        &src.id,
+        src.stamp,
+        style,
+        locator,
+        src.night,
+        src.underline.index() as u8,
+    );
     snapshot::load(&src.data_dir, &key, style)
 }
 
@@ -454,7 +471,7 @@ pub fn bench(library: &Path, root: Option<&Path>, title: &str) -> Result<(), Err
     // Save, as App::save_snapshot does on a pause, back to the library or quit.
     let progress = session.progress(aristotle_library::library::now());
     lib.set_progress(&id, progress.clone());
-    let key = snapshot::Key::new(&id, session.stamp(), &style, progress.locator, false);
+    let key = snapshot::Key::new(&id, session.stamp(), &style, progress.locator, false, 0);
     let here = session.current;
     let current = session.page(here)?;
     let next = session
@@ -599,6 +616,7 @@ pub fn bench(library: &Path, root: Option<&Path>, title: &str) -> Result<(), Err
             &style,
             &mobi_cache,
             crate::speed::DEFAULT_SECS_PER_PAGE,
+            Underline::Off,
         ) else {
             continue;
         };
@@ -646,7 +664,7 @@ mod tests {
         let data_dir = crate::testdir("snapshot-provenance");
         let style = Style::pw4();
         let locator = aristotle_library::Locator::Kindle { position: 1200 };
-        let key = snapshot::Key::new("joint", (123, 456), &style, locator.clone(), false);
+        let key = snapshot::Key::new("joint", (123, 456), &style, locator.clone(), false, 0);
         let snapshot = snapshot::Snapshot {
             key: key.clone(),
             pages: vec![(
@@ -671,15 +689,22 @@ mod tests {
             mobi_cache: data_dir.join("cache"),
             saved: Some(progress::progress_for(locator, 0.5, 1)),
             marks: Vec::new(),
+            mark_versions: Vec::new(),
             bookmarks: Vec::new(),
+            bookmark_versions: Vec::new(),
             secs_per_page: 30.0,
             exact: None,
             jump: None,
             format: aristotle_library::Format::Azw3,
+            txt_version: None,
+            txt_mapped: 0,
+            txt_unmapped: Vec::new(),
+            txt_legacy: None,
             paginate: false,
             cancel: None,
             progress: None,
             night: false,
+            underline: Underline::Off,
         };
         assert_eq!(find_snapshot(&source, &style).unwrap().info.location, 420);
         for provenance in [Some("kindle"), None, Some("future-import")] {
@@ -731,5 +756,75 @@ mod tests {
         let mut both = footer.clone();
         both.data[700 * a.stride + 500] = 0;
         assert_eq!(compare(&a, &both, &s), Verdict::Page);
+    }
+    fn txt_source(data_dir: &std::path::Path, saved: aristotle_library::Progress) -> Source {
+        Source {
+            id: "txt".into(),
+            title: "Synthetic TXT".into(),
+            path: data_dir.join("book.txt"),
+            stamp: (11, 22),
+            data_dir: data_dir.to_path_buf(),
+            mobi_cache: data_dir.join("cache"),
+            saved: Some(saved),
+            marks: Vec::new(),
+            mark_versions: Vec::new(),
+            bookmarks: Vec::new(),
+            bookmark_versions: Vec::new(),
+            secs_per_page: 30.0,
+            exact: None,
+            jump: None,
+            format: aristotle_library::Format::Txt,
+            txt_version: Some(aristotle_render::txt::CONVERTER_VERSION),
+            txt_mapped: 0,
+            txt_unmapped: Vec::new(),
+            txt_legacy: None,
+            paginate: false,
+            cancel: None,
+            progress: None,
+            night: false,
+            underline: Underline::Off,
+        }
+    }
+
+    #[test]
+    fn a_legacy_txt_pointer_declines_its_snapshot_without_reading_the_book() {
+        let data_dir = crate::testdir("txt-legacy-snapshot");
+        let style = Style::pw4();
+        let locator = aristotle_library::Locator::XPointer {
+            xpointer: "/body/DocFragment[1]/body/p[900]/text().0".into(),
+        };
+        let mut saved = progress::progress_for_source(locator.clone(), 0.4, 1, Some(1));
+        saved.source = Some("aristotle".into());
+        let mut source = txt_source(&data_dir, saved.clone());
+        assert!(source.saved_needs_txt_migration());
+        // Even a snapshot keyed by exactly the old locator must not match:
+        // showing it would present the old split's page as current.
+        let key = snapshot::Key::new("txt", (11, 22), &style, locator.clone(), false, 0);
+        snapshot::store(
+            &data_dir,
+            &snapshot::Snapshot {
+                key,
+                pages: vec![(
+                    snapshot::PageInfo {
+                        location: 7,
+                        locator,
+                        fraction: 0.4,
+                        chapter: String::new(),
+                        label: "40%".into(),
+                        last: false,
+                    },
+                    Page::white(&style),
+                )],
+            },
+        )
+        .unwrap();
+        assert!(find_snapshot(&source, &style).is_none());
+        // The UI thread did not translate anything.
+        assert_eq!(source.saved.as_ref(), Some(&saved));
+        assert_eq!(source.txt_mapped, 0);
+        // Once progress names converter 2, an ordinary snapshot works again.
+        source.saved.as_mut().unwrap().source = Some("aristotle/txt2".into());
+        assert!(!source.saved_needs_txt_migration());
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 }

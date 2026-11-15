@@ -6,6 +6,7 @@
 #
 # usage: tools/package.sh tree DIR
 #        tools/package.sh zip [FILE]
+#        tools/package.sh ota [FILE]
 #        tools/package.sh source [FILE]
 #        tools/package.sh version
 #
@@ -18,6 +19,10 @@
 #   zip     The same tree as one zip that users unpack to the root of the
 #           drive; the app is required. Default FILE:
 #           $ARISTOTLE_CACHE/dist/$PRODUCT-$VERSION.zip
+#   ota     The same tree as one gzipped tar for the KUAL OTA updater; the app
+#           is required. Kindle BusyBox has tar but not necessarily unzip, so
+#           OTA uses this format while USB installation keeps the zip. Default
+#           FILE: $ARISTOTLE_CACHE/dist/$PRODUCT-$VERSION-ota.tar.gz
 #   source  The corresponding source of a release: the files of HEAD,
 #           third_party/plato at the commit HEAD records, the reading
 #           engine (when this tree has one: the engine crate, crengine-ng's
@@ -42,7 +47,7 @@ print(tomllib.load(open(sys.argv[1], "rb"))["workspace"]["package"]["version"])'
 EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$REPO" log -1 --format=%ct 2>/dev/null || echo 315532800)}
 
 usage() {
-    echo "usage: $0 tree DIR | zip [FILE] | source [FILE] | version" >&2
+    echo "usage: $0 tree DIR | zip [FILE] | ota [FILE] | source [FILE] | version" >&2
     exit 1
 }
 
@@ -65,6 +70,17 @@ lay_out() {
     mkdir -p "$1/extensions/aristotle"
     cp -R "$REPO/device/extension/." "$1/extensions/aristotle/"
     cp "$REPO/device/app/takeover.sh" "$REPO/device/app/open-kual.sh" "$1/extensions/aristotle/"
+    # The updater compares the app and extension versions before it swaps
+    # anything.  Keep the one version in Cargo.toml and the extension in step.
+    ext_version=$(sed -n 's:.*<version>\([0-9][0-9.]*\)</version>.*:\1:p' \
+        "$1/extensions/aristotle/config.xml" | head -n 1)
+    [ "$ext_version" = "$VERSION" ] || {
+        echo "extension version ${ext_version:-missing} != workspace version $VERSION" >&2
+        exit 1
+    }
+    if [ -d "$1/aristotle" ]; then
+        printf '%s\n' "$VERSION" > "$1/aristotle/VERSION"
+    fi
 }
 
 work() {
@@ -110,6 +126,50 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
                 z.writestr(info, f.read())
 EOF
         mv -f "$WORK/out.zip" "$OUT"
+        ls -l "$OUT"
+        ;;
+    ota)
+        [ $# -le 2 ] || usage
+        OUT=${2:-$ARISTOTLE_CACHE/dist/$PRODUCT-$VERSION-ota.tar.gz}
+        mkdir -p "$(dirname "$OUT")"
+        work
+        lay_out "$WORK/root" app-required
+        python3 - "$WORK/root" "$WORK/out.tar" "$EPOCH" <<'EOF'
+import os, sys, tarfile
+root, out, epoch = sys.argv[1], sys.argv[2], int(sys.argv[3])
+stamp = max(epoch, 315532800)
+names = []
+for d, dirs, files in os.walk(root):
+    for n in dirs + files:
+        path = os.path.join(d, n)
+        rel = os.path.relpath(path, root).replace(os.sep, "/")
+        if os.path.islink(path):
+            raise SystemExit("refusing to package symlink: " + rel)
+        if "\n" in rel or "\r" in rel:
+            raise SystemExit("refusing to package control characters: " + repr(rel))
+        if not (rel == "aristotle" or rel.startswith("aristotle/") or
+                rel == "extensions/aristotle" or rel.startswith("extensions/aristotle/")):
+            continue
+        names.append(rel + "/" if os.path.isdir(path) else rel)
+with tarfile.open(out, "w", format=tarfile.GNU_FORMAT) as t:
+    for rel in sorted(set(names)):
+        path = os.path.join(root, rel.rstrip("/"))
+        st = os.stat(path)
+        info = tarfile.TarInfo(rel)
+        info.mtime = stamp
+        info.mode = st.st_mode & 0o777
+        info.uid = info.gid = 0
+        info.uname = info.gname = ""
+        if os.path.isdir(path):
+            info.type = tarfile.DIRTYPE
+            t.addfile(info)
+        else:
+            info.size = st.st_size
+            with open(path, "rb") as f:
+                t.addfile(info, f)
+EOF
+        gzip -9n < "$WORK/out.tar" > "$WORK/out.tar.gz"
+        mv -f "$WORK/out.tar.gz" "$OUT"
         ls -l "$OUT"
         ;;
     source)

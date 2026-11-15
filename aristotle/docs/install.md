@@ -1,6 +1,6 @@
 # Installing Aristotle
 
-> The 0.3.0 preview in this fork is for the Kindle Oasis 2 on firmware 5.16.x.
+> The 0.3.1 preview in this fork is for the Kindle Oasis 2 on firmware 5.16.x.
 > The Chinese guide is [安装、卸载与恢复](../../docs/安装卸载与恢复.md). The
 > Paperwhite 4 instructions below describe the upstream build, not this preview.
 

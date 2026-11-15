@@ -1,0 +1,17 @@
+{
+  "items": [
+    {
+      "name": "墨阅诊断日志",
+      "items": [
+        {"name": "1. 采集日志（复现问题后点击）", "action": "sh ./diagnostics.sh collect", "exitmenu": false, "status": false},
+        {
+          "name": "2. 上传日志（可能含书名与路径）",
+          "items": [
+            {"name": "同意发送到开发者服务器", "action": "sh ./diagnostics.sh upload", "exitmenu": false, "status": false},
+            {"name": "取消", "action": "true", "exitmenu": false, "status": false}
+          ]
+        }
+      ]
+    }
+  ]
+}

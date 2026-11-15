@@ -27,10 +27,10 @@ pub mod crengine;
 pub use error::{Error, Result};
 pub use interaction::{Link, LinkTarget, Word};
 pub use layout::{
-    LayoutSettings, Margins, DEFAULT_FONT_SIZE_PX, DEFAULT_LINE_SPACING_PERCENT,
-    DEFAULT_MARGIN_HORIZONTAL_PX, DEFAULT_MARGIN_VERTICAL_PX, MAX_FONT_SIZE_PX,
-    MAX_LINE_SPACING_PERCENT, MAX_MARGIN_PX, MAX_PAGE_DIMENSION_PX, MIN_FONT_SIZE_PX,
-    MIN_LINE_SPACING_PERCENT,
+    validate_page_size, LayoutSettings, Margins, DEFAULT_FONT_SIZE_PX,
+    DEFAULT_LINE_SPACING_PERCENT, DEFAULT_MARGIN_HORIZONTAL_PX, DEFAULT_MARGIN_VERTICAL_PX,
+    MAX_FONT_SIZE_PX, MAX_LINE_SPACING_PERCENT, MAX_MARGIN_PX, MAX_PAGE_DIMENSION_PX,
+    MIN_FONT_SIZE_PX, MIN_LINE_SPACING_PERCENT, MIN_PAGE_DIMENSION_PX,
 };
 pub use toc::TocEntry;
 
@@ -77,11 +77,44 @@ pub trait Engine {
 ///
 /// 文档内部持有排版状态，所以改排版参数与渲染页面都要可变借用。
 ///
+/// 正文每行下方的引导线样式。
+///
+/// 引导线画在正文每一行的下方（像读本上的横线），不是批注的下划线。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum Underline {
+    /// 不画引导线。
+    #[default]
+    Off = 0,
+    /// 整条实线。
+    Solid = 1,
+    /// 点状虚线。
+    Dotted = 2,
+}
+
+impl Underline {
+    /// 全部样式，顺序与 UI 里的选择器一致。
+    pub const ALL: [Underline; 3] = [Underline::Off, Underline::Solid, Underline::Dotted];
+
+    /// 把 UI 的下标（0/1/2）变成样式，越界的一律按“不画”处理。
+    pub fn from_index(index: usize) -> Underline {
+        match index {
+            1 => Underline::Solid,
+            2 => Underline::Dotted,
+            _ => Underline::Off,
+        }
+    }
+}
+
 /// 页面渲染选项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RenderOptions {
     /// 是否对页面中的图片执行反色（供夜间模式抵消全屏反色使用）。
     pub invert_images: bool,
+    /// 正文每行下方的引导线。
+    pub underline: Underline,
+    /// 引导线的灰度（0 黑、255 白）。
+    pub underline_gray: u8,
 }
 
 /// 文档可以换线程用（`Send`）：阅读器在工作线程里开书，再把文档交给主线程。
@@ -179,6 +212,31 @@ pub trait Document: Send {
         layout: &LayoutSettings,
         progress: Option<&mut dyn FnMut(u32)>,
     ) -> Result<()>;
+
+    /// 换一套排版参数，并按新的页面尺寸（像素宽高）重新排版。
+    ///
+    /// 尺寸变了要整本重排：页数、页码都会变，之前拿到的 XPointer 也可能失效。
+    /// 文档不用重开：DOM、目录、书签都还在。
+    ///
+    /// 引擎不支持改尺寸时返回 [`Error::Engine`]。尺寸不合法时返回
+    /// [`Error::InvalidLayout`]，文档保持原样可用。
+    fn set_layout_with_size(&mut self, layout: &LayoutSettings, size: (u32, u32)) -> Result<()> {
+        self.set_layout_with_size_and_progress(layout, size, None)
+    }
+
+    /// 换一套排版参数并按新的页面尺寸重新排版，可选传入排版进度回调闭包
+    /// （上报 0..=100 整数进度）。
+    ///
+    /// 注意：回调在持有引擎全局锁的线程里同步执行，回调内部不能调用任何 crengine 接口。
+    fn set_layout_with_size_and_progress(
+        &mut self,
+        layout: &LayoutSettings,
+        size: (u32, u32),
+        progress: Option<&mut dyn FnMut(u32)>,
+    ) -> Result<()> {
+        let _ = (layout, size, progress);
+        Err(Error::Engine("当前引擎不支持改页面尺寸".to_string()))
+    }
 
     /// 第 `page` 页（0 起）起始位置的 XPointer。
     ///

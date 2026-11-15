@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<extension>
+  <information>
+    <name>墨阅诊断日志</name>
+    <version>1.0.0</version>
+    <author>墨阅</author>
+    <id>moyue-diagnostics</id>
+  </information>
+  <menus><menu type="json" dynamic="true">menu.json</menu></menus>
+</extension>

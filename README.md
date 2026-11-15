@@ -51,7 +51,7 @@
 | 书库 | 全盘扫描用户存储、手动选择扫描目录、扫描结果逐本勾选后导入、本地/云端分段、网格/列表、拼音排序、搜索、长按菜单、滑动翻页 |
 | 首页与统计 | 时钟与农历、继续阅读、最近阅读、每日一句、桌宠；阅读统计、阅读日历、单书统计、名言库 |
 | 同步 | Readest 账号登录（邮箱密码 / 官方认证中转）、进度与高亮笔记拉取和推送、自动推送开关、云端书库下载 |
-| 系统 | KUAL 启动、原系统界面接管与恢复、实体翻页键、重力感应旋转、前光跟随原系统、休眠/唤醒、四种休眠屏与自选图片 |
+| 系统 | KUAL 启动、原系统界面接管与恢复、实体翻页键、启动时正拿/倒拿适配、前光跟随原系统、休眠/唤醒、四种休眠屏与自选图片 |
 | 传书 | Wi-Fi 传书（局域网网页上传书籍、字体、休眠图）、USB 放书 |
 
 ## 支持范围
@@ -68,7 +68,7 @@ Paperwhite 4 的代码仍在仓库里，但**未验证、不提供安装支持**
 
 ## 安装
 
-安装包需要在本机或 CI 构建（见 [docs/BUILD.md](docs/BUILD.md)），解压到 Kindle 的 USB 盘根目录，然后从 KUAL 启动。完整的准备、校验、安装、更新、卸载与恢复步骤见 **[docs/INSTALL.md](docs/INSTALL.md)**。
+从 [GitHub Releases](https://github.com/jasonchencnn/moyue-kindle/releases/tag/v0.3.1) 下载 `moyue-preview-0.3.1.zip` 和 `SHA256SUMS`，校验后解压到 Kindle 的 USB 盘根目录，然后从 KUAL 启动。源码构建见 [docs/BUILD.md](docs/BUILD.md)。完整的准备、校验、安装、更新、卸载与恢复步骤见 **[docs/INSTALL.md](docs/INSTALL.md)**。
 
 > 预览版没有验证过整机救砖路径。安装前务必备份 `.aristotle/`（进度、偏好、索引）、`documents/` 和 `My Clippings.txt`。
 
@@ -76,7 +76,7 @@ Paperwhite 4 的代码仍在仓库里，但**未验证、不提供安装支持**
 
 当前是 **预览版 / 实验性（preview）**，不是稳定版。已经在 Kindle Oasis 2 上验证过的部分：排版引擎、翻页、选词高亮、目录与链接、休眠唤醒、前光、Wi-Fi 传书、中文界面、局部重排。仍在真机验收中的部分：最新一轮扫描导入流程、手动同步与自动推送、长时阅读内存表现、真实账号跨端同步。
 
-源码状态领先于最后一次发布的 0.3.0 预览包，仓库里的代码按最新工作区整理。稳定性、已知问题与限制见 [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md)，变更历史见 [docs/RELEASE-NOTES.md](docs/RELEASE-NOTES.md)。
+当前发布为 **0.3.1 预览版**，提供 USB 安装包、OTA 包和完整对应源码。首次从 0.3.0 升级需要 USB 安装，之后可用 KUAL 的“检查更新”。运行中自动旋转、重力开关和手动四向选择仍待实现。稳定性、已知问题与限制见 [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md)，变更历史见 [docs/RELEASE-NOTES.md](docs/RELEASE-NOTES.md)。
 
 ## 同步兼容性
 

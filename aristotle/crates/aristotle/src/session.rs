@@ -21,7 +21,8 @@ use aristotle_library::{BookRecord, Library, Progress};
 use aristotle_render::book::{Book, CrengineMark, Engine, Link, Mark, Position, Word};
 use aristotle_render::page::{Chrome, Page};
 use aristotle_render::plato_core::anyhow::{format_err, Context, Error};
-use aristotle_render::style::Style;
+use aristotle_render::style::{Style, Underline};
+use aristotle_render::txt::{self, CONVERTER_VERSION};
 
 use crate::pagecache::{self, Paginator};
 use crate::progress;
@@ -36,6 +37,15 @@ pub struct Session {
     pub title: String,
     stamp: (u64, i64),
     pub style: Style,
+    /// Set for a TXT book read through the generated EPUB: the converter
+    /// version that names this layout (see [`aristotle_render::txt`]).
+    txt_version: Option<u32>,
+    /// The converter-1 split, loaded by the open worker, for translating
+    /// stored marks when the reader adds or removes one.
+    txt_legacy: Option<Arc<txt::LegacyMap>>,
+    /// Stored converter-1 positions translated for this open; the index is
+    /// rewritten once so later opens do not translate again.
+    txt_migrated: usize,
     book: Option<Book>,
     pub degraded: bool,
     last_fraction: Cell<f32>,
@@ -97,6 +107,22 @@ pub struct Source {
     pub jump: Option<aristotle_library::index::Annotation>,
     /// The book's format, for resolving [`Source::jump`].
     pub format: aristotle_library::Format,
+    /// The TXT converter version that lays this book out, when it is a TXT
+    /// book read through the generated EPUB. Progress and new annotations
+    /// are stamped with it (see [`aristotle_render::txt::source_for`]).
+    pub txt_version: Option<u32>,
+    /// Converter version tags of [`Source::marks`], in the same order.
+    pub mark_versions: Vec<Option<u32>>,
+    /// Converter version tags of [`Source::bookmarks`], in the same order.
+    pub bookmark_versions: Vec<Option<u32>>,
+    /// How many stored converter-1 positions were translated exactly.
+    pub txt_mapped: usize,
+    /// Stored positions that could not be translated; they are kept in the
+    /// index, never moved to different text.
+    pub txt_unmapped: Vec<String>,
+    /// The converter-1 split of the source text, loaded by the open worker
+    /// when a legacy position needs translating.
+    pub txt_legacy: Option<std::sync::Arc<txt::LegacyMap>>,
     /// Whether to paginate the whole book in the background when its page
     /// numbers are not cached (not for snapshots made ahead of time).
     pub paginate: bool,
@@ -106,6 +132,8 @@ pub struct Source {
     /// Counter updated with formatting progress (0..=100) on engines that report it.
     pub progress: Option<Arc<AtomicU8>>,
     pub night: bool,
+    /// The guide under every line of body text (KO2-UNDERLINE-001).
+    pub underline: Underline,
 }
 
 /// Held by every thread that opens a book in the background (an open
@@ -115,12 +143,19 @@ pub struct Source {
 pub static OPEN_GATE: Mutex<()> = Mutex::new(());
 
 impl Source {
+    /// What opening `rec` needs from the library. Metadata only: reading the
+    /// book (and translating converter-1 positions) happens on the open
+    /// worker in [`Session::prepare`], never on the UI thread.
     pub fn new(lib: &Library, rec: &BookRecord, mobi_cache: &Path) -> Result<Source, Error> {
         let path = lib
             .absolute_path(rec)
             .ok_or_else(|| format_err!("the library has no root"))?;
         // The file itself, in case it changed since the last scan.
         let stamp = crate::snapshot::file_stamp(&path).unwrap_or((rec.file.size, rec.file.mtime));
+        let txt_converted = rec.format == aristotle_library::Format::Txt
+            && aristotle_render::book::epub_engine_is_crengine();
+        let highlights = crate::marks::ours_versioned(rec, AnnotationKind::Highlight);
+        let bookmarks = crate::marks::ours_versioned(rec, AnnotationKind::Bookmark);
         Ok(Source {
             id: rec.id.clone(),
             title: rec.meta.title.clone(),
@@ -129,24 +164,212 @@ impl Source {
             data_dir: lib.data_dir().to_path_buf(),
             mobi_cache: mobi_cache.to_path_buf(),
             saved: rec.progress.clone(),
-            marks: crate::marks::ours(rec, AnnotationKind::Highlight)
-                .into_iter()
-                .map(|(i, s, e)| (Some(i), s, e))
+            marks: highlights
+                .iter()
+                .map(|(i, s, e, _)| (Some(*i), s.clone(), e.clone()))
                 .collect(),
-            bookmarks: crate::marks::ours(rec, AnnotationKind::Bookmark)
-                .into_iter()
-                .map(|(_, s, _)| s)
-                .collect(),
+            mark_versions: highlights.iter().map(|(_, _, _, v)| *v).collect(),
+            bookmarks: bookmarks.iter().map(|(_, s, _, _)| s.clone()).collect(),
+            bookmark_versions: bookmarks.iter().map(|(_, _, _, v)| *v).collect(),
             secs_per_page: crate::speed::DEFAULT_SECS_PER_PAGE,
             exact: None,
             jump: None,
             format: rec.format,
+            txt_version: txt_converted.then_some(CONVERTER_VERSION),
+            txt_mapped: 0,
+            txt_unmapped: Vec::new(),
+            txt_legacy: None,
             paginate: true,
             cancel: None,
             progress: None,
             night: false,
+            underline: Underline::Off,
         })
     }
+
+    /// Whether the saved progress names a layout older than this build.
+    ///
+    /// Cheap on purpose: snapshot and prewarm lookup run on the UI thread and
+    /// must not read the TXT. A legacy position is not used for those keys;
+    /// the book opens at it through [`Session::prepare`], which translates it,
+    /// and the next normal progress save stores the current pointer.
+    pub fn saved_needs_txt_migration(&self) -> bool {
+        if self.txt_version.is_none() {
+            return false;
+        }
+        let Some(saved) = self.saved.as_ref() else {
+            return false;
+        };
+        if !matches!(saved.locator, aristotle_library::Locator::XPointer { .. }) {
+            return false;
+        }
+        stored_txt_version(txt::version_from_source(saved.source.as_deref())) != CONVERTER_VERSION
+    }
+
+    /// Whether any stored highlight or bookmark needs translating.
+    fn marks_need_txt_migration(&self) -> bool {
+        self.txt_version.is_some()
+            && self
+                .mark_versions
+                .iter()
+                .chain(self.bookmark_versions.iter())
+                .any(|v| stored_txt_version(*v) != CONVERTER_VERSION)
+    }
+}
+
+/// Translate the converter-1 positions in `src` for this build's layout.
+///
+/// Runs on the open worker only: it reads and splits the source TXT. The
+/// library records are not modified; untranslatable marks are dropped from
+/// this open and reported, never moved to different text.
+pub fn migrate_txt_source(src: &mut Source) {
+    if src.txt_version.is_none()
+        || (!src.saved_needs_txt_migration() && !src.marks_need_txt_migration())
+    {
+        return;
+    }
+    let map = match txt::legacy_map(&src.path) {
+        Ok(map) => map,
+        Err(e) => {
+            src.txt_unmapped
+                .push(format!("can't read the source text: {e}"));
+            if let Some(saved) = src.saved.as_mut() {
+                saved.locator = fallback_locator(saved.fraction);
+            }
+            src.marks.clear();
+            src.bookmarks.clear();
+            src.mark_versions.clear();
+            src.bookmark_versions.clear();
+            return;
+        }
+    };
+    src.txt_legacy = Some(map.clone());
+    if let Some(saved) = src.saved.as_mut() {
+        if matches!(saved.locator, aristotle_library::Locator::XPointer { .. }) {
+            let version = stored_txt_version(txt::version_from_source(saved.source.as_deref()));
+            if version != CONVERTER_VERSION {
+                let aristotle_library::Locator::XPointer { xpointer } = &saved.locator else {
+                    unreachable!()
+                };
+                let mapped = if version == 1 {
+                    map.map_xpointer(xpointer)
+                } else {
+                    Err(txt::MapError::Unsupported)
+                };
+                match mapped {
+                    Ok(xpointer) => {
+                        saved.locator = aristotle_library::Locator::XPointer { xpointer };
+                        saved.source = Some(txt::source_for(CONVERTER_VERSION));
+                        src.txt_mapped += 1;
+                    }
+                    Err(e) => {
+                        src.txt_unmapped
+                            .push(format!("progress: {}: {e:?}", e.reason()));
+                        saved.locator = fallback_locator(saved.fraction);
+                        saved.source = Some(txt::source_for(CONVERTER_VERSION));
+                    }
+                }
+            }
+        }
+    }
+    let mut drops = Vec::new();
+    let versions = src.mark_versions.clone();
+    for (i, version) in versions.iter().enumerate() {
+        if stored_txt_version(*version) == CONVERTER_VERSION {
+            continue;
+        }
+        let mapped = translate_stored_with(
+            &map,
+            src.mark_versions[i],
+            &src.marks[i].1,
+            &mut src.txt_unmapped,
+        )
+        .and_then(|s| {
+            translate_stored_with(
+                &map,
+                src.mark_versions[i],
+                &src.marks[i].2,
+                &mut src.txt_unmapped,
+            )
+            .map(|e| (s, e))
+        });
+        match mapped {
+            Some((s, e)) => {
+                src.marks[i].1 = s;
+                src.marks[i].2 = e;
+                src.mark_versions[i] = Some(CONVERTER_VERSION);
+                src.txt_mapped += 1;
+            }
+            None => drops.push(i),
+        }
+    }
+    for i in drops.into_iter().rev() {
+        src.marks.remove(i);
+        src.mark_versions.remove(i);
+    }
+    let mut drops = Vec::new();
+    let versions = src.bookmark_versions.clone();
+    for (i, version) in versions.iter().enumerate() {
+        if stored_txt_version(*version) == CONVERTER_VERSION {
+            continue;
+        }
+        match translate_stored_with(
+            &map,
+            src.bookmark_versions[i],
+            &src.bookmarks[i],
+            &mut src.txt_unmapped,
+        ) {
+            Some(bookmark) => {
+                src.bookmarks[i] = bookmark;
+                src.bookmark_versions[i] = Some(CONVERTER_VERSION);
+                src.txt_mapped += 1;
+            }
+            None => drops.push(i),
+        }
+    }
+    for i in drops.into_iter().rev() {
+        src.bookmarks.remove(i);
+        src.bookmark_versions.remove(i);
+    }
+}
+
+/// A locator for the fraction fallback that crengine-ng cannot place as an
+/// XPointer, and that still identifies its fraction in a snapshot key.
+fn fallback_locator(fraction: f32) -> aristotle_library::Locator {
+    aristotle_library::Locator::Page {
+        index: (fraction.clamp(0.0, 1.0) * 1_000_000.0) as u32,
+    }
+}
+
+fn translate_stored_with(
+    map: &txt::LegacyMap,
+    tagged: Option<u32>,
+    position: &Position,
+    notes: &mut Vec<String>,
+) -> Option<Position> {
+    let version = stored_txt_version(tagged);
+    if version == CONVERTER_VERSION {
+        return Some(position.clone());
+    }
+    if version != 1 {
+        notes.push(format!(
+            "{position:?}: written by converter {version}, this build reads {CONVERTER_VERSION}"
+        ));
+        return None;
+    }
+    match map.map_position(position) {
+        Ok(position) => Some(position),
+        Err(e) => {
+            notes.push(format!("{position:?}: {}", e.reason()));
+            None
+        }
+    }
+}
+
+/// The converter version a stored position names: tagged, or converter 1
+/// for records that predate tags (the only version that shipped).
+fn stored_txt_version(tagged: Option<u32>) -> u32 {
+    tagged.unwrap_or(1)
 }
 
 /// A book opened, placed and rendered: the slow part of opening, done by
@@ -189,19 +412,25 @@ impl Session {
     /// Open, place at the saved position and render the first page (and,
     /// with `neighbours`, the pages on either side), without touching
     /// anything the main thread owns.
-    pub fn prepare(src: Source, style: Style, neighbours: bool) -> Result<Prepared, Error> {
+    pub fn prepare(mut src: Source, style: Style, neighbours: bool) -> Result<Prepared, Error> {
+        let cancel = src.cancel.clone();
         let cancelled = || {
-            if src
-                .cancel
-                .as_ref()
-                .is_some_and(|c| c.load(Ordering::Relaxed))
-            {
+            if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
                 Err(format_err!("cancelled"))
             } else {
                 Ok(())
             }
         };
         cancelled()?;
+        migrate_txt_source(&mut src);
+        if !src.txt_unmapped.is_empty() {
+            for note in &src.txt_unmapped {
+                eprintln!(
+                    "aristotle: \"{}\": keeping a stored TXT position instead of moving it: {note}",
+                    src.title
+                );
+            }
+        }
         let t = Instant::now();
         let mut book = Book::open_with_progress(
             &src.path,
@@ -211,6 +440,7 @@ impl Session {
         )
         .with_context(|| format!("can't open {}", src.path.display()))?;
         book.set_night(src.night);
+        book.set_underline(src.underline);
         // The chrome fonts of this thread: FreeType faces can't move to
         // another one, so the session loads its own.
         let mut chrome = Chrome::load(&style).context("can't load the chrome fonts")?;
@@ -226,14 +456,24 @@ impl Session {
             src.paginate.then_some(src.mobi_cache.as_path()),
         );
         let t = Instant::now();
+        let jump = src.jump.take().and_then(|annotation| {
+            let position =
+                crate::marks::target(&annotation, src.format, book.mobi().map(|m| &m.info))?;
+            let tagged = annotation
+                .position
+                .as_ref()
+                .and_then(|(start, _)| crate::marks::version_of(start));
+            match (src.txt_version, src.txt_legacy.as_ref()) {
+                (Some(version), Some(map)) if stored_txt_version(tagged) != version => {
+                    map.map_position(&position).ok()
+                }
+                (Some(version), None) if stored_txt_version(tagged) != version => None,
+                _ => Some(position),
+            }
+        });
         let target = src
             .exact
-            .or_else(|| {
-                let annotation = src.jump.as_ref()?;
-                let position =
-                    crate::marks::target(annotation, src.format, book.mobi().map(|m| &m.info))?;
-                book.location_of(&position)
-            })
+            .or_else(|| jump.and_then(|position| book.location_of(&position)))
             .unwrap_or_else(|| {
                 progress::positions(
                     book.engine(),
@@ -324,11 +564,17 @@ impl Session {
             .as_ref()
             .map(|pr| pr.fraction)
             .unwrap_or_else(|| p.book.fraction(p.current));
+        let txt_version = p.src.txt_version;
+        let txt_legacy = p.src.txt_legacy.clone();
+        let txt_migrated = p.src.txt_mapped;
         Ok(Session {
             id: p.src.id,
             title: p.src.title,
             stamp: p.src.stamp,
             style: p.style,
+            txt_version,
+            txt_legacy,
+            txt_migrated,
             book: Some(p.book),
             degraded: false,
             last_fraction: Cell::new(initial_fraction),
@@ -554,7 +800,7 @@ impl Session {
                 fraction: self.last_fraction.get(),
                 locator: aristotle_library::Locator::Page { index: 0 },
                 updated: now,
-                source: Some("aristotle".into()),
+                source: self.progress_source(),
                 page: None,
             };
         };
@@ -566,7 +812,54 @@ impl Session {
             self.last_fraction.set(f);
             f
         };
-        progress::progress_at(&pos, fraction, now)
+        let mut progress = progress::progress_at(&pos, fraction, now);
+        progress.source = self.progress_source();
+        progress
+    }
+
+    /// The provenance written with this book's progress: a TXT book names
+    /// the converter version, so a later converter can translate the
+    /// XPointer instead of reading it against a different split.
+    fn progress_source(&self) -> Option<String> {
+        Some(
+            self.txt_version
+                .map(txt::source_for)
+                .unwrap_or_else(|| "aristotle".into()),
+        )
+    }
+
+    /// The TXT converter version of this book, if it is one.
+    pub fn txt_version(&self) -> Option<u32> {
+        self.txt_version
+    }
+
+    /// Stored converter-1 positions translated for this open.
+    pub fn txt_migrated(&self) -> usize {
+        self.txt_migrated
+    }
+
+    /// Translate a stored position for the current layout.
+    ///
+    /// `tagged` is the version encoded in the position; untagged positions
+    /// are converter 1. Positions of other formats are returned unchanged.
+    /// `None` means the position cannot be placed exactly and must not be
+    /// attached to other text.
+    pub fn map_stored_position(
+        &self,
+        position: &Position,
+        tagged: Option<u32>,
+    ) -> Option<Position> {
+        if self.txt_version.is_none() {
+            return Some(position.clone());
+        }
+        let version = stored_txt_version(tagged);
+        if version == CONVERTER_VERSION {
+            return Some(position.clone());
+        }
+        if version != 1 {
+            return None;
+        }
+        self.txt_legacy.as_ref()?.map_position(position).ok()
     }
 
     /// Chapter title, "Page x of y" (or a percentage before the pages are
@@ -981,6 +1274,154 @@ mod tests {
         assert_eq!(pixel(&page, x0 + 24, 20), 0);
         assert_eq!(pixel(&page, x0 + 24, 3), 0);
         assert_eq!(pixel(&page, x0 + 2, 20), 0xff);
+    }
+    fn txt_source_for(path: std::path::PathBuf, saved: Progress) -> Source {
+        Source {
+            id: "txt".into(),
+            title: "Synthetic TXT".into(),
+            path,
+            stamp: (1, 2),
+            data_dir: std::path::PathBuf::from("."),
+            mobi_cache: std::path::PathBuf::from("."),
+            saved: Some(saved),
+            marks: vec![(
+                Some(0),
+                Position::XPointer {
+                    xpointer: "/body/DocFragment[1]/body/p[2]/text().0".into(),
+                },
+                Position::XPointer {
+                    xpointer: "/body/DocFragment[1]/body/p[4]/text().0".into(),
+                },
+            )],
+            mark_versions: vec![None],
+            bookmarks: vec![Position::XPointer {
+                xpointer: "/body/DocFragment[1]/body/p[1]".into(),
+            }],
+            bookmark_versions: vec![None],
+            secs_per_page: 30.0,
+            exact: None,
+            jump: None,
+            format: aristotle_library::Format::Txt,
+            txt_version: Some(CONVERTER_VERSION),
+            txt_mapped: 0,
+            txt_unmapped: Vec::new(),
+            txt_legacy: None,
+            paginate: false,
+            cancel: None,
+            progress: None,
+            night: false,
+            underline: Underline::Off,
+        }
+    }
+
+    #[test]
+    fn future_txt_progress_uses_fraction_without_reinterpreting_its_pointer() {
+        let dir = crate::testdir("txt-future-progress");
+        let path = dir.join("book.txt");
+        std::fs::write(&path, "第一章 开始\n正文").unwrap();
+        let mut saved = progress::progress_at(
+            &Position::XPointer {
+                xpointer: "/body/DocFragment[1]/body/p/text().0".into(),
+            },
+            0.5,
+            1,
+        );
+        saved.source = Some(txt::source_for(CONVERTER_VERSION + 1));
+        let mut source = txt_source_for(path, saved);
+        source.marks.clear();
+        source.mark_versions.clear();
+        source.bookmarks.clear();
+        source.bookmark_versions.clear();
+        migrate_txt_source(&mut source);
+        assert_eq!(source.txt_mapped, 0);
+        assert_eq!(source.saved.unwrap().locator, fallback_locator(0.5));
+        assert_eq!(source.txt_unmapped.len(), 1);
+    }
+
+    #[test]
+    fn the_open_worker_translates_legacy_progress_and_marks() {
+        let dir = crate::testdir("txt-migrate");
+        let src = dir.join("book.txt");
+        std::fs::write(
+            &src,
+            "第一章 开始\n一段。\n二段。\nChapter 5 New\n三段。\n第二章 继续\n四段。\n五段。",
+        )
+        .unwrap();
+        let mut source = txt_source_for(
+            src,
+            Progress {
+                fraction: 0.4,
+                locator: aristotle_library::Locator::XPointer {
+                    xpointer: "/body/DocFragment[1]/body/p[3]/text().0".into(),
+                },
+                updated: 1,
+                source: Some("aristotle".into()),
+                page: None,
+            },
+        );
+        migrate_txt_source(&mut source);
+        assert_eq!(source.txt_mapped, 3);
+        assert!(source.txt_unmapped.is_empty());
+        assert_eq!(
+            source.saved.as_ref().unwrap().locator,
+            aristotle_library::Locator::XPointer {
+                xpointer: "/body/DocFragment[2]/body/h2[1]/text().0".into()
+            }
+        );
+        assert_eq!(
+            source.saved.as_ref().unwrap().source.as_deref(),
+            Some("aristotle/txt2")
+        );
+        assert_eq!(
+            source.marks[0].1,
+            Position::XPointer {
+                xpointer: "/body/DocFragment[1]/body/p[2]/text().0".into()
+            }
+        );
+        assert_eq!(
+            source.marks[0].2,
+            Position::XPointer {
+                xpointer: "/body/DocFragment[2]/body/p[1]/text().0".into()
+            }
+        );
+        assert_eq!(source.mark_versions, vec![Some(CONVERTER_VERSION)]);
+        assert_eq!(
+            source.bookmarks[0],
+            Position::XPointer {
+                xpointer: "/body/DocFragment[1]/body/p[1]".into()
+            }
+        );
+        assert_eq!(source.bookmark_versions, vec![Some(CONVERTER_VERSION)]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unmappable_legacy_mark_is_kept_out_of_this_open() {
+        let dir = crate::testdir("txt-migrate-bad");
+        let src = dir.join("book.txt");
+        std::fs::write(&src, "第一章 开始\n一段。\n二段。").unwrap();
+        let mut source = txt_source_for(
+            src,
+            Progress {
+                fraction: 0.4,
+                locator: aristotle_library::Locator::XPointer {
+                    xpointer: "/body/DocFragment[9]/body/p[1]".into(),
+                },
+                updated: 1,
+                source: Some("aristotle".into()),
+                page: None,
+            },
+        );
+        migrate_txt_source(&mut source);
+        assert_eq!(
+            source.saved.as_ref().unwrap().locator,
+            aristotle_library::Locator::Page { index: 400_000 }
+        );
+        assert!(source.marks.is_empty() && source.mark_versions.is_empty());
+        // The bookmark at p[1] still maps exactly and is kept.
+        assert_eq!(source.bookmarks.len(), 1);
+        assert_eq!(source.txt_unmapped.len(), 2, "{:?}", source.txt_unmapped);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

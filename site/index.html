@@ -171,8 +171,8 @@ body[data-lang="en"] .en { display: block; }
       </div>
       <div class="card">
         <h3 class="zh">为墨水屏设计</h3><h3 class="en">Made for e-ink</h3>
-        <p class="zh">无动画、高对比、局部刷新；实体翻页键和重力旋转都可用；前光跟随原系统。</p>
-        <p class="en">No animations, high contrast, partial refresh; page buttons and rotation; stock frontlight control.</p>
+        <p class="zh">无动画、高对比、局部刷新；支持实体翻页键与启动时正拿/倒拿适配；前光跟随原系统。</p>
+        <p class="en">No animations, high contrast, partial refresh; page buttons and startup upright/upside-down mapping; stock frontlight control.</p>
       </div>
       <div class="card">
         <h3 class="zh">中文优先</h3><h3 class="en">Chinese-first</h3>
@@ -207,20 +207,20 @@ body[data-lang="en"] .en { display: block; }
 <section id="install">
   <div class="wrap">
     <h2 class="zh">安装</h2><h2 class="en">Install</h2>
-    <p class="sub zh">只支持 Kindle Oasis 2（第 9 代，2017）+ 固件 5.16.x + 已越狱 + KUAL。安装包由源码构建，详见仓库文档。</p>
-    <p class="sub en">Kindle Oasis 2 (9th gen, 2017), firmware 5.16.x, jailbroken with KUAL. Build the package from source.</p>
+    <p class="sub zh">只支持 Kindle Oasis 2（第 9 代，2017）+ 固件 5.16.x + 已越狱 + KUAL。从 GitHub Releases 下载 0.3.1 预览版，校验后安装。</p>
+    <p class="sub en">Kindle Oasis 2 (9th gen, 2017), firmware 5.16.x, jailbroken with KUAL. Download and verify the 0.3.1 preview from GitHub Releases.</p>
     <div class="split">
       <div>
         <ol class="steps zh">
           <li>备份 Kindle 上的 <code>.aristotle/</code>、<code>documents/</code> 与 <code>My Clippings.txt</code>。</li>
-          <li>按 <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/BUILD.md">BUILD.md</a> 构建设备包，得到 <code>aristotle/</code> 与 <code>extensions/</code>。</li>
+          <li>从 <a href="https://github.com/jasonchencnn/moyue-kindle/releases/tag/v0.3.1">GitHub Releases</a> 下载 ZIP 与 SHA256SUMS，校验后解压。</li>
           <li>把两个文件夹复制到 Kindle USB 盘根目录，合并覆盖同名文件。</li>
           <li>安全弹出，打开 KUAL → 墨阅 → 启动墨阅。</li>
           <li>打开一本书，检查正文、翻页键与触摸；需要时在设置里登录 Readest 账号。</li>
         </ol>
         <ol class="steps en">
           <li>Back up <code>.aristotle/</code>, <code>documents/</code> and <code>My Clippings.txt</code> on the Kindle.</li>
-          <li>Build the device bundle as described in <a href="https://github.com/jasonchencnn/moyue-kindle/blob/main/docs/BUILD.md">BUILD.md</a>.</li>
+          <li>Download the ZIP and SHA256SUMS from <a href="https://github.com/jasonchencnn/moyue-kindle/releases/tag/v0.3.1">GitHub Releases</a>, verify and extract the ZIP.</li>
           <li>Copy <code>aristotle/</code> and <code>extensions/</code> to the Kindle's USB root.</li>
           <li>Eject safely, then start it from KUAL → 墨阅 → 启动墨阅.</li>
           <li>Open a book and check reading, page buttons and touch; sign in to Readest in Settings if needed.</li>

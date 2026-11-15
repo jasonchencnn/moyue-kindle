@@ -55,11 +55,26 @@ pub fn progress_at(position: &Position, fraction: f32, now: i64) -> Progress {
 
 /// [`progress_at`] for a locator already made (a snapshot's page).
 pub fn progress_for(locator: Locator, fraction: f32, now: i64) -> Progress {
+    progress_for_source(locator, fraction, now, None)
+}
+
+/// [`progress_for`] with an explicit provenance, for a position whose
+/// converter version must survive (see [`aristotle_render::txt::source_for`]).
+pub fn progress_for_source(
+    locator: Locator,
+    fraction: f32,
+    now: i64,
+    txt_version: Option<u32>,
+) -> Progress {
     Progress {
         fraction: fraction.clamp(0.0, 1.0),
         locator,
         updated: now,
-        source: Some("aristotle".into()),
+        source: Some(
+            txt_version
+                .map(aristotle_render::txt::source_for)
+                .unwrap_or_else(|| "aristotle".into()),
+        ),
         page: None,
     }
 }
@@ -274,6 +289,28 @@ mod tests {
             ]
         );
         assert!(positions(Engine::Plato, None, false).is_empty());
+    }
+
+    #[test]
+    fn txt_progress_carries_the_converter_version() {
+        let p = progress_for_source(
+            Locator::XPointer {
+                xpointer: "/body/DocFragment[1]/body/p[1]".into(),
+            },
+            0.5,
+            1,
+            Some(2),
+        );
+        assert_eq!(p.source.as_deref(), Some("aristotle/txt2"));
+        let epub = progress_for_source(
+            Locator::XPointer {
+                xpointer: "/body/DocFragment[1]".into(),
+            },
+            0.5,
+            1,
+            None,
+        );
+        assert_eq!(epub.source.as_deref(), Some("aristotle"));
     }
 
     #[test]

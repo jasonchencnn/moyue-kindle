@@ -1659,3 +1659,90 @@ fn test_cjk_indent_class_style_and_u3000_spaces() {
 
     let _ = std::fs::remove_dir_all(&temp);
 }
+
+#[test]
+fn a_page_size_change_relays_out_the_book_at_the_new_size() {
+    let _serial = serial();
+    let Some(cache) = cache() else {
+        return;
+    };
+    let style = Style::pw4();
+    let Some(mut book) = open_book(&cache, &style) else {
+        return;
+    };
+
+    // The portrait page the book opens with.
+    let mut chrome = Chrome::load(&style).expect("chrome fonts must load");
+    let page = book
+        .render_location_with(0, &mut chrome, None)
+        .expect("render the portrait page");
+    assert_eq!(page.width, style.width, "the portrait page keeps its width");
+    assert_eq!(
+        page.height, style.height,
+        "the portrait page keeps its height"
+    );
+
+    // The same panel turned sideways. The book is not reopened: the layout
+    // path has to change the engine's viewport too, or the page comes back
+    // with the old geometry.
+    let mut landscape = style.clone();
+    landscape.width = style.height;
+    landscape.height = style.width;
+    book.set_layout(&landscape)
+        .expect("set the landscape layout");
+
+    let mut chrome = Chrome::load(&landscape).expect("chrome fonts must load");
+    let page = book
+        .render_location_with(0, &mut chrome, None)
+        .expect("render the landscape page");
+    assert_eq!(
+        page.width, landscape.width,
+        "the landscape page is as wide as the new layout says"
+    );
+    assert_eq!(
+        page.height, landscape.height,
+        "the landscape page is as tall as the new layout says"
+    );
+    assert!(
+        page.width > page.height,
+        "the landscape page is wider than it is tall"
+    );
+
+    // Back to portrait: the book is still usable at the old size.
+    book.set_layout(&style)
+        .expect("set the portrait layout back");
+    let mut chrome = Chrome::load(&style).expect("chrome fonts must load");
+    let page = book
+        .render_location_with(0, &mut chrome, None)
+        .expect("render the portrait page again");
+    assert_eq!(page.width, style.width);
+    assert_eq!(page.height, style.height);
+}
+
+#[test]
+fn a_rejected_page_size_leaves_the_book_alone() {
+    let _serial = serial();
+    let Some(cache) = cache() else {
+        return;
+    };
+    let style = Style::pw4();
+    let Some(mut book) = open_book(&cache, &style) else {
+        return;
+    };
+
+    // A screen shorter than the footer margin: the body height underflows
+    // and is not a page size. The book must keep its old geometry.
+    let mut broken = style.clone();
+    broken.height = 10;
+    assert!(
+        book.set_layout(&broken).is_err(),
+        "an underflowed body height must be rejected"
+    );
+
+    let mut chrome = Chrome::load(&style).expect("chrome fonts must load");
+    let page = book
+        .render_location_with(0, &mut chrome, None)
+        .expect("the book still renders at the old size");
+    assert_eq!(page.width, style.width);
+    assert_eq!(page.height, style.height);
+}

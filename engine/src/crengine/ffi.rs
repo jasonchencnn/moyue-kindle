@@ -269,11 +269,23 @@ extern "C" {
         dst_width: c_int,
         dst_height: c_int,
         invert_images: c_int,
+        underline: c_int,
+        underline_gray: c_int,
         err: *mut c_char,
         err_len: usize,
     ) -> c_int;
     fn cr_doc_set_layout(
         doc: *mut CrDoc,
+        layout: *const CrLayout,
+        progress_cb: Option<CrProgressCb>,
+        user_data: *mut c_void,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> c_int;
+    fn cr_doc_set_viewport(
+        doc: *mut CrDoc,
+        width: c_int,
+        height: c_int,
         layout: *const CrLayout,
         progress_cb: Option<CrProgressCb>,
         user_data: *mut c_void,
@@ -779,15 +791,20 @@ impl Document {
 
     /// 渲染第 `page` 页（0 起）到 8 位灰度缓冲。
     pub fn render_page(&mut self, page: u32, buffer: &mut GrayBuffer) -> Result<(), String> {
-        self.render_page_with_options(page, buffer, false)
+        self.render_page_with_options(page, buffer, false, 0, 0)
     }
 
-    /// 渲染第 `page` 页（0 起）到 8 位灰度缓冲，支持设置图片反色。
+    /// 渲染第 `page` 页（0 起）到 8 位灰度缓冲，支持设置图片反色与正文引导线。
+    ///
+    /// `underline` 取值：0 不画、1 实线、2 点状虚线；`underline_gray` 是
+    /// 引导线的灰度（0 黑、255 白），0 表示用引擎默认灰度。
     pub fn render_page_with_options(
         &mut self,
         page: u32,
         buffer: &mut GrayBuffer,
         invert_images: bool,
+        underline: u8,
+        underline_gray: u8,
     ) -> Result<(), String> {
         let mut err = [0 as c_char; ERR_LEN];
         let len = buffer.pixels().len();
@@ -810,6 +827,8 @@ impl Document {
                 width,
                 height,
                 invert,
+                underline as c_int,
+                underline_gray as c_int,
                 err.as_mut_ptr(),
                 ERR_LEN,
             )
@@ -864,6 +883,67 @@ impl Document {
                 msg
             });
         }
+        Ok(())
+    }
+
+    /// 换一套排版参数，并按新的页面尺寸重新排版，可选传入排版进度回调（0..=100）。
+    ///
+    /// 尺寸变了要整本重排：排好版的分片是按旧宽度排的。shim 那边会把视口、
+    /// 输出缓冲和尺寸元数据一起换掉，重排不出来时换回原尺寸。
+    ///
+    /// 只有成功之后才更新本 struct 里的宽高：失败时 Rust 侧记的还是旧尺寸，
+    /// 和 shim 里回退后的尺寸对得上。
+    pub fn set_viewport(
+        &mut self,
+        width: u32,
+        height: u32,
+        layout: &LayoutSettings,
+        css: &str,
+        mut progress: Option<&mut dyn FnMut(u32)>,
+    ) -> Result<(), String> {
+        let args = CrLayoutArgs::new(layout, css)?;
+        let cr_layout = args.layout();
+        let mut err = [0 as c_char; ERR_LEN];
+
+        let (cb, user_data) = match &mut progress {
+            Some(f) => {
+                let ptr: *mut &mut dyn FnMut(u32) = f;
+                (
+                    Some(progress_trampoline as CrProgressCb),
+                    ptr as *mut c_void,
+                )
+            }
+            None => (None, std::ptr::null_mut()),
+        };
+
+        // SAFETY: self.doc 有效；cr_layout 是对齐的 repr(C) 结构，
+        // 其内部指针都指向 args 里的 CString，在调用期间有效；
+        // progress_trampoline 在调用期间同步触发，user_data 指向本栈帧上的闭包引用；
+        // err 是合法可写缓冲区；
+        // 引擎锁保证同一时刻没有别的线程在 crengine 里。
+        let doc = self.doc;
+        let code = with_engine_lock(|| unsafe {
+            cr_doc_set_viewport(
+                doc,
+                width as c_int,
+                height as c_int,
+                &cr_layout,
+                cb,
+                user_data,
+                err.as_mut_ptr(),
+                ERR_LEN,
+            )
+        });
+        if code != 0 {
+            let msg = take_error(&err);
+            return Err(if msg.is_empty() {
+                format!("换页面尺寸失败（代码 {code}）")
+            } else {
+                msg
+            });
+        }
+        self.width = width;
+        self.height = height;
         Ok(())
     }
 

@@ -65,6 +65,41 @@ pub const MAX_MARGIN_PX: u32 = 256;
 /// 超过它一定是调用方传错了参数。
 pub const MAX_PAGE_DIMENSION_PX: u32 = 8192;
 
+/// 页面宽度或高度的下限（像素）。
+///
+/// crengine 的 `LVDocView::Resize()` 会把尺寸钳到 80..=32767：比 80 小的
+/// 页面会被静默放大，而引擎那边的页面尺寸和调用方以为的尺寸就对不上了
+/// （渲染按 80 宽写，缓冲按调用方的宽度解读，整页错行）。所以下限在这里
+/// 挡住，别让那种尺寸走到引擎里。
+pub const MIN_PAGE_DIMENSION_PX: u32 = 80;
+
+/// 校验页面尺寸（像素宽高）。
+///
+/// 宽高都不能是 0：0 宽的页面排不出内容。也不能超过
+/// [`MAX_PAGE_DIMENSION_PX`]，理由见那里的说明。
+///
+/// 尺寸不合法时返回 [`Error::InvalidLayout`]，调用方在改动文档之前就该
+/// 挡住，不能让引擎拿着半个改好的状态继续跑。
+pub fn validate_page_size(size: (u32, u32)) -> Result<()> {
+    let (width, height) = size;
+    if width == 0 || height == 0 {
+        return Err(Error::InvalidLayout(format!(
+            "页面尺寸 {width}x{height} 非法：宽高都不能是 0"
+        )));
+    }
+    if width < MIN_PAGE_DIMENSION_PX || height < MIN_PAGE_DIMENSION_PX {
+        return Err(Error::InvalidLayout(format!(
+            "页面尺寸 {width}x{height} 小于下限 {MIN_PAGE_DIMENSION_PX}px"
+        )));
+    }
+    if width > MAX_PAGE_DIMENSION_PX || height > MAX_PAGE_DIMENSION_PX {
+        return Err(Error::InvalidLayout(format!(
+            "页面尺寸 {width}x{height} 超出上限 {MAX_PAGE_DIMENSION_PX}px"
+        )));
+    }
+    Ok(())
+}
+
 /// 页面四边的页边距，单位是设备像素。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Margins {

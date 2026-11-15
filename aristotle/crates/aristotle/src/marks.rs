@@ -55,8 +55,39 @@ pub fn encode(p: &Position) -> String {
     aristotle_render::locator::encode(p)
 }
 
+/// [`encode`] for a position into a generated TXT EPUB, tagged with the
+/// converter version that produced it.
+///
+/// The converter rewrites `DocFragment`/paragraph numbering between versions,
+/// so a stored position alone cannot say which split it names. The tag is
+/// local to the position string: the annotation's own `source` stays
+/// "aristotle", so exports and the reader keep treating it as ours.
+pub fn encode_versioned(p: &Position, txt_version: Option<u32>) -> String {
+    match txt_version {
+        Some(version) => format!("txt{version}:{}", encode(p)),
+        None => encode(p),
+    }
+}
+
+/// The converter version tagged into a stored position, if any.
+///
+/// An untagged position was written before tags existed: converter 1, the
+/// only TXT converter that shipped.
+pub fn version_of(encoded: &str) -> Option<u32> {
+    let rest = encoded.strip_prefix("txt")?;
+    let (version, _) = rest.split_once(':')?;
+    version.parse().ok()
+}
+
+fn untagged(encoded: &str) -> &str {
+    match version_of(encoded).and_then(|_| encoded.split_once(':')) {
+        Some((_, rest)) => rest,
+        None => encoded,
+    }
+}
+
 pub fn decode(s: &str) -> Option<Position> {
-    aristotle_render::locator::decode(s)
+    aristotle_render::locator::decode(untagged(s))
 }
 
 /// Kindle location of a Plato location (or a MOBI position): 1-based, 150
@@ -81,6 +112,9 @@ pub struct NewHighlight {
     pub text: String,
     pub start: Position,
     pub end: Position,
+    /// The TXT converter version, when the highlight is in a TXT book read
+    /// through the generated EPUB.
+    pub txt_version: Option<u32>,
     /// Byte counts for Kindle locations: the start and end in the text.
     pub start_bytes: u64,
     pub end_bytes: u64,
@@ -101,7 +135,10 @@ pub fn highlight(h: NewHighlight) -> Annotation {
         } else {
             Some((kindle_location(h.start_bytes), kindle_location(h.end_bytes)))
         },
-        position: Some((encode(&h.start), encode(&h.end))),
+        position: Some((
+            encode_versioned(&h.start, h.txt_version),
+            encode_versioned(&h.end, h.txt_version),
+        )),
         created: Some(h.created),
         modified: None,
         color: None,
@@ -112,14 +149,23 @@ pub fn highlight(h: NewHighlight) -> Annotation {
     }
 }
 
-pub fn bookmark(at: &Position, bytes: u64, chapter: Option<String>, created: String) -> Annotation {
+pub fn bookmark(
+    at: &Position,
+    bytes: u64,
+    chapter: Option<String>,
+    created: String,
+    txt_version: Option<u32>,
+) -> Annotation {
     Annotation {
         id: aristotle_library::index::generate_annotation_id(),
         kind: AnnotationKind::Bookmark,
         text: None,
         page: None,
         location: Some((kindle_location(bytes), kindle_location(bytes))),
-        position: Some((encode(at), encode(at))),
+        position: Some((
+            encode_versioned(at, txt_version),
+            encode_versioned(at, txt_version),
+        )),
         created: Some(created),
         modified: None,
         color: None,
@@ -130,16 +176,29 @@ pub fn bookmark(at: &Position, bytes: u64, chapter: Option<String>, created: Str
     }
 }
 
-/// The book's annotations made here, of one kind, with decoded positions.
-pub fn ours(book: &BookRecord, kind: AnnotationKind) -> Vec<(usize, Position, Position)> {
+/// The book's annotations made here, of one kind, with decoded positions
+/// and the TXT converter version tagged into them (`None` for untagged,
+/// converter 1, and for other formats).
+pub fn ours_versioned(
+    book: &BookRecord,
+    kind: AnnotationKind,
+) -> Vec<(usize, Position, Position, Option<u32>)> {
     book.annotations
         .iter()
         .enumerate()
         .filter(|(_, a)| a.kind == kind && a.source == SOURCE)
         .filter_map(|(i, a)| {
             let (s, e) = a.position.as_ref()?;
-            Some((i, decode(s)?, decode(e)?))
+            Some((i, decode(s)?, decode(e)?, version_of(s)))
         })
+        .collect()
+}
+
+/// The book's annotations made here, of one kind, with decoded positions.
+pub fn ours(book: &BookRecord, kind: AnnotationKind) -> Vec<(usize, Position, Position)> {
+    ours_versioned(book, kind)
+        .into_iter()
+        .map(|(i, s, e, _)| (i, s, e))
         .collect()
 }
 
@@ -213,7 +272,7 @@ mod tests {
 
     #[test]
     fn imported_targets_require_exact_positions_in_a_matching_format() {
-        let mut a = bookmark(&Position::Kindle(7510), 7510, None, String::new());
+        let mut a = bookmark(&Position::Kindle(7510), 7510, None, String::new(), None);
         let single = aristotle_render::mobi::MobiInfo {
             version: 6,
             text_length: 10_000,
@@ -262,6 +321,7 @@ mod tests {
             100,
             None,
             String::new(),
+            None,
         );
         let mut imported = a.clone();
         imported.source = "kindle-sidecar".into();
@@ -306,7 +366,7 @@ mod tests {
         assert_eq!(map.location(end + 1), map.location(end));
         for info in [cold, warm] {
             assert_eq!(u64::from(info.text_length), end);
-            let mut a = bookmark(&Position::Kindle(0), 0, None, String::new());
+            let mut a = bookmark(&Position::Kindle(0), 0, None, String::new(), None);
             a.source = "kindle-sidecar".into();
             for position in [0, 14, end - 1, end, end + 1, u64::MAX] {
                 let raw_position = format!("{position}:{position}:11:state");
@@ -322,7 +382,7 @@ mod tests {
             };
             a.position = Some(("14".into(), "14".into()));
             assert_eq!(target(&a, Format::Mobi, Some(&joint)), None);
-            let own = bookmark(&Position::Kindle(u64::MAX), 0, None, String::new());
+            let own = bookmark(&Position::Kindle(u64::MAX), 0, None, String::new(), None);
             assert_eq!(
                 target(&own, Format::Mobi, Some(&joint)),
                 Some(Position::Kindle(u64::MAX))
@@ -492,6 +552,7 @@ mod tests {
                 item: 2,
                 offset: 9070,
             },
+            txt_version: None,
             start_bytes: 45_000,
             end_bytes: 45_070,
             page: None,
@@ -509,6 +570,7 @@ mod tests {
             10,
             None,
             "2026-10-17 21:00:00".into(),
+            None,
         ));
 
         let dir = crate::testdir("marks-export");
@@ -558,6 +620,7 @@ mod tests {
                 item: 2,
                 offset: 20,
             },
+            txt_version: None,
             start_bytes: 1500,
             end_bytes: 1520,
             page: None,
@@ -600,6 +663,7 @@ mod tests {
                 item: 2,
                 offset: 20,
             },
+            txt_version: None,
             start_bytes: 1500,
             end_bytes: 1520,
             page: None,

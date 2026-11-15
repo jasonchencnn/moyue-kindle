@@ -1,6 +1,6 @@
 # Documentation
 
-The 0.3.0 preview in this fork runs on a jailbroken Kindle Oasis 2 on firmware
+The 0.3.1 preview in this fork runs on a jailbroken Kindle Oasis 2 on firmware
 5.16.x. Start with the [Chinese installation, uninstall and recovery guide](../../docs/安装卸载与恢复.md)
 if you have not installed it yet. The English pages below also cover the
 upstream Paperwhite 4 build.

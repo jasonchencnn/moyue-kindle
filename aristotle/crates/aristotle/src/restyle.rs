@@ -593,29 +593,35 @@ impl App {
         let Screen::Reader(r) = &mut self.screen else {
             return Ok(());
         };
-        let Some(book) = r.session.take_book() else {
-            return Ok(());
-        };
         let id = r.session.id.clone();
         let rec = self.lib.book(&id).cloned();
+        // Translate stored converter-1 marks before the book leaves the
+        // session (its in-memory split is the one loaded by the open worker).
         let marks = rec
             .as_ref()
             .map(|rec| {
-                crate::marks::ours(rec, AnnotationKind::Highlight)
+                crate::marks::ours_versioned(rec, AnnotationKind::Highlight)
                     .into_iter()
-                    .map(|(i, s, e)| (Some(i), s, e))
+                    .filter_map(|(i, s, e, version)| {
+                        let s = r.session.map_stored_position(&s, version)?;
+                        let e = r.session.map_stored_position(&e, version)?;
+                        Some((Some(i), s, e))
+                    })
                     .collect()
             })
             .unwrap_or_default();
         let bookmarks = rec
             .as_ref()
             .map(|rec| {
-                crate::marks::ours(rec, AnnotationKind::Bookmark)
+                crate::marks::ours_versioned(rec, AnnotationKind::Bookmark)
                     .into_iter()
-                    .map(|(_, s, _)| s)
+                    .filter_map(|(_, s, _, version)| r.session.map_stored_position(&s, version))
                     .collect()
             })
             .unwrap_or_default();
+        let Some(book) = r.session.take_book() else {
+            return Ok(());
+        };
         let secs_per_page = self.speed.secs_per_page();
         let worker = spawn_partial(book, style, anchor, marks, bookmarks, secs_per_page);
         let progress = Arc::new(AtomicU8::new(0));
@@ -639,6 +645,7 @@ impl App {
         let mut src = Source::new(&self.lib, &rec, &self.mobi_cache)?;
         src.saved = Some(anchor);
         src.night = self.prefs.night;
+        src.underline = self.prefs.underline();
         let worker = crate::open::spawn_with(src, style, false);
         let progress = worker.progress.clone();
         self.restyler.worker = Some(RestyleWorker {

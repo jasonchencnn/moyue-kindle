@@ -1,0 +1,26 @@
+{
+  "items": [
+    {
+      "name": "墨阅书库清理",
+      "items": [
+        {
+          "name": "备份并清空书库列表",
+          "items": [
+            {
+              "name": "确认清空（进度与笔记归档到备份）",
+              "action": "sh ./clear-library.sh",
+              "exitmenu": false,
+              "status": false
+            },
+            {
+              "name": "取消",
+              "action": "true",
+              "exitmenu": false,
+              "status": false
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

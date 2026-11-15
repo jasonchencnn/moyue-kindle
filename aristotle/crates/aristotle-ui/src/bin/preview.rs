@@ -2351,13 +2351,14 @@ fn typeset_screens(profile: Screen, out: &Path, fonts_dir: &Path) {
         ],
         selected_latin_font: 0,
         latin_page: 0,
-        size_index: 3,    // 44 px (prototype default)
-        spacing_index: 1, // 标准 (1.7)
-        margin_index: 1,  // 标准 (88 px)
-        indent_index: 0,  // 2 字
-        script_index: 0,  // 简体
-        gap_index: 2,     // 大 (0.6)
-        trim_index: 0,    // 开
+        size_index: 3,      // 44 px (prototype default)
+        spacing_index: 1,   // 标准 (1.7)
+        margin_index: 1,    // 标准 (88 px)
+        indent_index: 0,    // 2 字
+        script_index: 0,    // 简体
+        gap_index: 2,       // 大 (0.6)
+        underline_index: 0, // 无
+        trim_index: 0,      // 开
         anim_enabled: false,
         anim_speed: 1, // 标准
     };

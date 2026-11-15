@@ -16,6 +16,7 @@
 #include <lvpagesplitter.h>
 #include <lvstring.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -141,6 +142,12 @@ constexpr int kGrayBits = 8;
  * 超大尺寸会直接让 LVGrayDrawBuf 越界写。8192 远超任何真实墨水屏。 */
 constexpr int kMaxPageDimension = 8192;
 
+/* 页面宽高下限（像素），与 crengine 的 SCREEN_SIZE_MIN 一致（crsetup.h）。
+ * LVDocView::Resize() 会把更小的尺寸静默钳到 80：放进来就会变成「引擎按 80
+ * 排版、缓冲按调用方尺寸解读」，整页错行。Rust 层有同一套校验，这里再挡一道，
+ * 保证 C 边界单独被调用时也不会出现不一致的尺寸。 */
+constexpr int kMinPageDimension = 80;
+
 /* C++ 异常时返回的错误码。与正常错误的 1..6 区分开。 */
 constexpr int kErrorException = 99;
 
@@ -249,6 +256,131 @@ CrRect to_page_rect(const lvRect &rc, int page_start, int margin_left, int margi
     out.width = rc.width();
     out.height = rc.height();
     return out;
+}
+
+void draw_underline_line(const CrDoc *doc, uint8_t *dst, int width, int height, int flow_top,
+                         int flow_bottom, int flow_left, int flow_right, int page_start,
+                         int page_end, int style, lUInt8 gray, int thickness, int dotted_gap);
+
+/* 正文每行下方的引导线。
+ *
+ * 用的是 crengine 自己的行几何：getPageDocumentRange() 拿到本页的文档
+ * 范围，getSegmentRects() 给出每个文本行一个矩形（默认不含图片）。
+ * 所以引导线只落在正文文字行的下面，图片、页眉页脚都不会被画到。
+ *
+ * 引导线画进 cr_doc_render_page 的页面缓冲里，和文字同一次渲染完成，
+ * 翻页路径上不额外调用引擎。 */
+void draw_underline_guides(const CrDoc *doc, int page, uint8_t *dst, int width, int height,
+                           int style, int gray) {
+    if (style <= 0 || doc->view == nullptr || dst == nullptr) {
+        return;
+    }
+    LVRef<ldomXRange> range = doc->view->getPageDocumentRange(page);
+    if (range.isNull()) {
+        return; // 空页
+    }
+    LVArray<lvRect> rects;
+    range->getSegmentRects(rects); // 每个文本行一个矩形，图片不在其中
+    const int count = rects.length();
+    if (count <= 0) {
+        return;
+    }
+    const int page_start = page_flow_start(doc, page);
+    const int page_end = page_flow_end(doc, page);
+    const lUInt8 g = static_cast<lUInt8>(std::clamp(gray, 0, 255));
+    // 实线 2 像素、点线 2 像素实 4 像素空。
+    const int thickness = 2;
+    const int dotted_gap = 4;
+
+    /* 同一行可能有多个片段（双向文字），按行的 y 合并成一段，
+     * 免得一行被切成两截短线。 */
+    int line_top = 0;
+    int line_bottom = 0;
+    int line_left = 0;
+    int line_right = 0;
+    bool have_line = false;
+    for (int r = 0; r < count; r++) {
+        const lvRect &rc = rects[r];
+        if (rc.top >= page_end) {
+            break; // 其实在下一页
+        }
+        if (!have_line || rc.top != line_top) {
+            if (have_line) {
+                draw_underline_line(doc, dst, width, height, line_top, line_bottom, line_left,
+                                    line_right, page_start, page_end, style, g, thickness, dotted_gap);
+            }
+            line_top = rc.top;
+            line_bottom = rc.bottom;
+            line_left = rc.left;
+            line_right = rc.right;
+            have_line = true;
+            continue;
+        }
+        if (rc.bottom > line_bottom) {
+            line_bottom = rc.bottom;
+        }
+        if (rc.left < line_left) {
+            line_left = rc.left;
+        }
+        if (rc.right > line_right) {
+            line_right = rc.right;
+        }
+    }
+    if (have_line) {
+        draw_underline_line(doc, dst, width, height, line_top, line_bottom, line_left, line_right,
+                            page_start, page_end, style, g, thickness, dotted_gap);
+    }
+}
+
+/* 画一行文字下方的引导线（文档流坐标转页面坐标后落在页面缓冲里）。 */
+void draw_underline_line(const CrDoc *doc, uint8_t *dst, int width, int height, int flow_top,
+                         int flow_bottom, int flow_left, int flow_right, int page_start,
+                         int page_end, int style, lUInt8 gray, int thickness, int dotted_gap) {
+    (void)page_end;
+    const int top = flow_top - page_start + doc->margin_top;
+    const int bottom = flow_bottom - page_start + doc->margin_top;
+    const int left = flow_left + doc->margin_left;
+    const int right = flow_right + doc->margin_left;
+    // 引导线在文字下方 2 像素；行距不够时贴到文字下方 1 像素画一条细线。
+    int y = bottom + 2;
+    int thick = thickness;
+    if (y + thick > height) {
+        return;
+    }
+    if (y <= top) {
+        return; // 与文字重叠，不画
+    }
+    if (y >= height) {
+        return;
+    }
+    int x_end = right;
+    if (x_end > width) {
+        x_end = width;
+    }
+    int x = left;
+    if (x < 0) {
+        x = 0;
+    }
+    if (x >= x_end) {
+        return;
+    }
+    for (int py = y; py < y + thick && py < height; py++) {
+        uint8_t *row = dst + static_cast<size_t>(py) * static_cast<size_t>(width);
+        if (style == 2) {
+            // 点状：2 像素实、4 像素空。
+            for (int px = x; px < x_end;) {
+                const int run_end = px + thickness < x_end ? px + thickness : x_end;
+                for (int i = px; i < run_end; i++) {
+                    row[i] = gray;
+                }
+                px = run_end + dotted_gap;
+            }
+        } else {
+            for (int px = x; px < x_end; px++) {
+                row[px] = gray;
+            }
+        }
+    }
 }
 
 /* 释放一批目录项（含里面的字符串）。 */
@@ -500,6 +632,77 @@ struct CrDocOwner {
             cr_doc_close(doc);
             doc = nullptr;
         }
+    }
+};
+
+/* cr_doc_set_viewport 的事务守卫。
+ *
+ * 改视口要连输出缓冲、尺寸元数据、局部重排开关一起动。中途任何一步抛异常
+ * （新缓冲分配之后的 Resize / apply_layout / Render），CR_GUARD 只能把异常
+ * 转成错误码，没法恢复文档状态；0 页回退也要走同一条恢复路径。统一放在
+ * 析构里：没有 commit() 就说明这次改尺寸没成功，把几何换回旧的。
+ *
+ * 只回滚几何（视口、输出缓冲、宽高、局部重排开关）。排版参数已经套到 view
+ * 上了，和 cr_doc_set_layout 失败时一样保留：调用方拿到错误后，用有效参数
+ * 再调一次即可继续用。 */
+struct ViewportTxn {
+    CrDoc *doc = nullptr;
+    LVGrayDrawBuf *old_buf = nullptr;
+    LVGrayDrawBuf *new_buf = nullptr;
+    int old_width = 0;
+    int old_height = 0;
+    ldomDocument *dom = nullptr;
+    bool restore_partial = false;
+    bool committed = false;
+
+    ViewportTxn(CrDoc *d, LVGrayDrawBuf *nb, ldomDocument *dom_, bool restore_partial_)
+        : doc(d), old_buf(d->buf), new_buf(nb), old_width(d->width), old_height(d->height),
+          dom(dom_), restore_partial(restore_partial_) {}
+
+    ~ViewportTxn() {
+        if (!committed) {
+            // 回调里存的是调用方栈上的闭包指针，函数返回后不能留着。
+            doc->callback.reset(false, nullptr, nullptr);
+            // Resize 本身也可能抛异常；它失败也不能漏掉元数据和模式的恢复，
+            // 所以每一步分别兜底。析构不能抛异常。
+            try {
+                if (doc->view != nullptr) {
+                    doc->view->Resize(old_width, old_height);
+                }
+            } catch (...) {
+            }
+            doc->buf = old_buf;
+            doc->width = old_width;
+            doc->height = old_height;
+            if (dom != nullptr && restore_partial) {
+                try {
+                    dom->enablePartialRerendering(true);
+                } catch (...) {
+                }
+            }
+        }
+        // 提交后 new_buf 归文档管（commit 里已置空），这里不能再删。
+        delete new_buf;
+    }
+
+    /* 把新缓冲和尺寸交给文档。渲染失败时由析构负责换回去。 */
+    void publish(int width, int height) {
+        if (new_buf != nullptr) {
+            doc->buf = new_buf;
+        }
+        doc->width = width;
+        doc->height = height;
+    }
+
+    /* 成功：旧缓冲可以释放了，析构不再回滚。 */
+    void commit() {
+        committed = true;
+        // 同尺寸时没有换缓冲，doc->buf 还是 old_buf，不能删。
+        if (doc->buf != old_buf) {
+            delete old_buf;
+        }
+        old_buf = nullptr;
+        new_buf = nullptr;
     }
 };
 
@@ -772,6 +975,10 @@ extern "C" CrDoc *cr_doc_open(const char *path, int width, int height, const CrL
         set_error(err, err_len, "invalid page size");
         return nullptr;
     }
+    if (width < kMinPageDimension || height < kMinPageDimension) {
+        set_error(err, err_len, "page size below minimum");
+        return nullptr;
+    }
     if (width > kMaxPageDimension || height > kMaxPageDimension) {
         set_error(err, err_len, "page size exceeds limit");
         return nullptr;
@@ -875,7 +1082,8 @@ extern "C" int cr_doc_page_count(const CrDoc *doc) {
 }
 
 extern "C" int cr_doc_render_page(CrDoc *doc, int page, uint8_t *dst, size_t dst_len, int dst_width,
-                                  int dst_height, int invert_images, char *err, size_t err_len) {
+                                  int dst_height, int invert_images, int underline,
+                                  int underline_gray, char *err, size_t err_len) {
     CR_GUARD_BEGIN
     if (doc == nullptr || doc->view == nullptr || doc->buf == nullptr) {
         set_error(err, err_len, "document not opened");
@@ -930,6 +1138,9 @@ extern "C" int cr_doc_render_page(CrDoc *doc, int page, uint8_t *dst, size_t dst
         std::memcpy(dst + static_cast<size_t>(y) * static_cast<size_t>(doc->width), line,
                     static_cast<size_t>(doc->width));
     }
+    // 正文每行下方的引导线：和文字同一次渲染画进页面缓冲，
+    // 翻页时不用额外调用引擎。
+    draw_underline_guides(doc, page, dst, doc->width, doc->height, underline, underline_gray);
     return 0;
     CR_GUARD_END(err, err_len, kErrorException)
 }
@@ -957,6 +1168,95 @@ extern "C" int cr_doc_set_layout(CrDoc *doc, const CrLayout *layout,
         return 3;
     }
     doc->callback.finish();
+    return 0;
+    CR_GUARD_END(err, err_len, kErrorException)
+}
+
+/* 把文档的页面尺寸改成 width x height，并按新尺寸重新排版。
+ *
+ * 要同时动三样东西，缺一不可：
+ * - LVDocView 的视口（Resize）：决定正文区有多宽、多高，决定怎么分页；
+ * - 输出缓冲（LVGrayDrawBuf）：渲染时按页面尺寸逐行写进它，尺寸不对就错行；
+ * - 尺寸元数据（doc->width/height）：渲染时校验调用方给的缓冲尺寸。
+ *
+ * 尺寸变了以后，排好版的分片全废了（它们是按旧宽度排的），局部重排会把
+ * 新旧两种分页混在一起，所以这里临时关掉局部重排、整本重排一次、排完恢复。
+ * 这条路跟 cr_doc_catchup_render 走的是同一条。
+ *
+ * 失败时的处理：
+ * - 尺寸非法：改之前就挡住，文档一个字节都没动，照旧可用；
+ * - 新缓冲分配失败：分配在改动之前，文档还是原样；
+ * - Resize / apply_layout / Render 抛异常，或重排出不了页：视口、输出缓冲、
+ *   宽高、局部重排开关一起回滚到调用前（见 ViewportTxn）。
+ *   排版参数已经套到 view 上，和 cr_doc_set_layout 失败时一样保留；调用方
+ *   拿到错误后，用有效参数重试即可继续用。 */
+extern "C" int cr_doc_set_viewport(CrDoc *doc, int width, int height, const CrLayout *layout,
+                                   cr_progress_cb progress_cb, void *user_data,
+                                   char *err, size_t err_len) {
+    CR_GUARD_BEGIN
+    if (doc == nullptr || doc->view == nullptr || doc->buf == nullptr) {
+        set_error(err, err_len, "document not opened");
+        return 1;
+    }
+    if (layout == nullptr) {
+        set_error(err, err_len, "missing layout");
+        return 2;
+    }
+    if (width <= 0 || height <= 0) {
+        set_error(err, err_len, "invalid page size");
+        return 3;
+    }
+    if (width < kMinPageDimension || height < kMinPageDimension) {
+        set_error(err, err_len, "page size below minimum");
+        return 3;
+    }
+    if (width > kMaxPageDimension || height > kMaxPageDimension) {
+        set_error(err, err_len, "page size exceeds limit");
+        return 4;
+    }
+
+    const int old_width = doc->width;
+    const int old_height = doc->height;
+    // 尺寸没变就是纯改排版参数：输出缓冲不用换，局部重排该延迟还是延迟。
+    // 尺寸变了才必须整本重排。
+    const bool size_changed = width != old_width || height != old_height;
+
+    // 新缓冲先分配：分配失败时文档还是原样，不用回滚。
+    LVGrayDrawBuf *new_buf =
+        size_changed ? new LVGrayDrawBuf(width, height, kGrayBits) : nullptr;
+
+    LVDocView *view = doc->view;
+    ldomDocument *dom = view->getDocument();
+    const bool partial_was_enabled = dom != nullptr && dom->isPartialRerenderingEnabled();
+    // 只有尺寸变了才临时关掉局部重排。
+    const bool partial_disabled = size_changed && partial_was_enabled;
+
+    ViewportTxn txn(doc, new_buf, dom, partial_disabled);
+    if (partial_disabled) {
+        dom->enablePartialRerendering(false);
+    }
+
+    // 视口先改，再套排版参数：页边距是按视口算的（setPageMargins 依赖
+    // m_dx/m_dy 算页面矩形）。顺序和 cr_doc_open 里一样。
+    view->Resize(width, height);
+    apply_layout(view, *layout);
+    doc->margin_left = layout->margin_left;
+    doc->margin_top = layout->margin_top;
+    doc->fallback_font_faces = fallback_faces_of(*layout);
+    txn.publish(width, height);
+
+    doc->callback.reset(false, progress_cb, user_data);
+    view->Render();
+    if (view->getPageCount() <= 0) {
+        set_error(err, err_len, "document has no pages");
+        // 析构里回滚视口、缓冲、宽高和局部重排开关。
+        return 5;
+    }
+    doc->callback.finish();
+    if (partial_disabled) {
+        dom->enablePartialRerendering(true);
+    }
+    txn.commit();
     return 0;
     CR_GUARD_END(err, err_len, kErrorException)
 }

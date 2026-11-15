@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use aristotle_render::style::Style;
+use aristotle_render::style::{Style, Underline};
 use aristotle_ui::screens::library::{CoverMode, LibraryLayout, View};
 use aristotle_ui::screens::reader::Settings;
 use serde::{Deserialize, Serialize};
@@ -288,6 +288,12 @@ pub struct Prefs {
     /// folder. The folder is created only when a confirmed import runs.
     #[serde(default)]
     pub library_destination: Option<PathBuf>,
+    /// The guide under every line of body text: 0: 无, 1: 实线, 2: 虚线.
+    ///
+    /// A render option, not a typographic one: it never changes the layout
+    /// of the book, only the way a page is drawn.
+    #[serde(default)]
+    pub underline: usize,
 }
 
 fn default_cjk_gap() -> usize {
@@ -372,6 +378,7 @@ impl Default for Prefs {
             cjk_gap: 2,
             cjk_trim: true,
             library_destination: None,
+            underline: 0,
         }
     }
 }
@@ -439,6 +446,7 @@ impl Prefs {
         self.cjk_indent = self.cjk_indent.min(1);
         self.cjk_script = self.cjk_script.min(1);
         self.cjk_gap = self.cjk_gap.min(2);
+        self.underline = self.underline.min(2);
         if !aristotle_i18n::locales()
             .iter()
             .any(|l| l.code == self.language)
@@ -446,6 +454,11 @@ impl Prefs {
             self.language = Prefs::default().language;
         }
         self
+    }
+
+    /// The guide under every line of body text.
+    pub fn underline(&self) -> Underline {
+        Underline::from_index(self.underline.min(2))
     }
 
     /// The page style for these preferences.
@@ -627,6 +640,7 @@ mod tests {
             cjk_gap: 2,
             cjk_trim: true,
             library_destination: None,
+            underline: 0,
         };
         p.save(&dir).unwrap();
         assert_eq!(Prefs::load(&dir), p);

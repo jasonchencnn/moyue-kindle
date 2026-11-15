@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use inkread_platform::GrayBuffer;
 
 use crate::{
-    Document, Engine, Error, LayoutSettings, Link, Result, TocEntry, Word, MAX_PAGE_DIMENSION_PX,
+    validate_page_size, Document, Engine, Error, LayoutSettings, Link, Result, TocEntry, Word,
 };
 
 /// 墨阅内置样式表。
@@ -279,20 +279,9 @@ impl Engine for CrengineEngine {
         progress: Option<&mut dyn FnMut(u32)>,
     ) -> Result<Box<dyn Document>> {
         layout.validate()?;
-        if page_size.0 == 0 || page_size.1 == 0 {
-            return Err(Error::InvalidLayout(format!(
-                "页面尺寸不合法：{}x{}",
-                page_size.0, page_size.1
-            )));
-        }
-        // Kindle 是 32 位 ARM：页面尺寸的乘法会回绕，底层还会按这个尺寸
-        // 分配灰度缓冲。超上限的尺寸一定是调用方传错了。
-        if page_size.0 > MAX_PAGE_DIMENSION_PX || page_size.1 > MAX_PAGE_DIMENSION_PX {
-            return Err(Error::InvalidLayout(format!(
-                "页面尺寸 {}x{} 超出上限 {MAX_PAGE_DIMENSION_PX}x{MAX_PAGE_DIMENSION_PX}",
-                page_size.0, page_size.1
-            )));
-        }
+        // 页面尺寸的校验与改尺寸那条路共用一套规则：0 宽、越界的尺寸
+        // 都得在碰引擎之前挡住。
+        validate_page_size(page_size)?;
         let layout = self.resolve_layout(layout);
         let css = effective_css(&layout);
         let inner = ffi::Document::open(path, page_size.0, page_size.1, &layout, &css, progress)
@@ -300,6 +289,7 @@ impl Engine for CrengineEngine {
         Ok(Box::new(CrengineDocument {
             inner,
             default_face: self.default_face.clone(),
+            last_layout: layout,
         }))
     }
 }
@@ -308,6 +298,11 @@ impl Engine for CrengineEngine {
 struct CrengineDocument {
     inner: ffi::Document,
     default_face: Option<String>,
+    /// 上一次成功用上的排版参数（已解析出字体名）。
+    ///
+    /// 改尺寸失败时要靠它把文档恢复回去：引擎那边只回滚了尺寸，新排版
+    /// 参数还套在 view 上，不换回来的话书虽然能渲染，排版却是坏的。
+    last_layout: LayoutSettings,
 }
 
 impl CrengineDocument {
@@ -323,6 +318,32 @@ impl CrengineDocument {
             },
             None => layout.clone(),
         }
+    }
+
+    /// 用上一次成功的排版参数，在原来的尺寸上重新排版。
+    ///
+    /// 改尺寸失败后调用：引擎那边只回滚了尺寸，新排版参数还套在 view 上，
+    /// 尺寸元数据也已经回到旧值（见 ffi 层），所以这里按旧尺寸重排一次，
+    /// 文档就回到失败前的样子，调用方可以直接接着读。
+    ///
+    /// 不带进度回调：恢复是善后，不该再打扰调用方。
+    fn restore_last_layout(&mut self) -> std::result::Result<(), String> {
+        let layout = self.last_layout.clone();
+        let css = effective_css(&layout);
+        // inner 记的宽高只在成功时更新，失败时还是旧尺寸。
+        let (width, height) = (self.inner.width(), self.inner.height());
+        // 恢复是在旧尺寸上重排：局部重排开着的话，同尺寸重排会被延迟，
+        // 失败留下的「0 页」状态排不回来，文档就不能直接接着读。
+        // 临时关掉，让旧布局整本重排完，再把原开关恢复。
+        let partial = self.inner.is_partial_rerender_enabled();
+        if partial {
+            self.inner.enable_partial_rerender(false)?;
+        }
+        let result = self.inner.set_viewport(width, height, &layout, &css, None);
+        if partial {
+            self.inner.enable_partial_rerender(true)?;
+        }
+        result
     }
 }
 
@@ -391,11 +412,18 @@ impl Document for CrengineDocument {
                 buffer.height()
             )));
         }
-        if !options.invert_images {
+        if !options.invert_images && options.underline == crate::Underline::Off {
+            // 最常见的一档：既不反色也不画引导线，走原来的快速路径。
             self.inner.render_page(page, buffer).map_err(Error::Render)
         } else {
             self.inner
-                .render_page_with_options(page, buffer, true)
+                .render_page_with_options(
+                    page,
+                    buffer,
+                    options.invert_images,
+                    options.underline as u8,
+                    options.underline_gray,
+                )
                 .map_err(Error::Render)
         }
     }
@@ -410,7 +438,44 @@ impl Document for CrengineDocument {
         let css = effective_css(&layout);
         self.inner
             .set_layout(&layout, &css, progress)
-            .map_err(Error::Render)
+            .map_err(Error::Render)?;
+        // 只有成功才记：失败时旧参数仍是当前生效的那套。
+        self.last_layout = layout;
+        Ok(())
+    }
+
+    fn set_layout_with_size_and_progress(
+        &mut self,
+        layout: &LayoutSettings,
+        size: (u32, u32),
+        progress: Option<&mut dyn FnMut(u32)>,
+    ) -> Result<()> {
+        layout.validate()?;
+        // 尺寸先校验：不合法的尺寸在改动文档之前就该挡住，
+        // 文档保持原样可用。
+        validate_page_size(size)?;
+        let layout = self.resolve_layout(layout);
+        let css = effective_css(&layout);
+        match self
+            .inner
+            .set_viewport(size.0, size.1, &layout, &css, progress)
+        {
+            Ok(()) => {
+                self.last_layout = layout;
+                Ok(())
+            }
+            Err(err) => {
+                // 引擎只回滚了尺寸，新排版参数还套在 view 上：拿上一套
+                // 成功的参数在原尺寸上重排一次，把文档恢复成能直接读的样子。
+                match self.restore_last_layout() {
+                    Ok(()) => Err(Error::Render(err)),
+                    // 恢复也失败：两层的错误都要报出来，不能吞掉任何一层。
+                    Err(restore_err) => Err(Error::Render(format!(
+                        "{err}；恢复上一套排版参数也失败：{restore_err}"
+                    ))),
+                }
+            }
+        }
     }
 
     fn page_xpointer(&self, page: u32) -> Result<String> {

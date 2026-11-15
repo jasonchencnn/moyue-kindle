@@ -18,7 +18,8 @@ use std::sync::Arc;
 use inkread_engine::crengine::CrengineEngine;
 use inkread_engine::{
     Document as CrengineDocument, Engine as _, LayoutSettings, Margins, TocEntry, MAX_FONT_SIZE_PX,
-    MAX_LINE_SPACING_PERCENT, MAX_MARGIN_PX, MIN_FONT_SIZE_PX, MIN_LINE_SPACING_PERCENT,
+    MAX_LINE_SPACING_PERCENT, MAX_MARGIN_PX, MAX_PAGE_DIMENSION_PX, MIN_FONT_SIZE_PX,
+    MIN_LINE_SPACING_PERCENT,
 };
 use inkread_platform::GrayBuffer;
 use plato_core::anyhow::{format_err, Error};
@@ -72,11 +73,28 @@ pub fn configure_cache(data_dir: &Path) -> Result<(), Error> {
         .map_err(|e| format_err!("crengine cache: {e}"))
 }
 
+/// A chapter start named by the book's table of contents.
+///
+/// crengine merges the EPUB spine items into one DOM and prefixes every id
+/// with the fragment it came from (`_doc_fragment_2_ chapter3`, see
+/// `ldomDocumentFragmentWriter::convertId` in the vendored engine), so the
+/// rule has to name that prefixed attribute value, not the bare id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChapterAnchor {
+    /// Zero-based spine item index, as crengine numbers `DocFragment`s.
+    pub spine: usize,
+    /// The target element's id in that spine item, without the leading `#`.
+    pub id: String,
+}
+
 /// A book laid out by crengine-ng.
 pub struct CrengineDoc {
     doc: Box<dyn CrengineDocument>,
     /// The layout the book was laid out with.
     layout: LayoutSettings,
+    /// Chapter starts from the book's table of contents: they survive a
+    /// restyle because every new layout is built from the same anchors.
+    chapter_anchors: Vec<ChapterAnchor>,
     /// The text block's size in pixels: what crengine lays out into.
     width: u32,
     height: u32,
@@ -91,7 +109,7 @@ impl CrengineDoc {
     /// The layout is the text block's size in pixels: the same area Plato's
     /// engine is given, so both engines put the text in the same place.
     pub fn open(path: &Path, style: &Style) -> Result<CrengineDoc, Error> {
-        Self::open_with_progress(path, style, None)
+        Self::open_with_progress_and_chapters(path, style, None, &[])
     }
 
     /// Open `path` and lay it out for `style`, reporting formatting progress (0..=100)
@@ -101,11 +119,26 @@ impl CrengineDoc {
         style: &Style,
         progress: Option<&Arc<AtomicU8>>,
     ) -> Result<CrengineDoc, Error> {
+        Self::open_with_progress_and_chapters(path, style, progress, &[])
+    }
+
+    /// Open `path` and lay it out for `style`, reporting progress and starting
+    /// each table of contents anchor on a new page.
+    ///
+    /// The anchors come from the EPUB's own navigation, so a mid-chapter
+    /// heading the table of contents does not name never forces a page. The
+    /// rules are part of the user stylesheet at open time, which keeps the
+    /// engine's warm cache usable: there is no second layout after opening.
+    pub fn open_with_progress_and_chapters(
+        path: &Path,
+        style: &Style,
+        progress: Option<&Arc<AtomicU8>>,
+        chapter_anchors: &[ChapterAnchor],
+    ) -> Result<CrengineDoc, Error> {
         let engine = engine()?;
+        let (size, top) = body_size(style)?;
         let (face, fallback_faces) = faces_for(&engine, style);
-        let (top, body_height) = style.body();
-        let size = (style.width, body_height);
-        let layout = layout_for(style, &face, &fallback_faces);
+        let layout = layout_for(style, &face, &fallback_faces, chapter_anchors);
         let mut cb = progress.map(|p| {
             let p = p.clone();
             move |val: u32| {
@@ -123,6 +156,7 @@ impl CrengineDoc {
         Ok(CrengineDoc {
             doc,
             layout,
+            chapter_anchors: chapter_anchors.to_vec(),
             width: size.0,
             height: size.1,
             top,
@@ -137,16 +171,20 @@ impl CrengineDoc {
 
     /// Lay the document out again with `style`, reporting formatting progress
     /// to `progress` if provided.
+    ///
+    /// The page size comes from `style` too, so this is the one call that
+    /// changes both the typography and the viewport: the engine resizes its
+    /// view and re-paginates in the same pass, and we only publish the new
+    /// geometry once that has succeeded.
     pub fn set_layout_with_progress(
         &mut self,
         style: &Style,
         progress: Option<&Arc<AtomicU8>>,
     ) -> Result<(), Error> {
         let engine = engine()?;
+        let (size, top) = body_size(style)?;
         let (face, fallback_faces) = faces_for(&engine, style);
-        let (top, body_height) = style.body();
-        let size = (style.width, body_height);
-        let layout = layout_for(style, &face, &fallback_faces);
+        let layout = layout_for(style, &face, &fallback_faces, &self.chapter_anchors);
         let mut cb = progress.map(|p| {
             let p = p.clone();
             move |val: u32| {
@@ -154,7 +192,11 @@ impl CrengineDoc {
             }
         });
         self.doc
-            .set_layout_with_progress(&layout, cb.as_mut().map(|f| f as &mut dyn FnMut(u32)))
+            .set_layout_with_size_and_progress(
+                &layout,
+                size,
+                cb.as_mut().map(|f| f as &mut dyn FnMut(u32)),
+            )
             .map_err(|e| format_err!("set_layout: {e}"))?;
         self.layout = layout;
         self.width = size.0;
@@ -407,15 +449,96 @@ fn faces_for(engine: &CrengineEngine, style: &Style) -> (String, Vec<String>) {
 /// full-width spaces are content, not style; crengine drops them at load
 /// (see `strip_leading_ideographic_spaces` in `engine/shim.cpp`), so this
 /// sheet alone controls the first line.
+///
+/// Chapter starts come from the book's table of contents (see
+/// [`ChapterAnchor`]), not from the tag or position of a heading: an `h2`
+/// used for a subsection inside a chapter must not start a page.
 pub fn build_cjk_css(indent_chars: usize, gap_em: f32) -> String {
+    build_cjk_css_with_anchors(indent_chars, gap_em, &[])
+}
+
+/// [`build_cjk_css`], with a page break before every table of contents anchor.
+pub fn build_cjk_css_with_anchors(
+    indent_chars: usize,
+    gap_em: f32,
+    chapter_anchors: &[ChapterAnchor],
+) -> String {
     let gap_str = if gap_em <= 0.001 {
         "0em".to_string()
     } else {
         format!("{gap_em:.1}em")
     };
-    format!(
-        "body {{\n    text-indent: {indent_chars}em !important;\n}}\np {{\n    text-indent: {indent_chars}em !important;\n    margin-top: 0em !important;\n    margin-bottom: {gap_str} !important;\n}}"
-    )
+    let mut css = format!(
+        "body {{\n    text-indent: {indent_chars}em !important;\n    page-break-before: always !important;\n}}\np {{\n    text-indent: {indent_chars}em !important;\n    margin-top: 0em !important;\n    margin-bottom: {gap_str} !important;\n}}"
+    );
+    for anchor in chapter_anchors {
+        let id = format!("_doc_fragment_{}_ {}", anchor.spine, anchor.id);
+        let Some(quoted) = css_quoted(&id) else {
+            // crengine's attribute parser takes the value between quotes
+            // literally, so an id holding both quote characters cannot be
+            // named safely. Skipping it is better than emitting a rule that
+            // matches the wrong element.
+            continue;
+        };
+        // The body rule already starts every spine item; the anchor rule adds
+        // the break inside a spine item. An inline empty `a` is a common
+        // anchor target, so it needs a block box for the break to apply.
+        // EPUB2 books may name an anchor with `name` instead of `id`;
+        // crengine prefixes both attributes the same way.
+        css.push_str(&format!(
+            "\n[id={quoted}], [name={quoted}] {{\n    page-break-before: always !important;\n}}"
+        ));
+        css.push_str(&format!(
+            "\na[id={quoted}], a[name={quoted}] {{\n    display: block !important;\n}}"
+        ));
+    }
+    css
+}
+
+/// Quote an attribute value the way crengine's CSS parser reads it.
+///
+/// It copies the value between the quotes without unescaping, so a value
+/// that contains both quote characters is rejected instead of escaped.
+fn css_quoted(value: &str) -> Option<String> {
+    if value.len() >= 500 || value.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    if !value.contains('"') {
+        Some(format!("\"{value}\""))
+    } else if !value.contains('\'') {
+        Some(format!("'{value}'"))
+    } else {
+        None
+    }
+}
+
+/// The page size `style` asks for, as (width, body height), plus the top of
+/// the text block.
+///
+/// `style.width`/`style.height` are checked before [`Style::body()`]: a
+/// height past `i32::MAX` wraps to a negative number there, and the
+/// subtraction can overflow (a panic in debug builds) before the size ever
+/// reaches the engine. A body height that underflowed (a screen shorter than
+/// the footer margin) is not a page size either: `Style::body()` wraps it
+/// into a huge number.
+fn body_size(style: &Style) -> Result<((u32, u32), i32), Error> {
+    if style.width == 0
+        || style.width > MAX_PAGE_DIMENSION_PX
+        || style.height == 0
+        || style.height > MAX_PAGE_DIMENSION_PX
+    {
+        return Err(format_err!(
+            "page size {}x{} is not valid",
+            style.width,
+            style.height
+        ));
+    }
+    let (top, body_height) = style.body();
+    let size = (style.width, body_height);
+    if size.1 == 0 || size.1 > MAX_PAGE_DIMENSION_PX {
+        return Err(format_err!("page size {}x{} is not valid", size.0, size.1));
+    }
+    Ok((size, top))
 }
 
 /// crengine's layout parameters, from Aristotle's style.
@@ -423,7 +546,12 @@ pub fn build_cjk_css(indent_chars: usize, gap_em: f32) -> String {
 /// The margins are the same on all four sides, as in Plato: the layout area
 /// is the text block plus its margins, and the chrome (header and footer)
 /// lives outside it.
-fn layout_for(style: &Style, face: &str, fallback_faces: &[String]) -> LayoutSettings {
+fn layout_for(
+    style: &Style,
+    face: &str,
+    fallback_faces: &[String],
+    chapter_anchors: &[ChapterAnchor],
+) -> LayoutSettings {
     // Plato takes the font size in points and the dpi; crengine wants
     // device pixels.
     let font_size_px = ((style.font_size * style.dpi as f32) / 72.0)
@@ -432,7 +560,11 @@ fn layout_for(style: &Style, face: &str, fallback_faces: &[String]) -> LayoutSet
     let line_spacing_percent = ((style.line_height * 100.0).round() as u32)
         .clamp(MIN_LINE_SPACING_PERCENT, MAX_LINE_SPACING_PERCENT);
     let margin = style.margin_px().clamp(0, MAX_MARGIN_PX as i32) as u32;
-    let user_css = Some(build_cjk_css(style.cjk_indent, style.cjk_gap));
+    let user_css = Some(build_cjk_css_with_anchors(
+        style.cjk_indent,
+        style.cjk_gap,
+        chapter_anchors,
+    ));
     LayoutSettings {
         font_size_px,
         line_spacing_percent,
@@ -505,7 +637,7 @@ mod tests {
     #[test]
     fn the_layout_follows_aristotles_style() {
         let style = Style::pw4();
-        let layout = layout_for(&style, "Literata", &["Noto Sans SC".to_string()]);
+        let layout = layout_for(&style, "Literata", &["Noto Sans SC".to_string()], &[]);
         // 10 pt at 300 dpi is 42 px.
         assert_eq!(layout.font_size_px, 42);
         // 1.3 em is 130 %, which the engine does not go below 140 % on.
@@ -519,41 +651,119 @@ mod tests {
         assert_eq!(layout.margins.bottom, margin);
         assert_eq!(layout.font_face, "Literata");
         assert!(layout.embedded_styles);
+        let css = layout.user_css.as_deref().expect("the CJK sheet is set");
+        assert!(css.contains("text-indent: 2em !important;"), "{css}");
+        assert!(
+            css.contains("page-break-before: always !important;"),
+            "{css}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_page_size_is_rejected_before_body_wraps() {
+        // Past i32::MAX, `Style::body()`'s `height as i32` goes negative and
+        // the subtraction can overflow; the size must be rejected first.
+        let mut style = Style::pw4();
+        style.height = u32::MAX;
+        assert!(
+            body_size(&style).is_err(),
+            "a height past i32::MAX must be rejected, not overflow"
+        );
+        style.height = MAX_PAGE_DIMENSION_PX + 1;
+        assert!(body_size(&style).is_err());
+        style.height = Style::pw4().height;
+        style.width = 0;
+        assert!(body_size(&style).is_err());
+
+        // The normal PW4 style still yields the panel size.
         assert_eq!(
-            layout.user_css.as_deref(),
-            Some("body {\n    text-indent: 2em !important;\n}\np {\n    text-indent: 2em !important;\n    margin-top: 0em !important;\n    margin-bottom: 0.6em !important;\n}")
+            body_size(&Style::pw4()).expect("PW4 size is valid").0 .0,
+            1072
         );
     }
 
     #[test]
     fn cjk_css_mapping_supports_indent_and_gap_variations() {
-        assert_eq!(
-            build_cjk_css(2, 0.6),
-            "body {\n    text-indent: 2em !important;\n}\np {\n    text-indent: 2em !important;\n    margin-top: 0em !important;\n    margin-bottom: 0.6em !important;\n}"
-        );
-        assert_eq!(
-            build_cjk_css(0, 0.0),
-            "body {\n    text-indent: 0em !important;\n}\np {\n    text-indent: 0em !important;\n    margin-top: 0em !important;\n    margin-bottom: 0em !important;\n}"
-        );
-        assert_eq!(
-            build_cjk_css(2, 0.3),
-            "body {\n    text-indent: 2em !important;\n}\np {\n    text-indent: 2em !important;\n    margin-top: 0em !important;\n    margin-bottom: 0.3em !important;\n}"
-        );
+        for (indent, gap, gap_css) in [(2, 0.6, "0.6em"), (0, 0.0, "0em"), (2, 0.3, "0.3em")] {
+            let css = build_cjk_css(indent, gap);
+            assert!(
+                css.contains(&format!("text-indent: {indent}em !important;")),
+                "{css}"
+            );
+            assert!(
+                css.contains(&format!("margin-bottom: {gap_css} !important;")),
+                "{css}"
+            );
+            // Every body starts a page (EPUB spine files and TXT chapters).
+            // Table of contents anchors add breaks inside one spine file.
+            assert!(
+                css.contains("page-break-before: always !important;"),
+                "{css}"
+            );
+            // No heading selector may force or avoid a chapter page: the
+            // book's table of contents is the only source of chapter breaks.
+            assert!(!css.contains("h1"), "{css}");
+            assert!(!css.contains("h2"), "{css}");
+            assert!(!css.contains("h3"), "{css}");
+        }
 
         let mut style = Style::pw4();
         style.cjk_indent = 0;
         style.cjk_gap = 0.0;
-        let layout = layout_for(&style, LATIN_FACE, &[CJK_FACE.to_string()]);
-        assert_eq!(
-            layout.user_css.as_deref(),
-            Some("body {\n    text-indent: 0em !important;\n}\np {\n    text-indent: 0em !important;\n    margin-top: 0em !important;\n    margin-bottom: 0em !important;\n}")
+        let layout = layout_for(&style, LATIN_FACE, &[CJK_FACE.to_string()], &[]);
+        let css = layout.user_css.as_deref().expect("the CJK sheet is set");
+        assert!(css.contains("text-indent: 0em !important;"), "{css}");
+        assert!(
+            css.contains("page-break-before: always !important;"),
+            "{css}"
         );
+    }
+
+    #[test]
+    fn chapter_css_names_only_toc_anchors_and_their_crengine_ids() {
+        let anchors = [
+            ChapterAnchor {
+                spine: 0,
+                id: "c0".into(),
+            },
+            ChapterAnchor {
+                spine: 2,
+                id: "part/one".into(),
+            },
+        ];
+        let css = build_cjk_css_with_anchors(2, 0.6, &anchors);
+        // crengine prefixes every EPUB id with its DocFragment, space included.
+        assert!(css.contains(r#"[id="_doc_fragment_0_ c0"]"#), "{css}");
+        assert!(css.contains(r#"[id="_doc_fragment_2_ part/one"]"#), "{css}");
+        // The inline anchor target needs a block box for the break to apply;
+        // EPUB2 `name` anchors are prefixed the same way.
+        assert!(css.contains(r#"a[id="_doc_fragment_0_ c0"]"#), "{css}");
+        assert!(css.contains(r#"[name="_doc_fragment_0_ c0"]"#), "{css}");
+        // No tag or position may turn an unnamed subheading into a chapter.
+        for wildcard in [
+            "body > h1",
+            "body > h2",
+            "body > h3",
+            "section > h2:first-child",
+            "div > h2:first-child",
+        ] {
+            assert!(!css.contains(wildcard), "{wildcard} in {css}");
+        }
+
+        // Attributes with both quote characters cannot be escaped by
+        // crengine's CSS parser; they are skipped, not mismatched.
+        let awkward = [ChapterAnchor {
+            spine: 1,
+            id: "a\"b'c".into(),
+        }];
+        let css = build_cjk_css_with_anchors(2, 0.6, &awkward);
+        assert!(!css.contains("a\"b'c"), "{css}");
     }
 
     #[test]
     fn the_chinese_face_is_the_fallback_for_the_body_face() {
         let style = Style::pw4();
-        let layout = layout_for(&style, LATIN_FACE, &[CJK_FACE.to_string()]);
+        let layout = layout_for(&style, LATIN_FACE, &[CJK_FACE.to_string()], &[]);
         // The body is set in Literata; the Chinese characters go to the
         // Chinese face.
         assert_eq!(layout.font_face, LATIN_FACE);

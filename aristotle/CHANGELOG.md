@@ -22,7 +22,32 @@ are its section below.
 
 ### Changed
 
-- New preferences use a 10-minute sleep delay. Existing preferences stay unchanged.
+## [0.3.1] - 2026-11-14
+
+The KO2 preview adds manual over-the-air updates and brings the support
+diagnostics into the main KUAL extension.
+
+### Added
+
+- KUAL > 墨阅 > 检查更新（OTA）: fetch a versioned manifest over HTTPS from
+  `me.chen-cn.top`, verify the device, firmware, version and SHA-256, and
+  install a staged application and extension with rollback on failure. User
+  books, progress, login, settings, screensavers and fonts are outside the
+  replaced trees and are not touched.
+- KUAL > 墨阅 > 诊断日志: the DIAG-001 collector and confirmation-protected
+  upload, with credentials read from `/mnt/us/.aristotle/diagnostics/`.
+- `tools/package.sh ota` and `tools/ota-manifest.py` for the release package,
+  manifest and the corresponding-source publication fields.
+
+### Changed
+
+- Version metadata, the extension version and the About screen use 0.3.1.
+
+### Security
+
+- The OTA updater never executes package content, refuses archive traversal,
+  symlinks and paths outside `aristotle/` and `extensions/aristotle/`, and
+  writes only under `/mnt/us` and `/var/tmp`.
 
 ## [0.1.0] - 2026-10-17
 
