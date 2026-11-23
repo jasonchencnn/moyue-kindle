@@ -83,7 +83,11 @@ impl Control for Device {
         if let Err(e) = powerd::blanket(load, "screensaver") {
             eprintln!(
                 "aristotle: blanket {}: {e}",
-                if load { "load screensaver" } else { "unload screensaver" }
+                if load {
+                    "load screensaver"
+                } else {
+                    "unload screensaver"
+                }
             );
             return Err(e);
         }

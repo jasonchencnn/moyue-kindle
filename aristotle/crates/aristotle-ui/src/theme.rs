@@ -237,3 +237,24 @@ mod tests {
         }
     }
 }
+
+/// Content arrangements for six-inch, seven-inch and larger panels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PanelLayout {
+    Compact,
+    Standard,
+    Large,
+}
+
+impl PanelLayout {
+    pub(crate) fn for_size(size: crate::geom::Size, density: crate::geom::Density) -> Self {
+        let inches = (size.w as f64).hypot(size.h as f64) / density.dpi() as f64;
+        if inches < 6.5 {
+            Self::Compact
+        } else if inches < 9.0 {
+            Self::Standard
+        } else {
+            Self::Large
+        }
+    }
+}

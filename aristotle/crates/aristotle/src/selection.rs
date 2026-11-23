@@ -119,6 +119,23 @@ pub fn text(words: &[Word], start: usize, end: usize) -> String {
         .to_string()
 }
 
+/// The text of words `start..=end`, as the book spells them: the marks at
+/// the ends stay.
+pub fn range_text(words: &[Word], start: usize, end: usize) -> String {
+    joined(words, start, end).trim().to_string()
+}
+
+/// The sentence the selection stands in: the words from the one after the
+/// last sentence end before it to the one with the next sentence end.
+///
+/// The ends are the Chinese and English marks (`。！？.!?`) and the line
+/// break. The rule itself lives in `aristotle-net`, where it can be
+/// tested on the host.
+pub fn sentence(words: &[Word], sel: &Selection) -> (usize, usize) {
+    let pieces: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+    aristotle_net::translate::sentence_span(&pieces, sel.start, sel.end)
+}
+
 /// The text a highlight of words `start..=end` covers: what
 /// [`line_boxes`] shades, so the punctuation at the ends of the first and
 /// last words is left out, but a word of punctuation alone (Plato makes

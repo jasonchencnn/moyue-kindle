@@ -27,11 +27,16 @@ use std::time::{Duration, Instant};
 
 use aristotle_i18n::{tf, tr, Msg};
 use aristotle_library::index::AnnotationKind;
-use aristotle_render::book::{Bounds, Engine, Link, Position, TocItem, Word};
+use aristotle_net::translate::Translation;
+use aristotle_render::book::{Bounds, Engine, Link, Position, Word};
 use aristotle_render::plato_core::anyhow::Error;
 use aristotle_render::richtext::{Block, RichText, Run};
 use aristotle_ui::geom::{min_target, Point, Rect};
 use aristotle_ui::input::Direction;
+use aristotle_ui::screens::selection as selection_ui;
+use aristotle_ui::screens::sheet::{self, Button};
+use aristotle_ui::screens::toc as toc_ui;
+use aristotle_ui::screens::translate as translate_ui;
 use aristotle_ui::text::FamilyId;
 use aristotle_ui::tree::{ActionId, NodeId, Refresh, Tree};
 use aristotle_ui::ui::UiEvent;
@@ -43,6 +48,8 @@ use crate::marks;
 use crate::overlay::{self, act, ListRow, Place, PopupSpec, SelectionMarks};
 use crate::panel::Content;
 use crate::selection::{self, Selection};
+use crate::translate::{self as translation, Reply as TranslateReply};
+use crate::turns::Turn;
 use crate::{perf, App, Screen};
 
 /// How long a long press waits for the dictionary before it shows the
@@ -79,6 +86,18 @@ pub enum Overlay {
         sel: Selection,
         words: Rc<Vec<Word>>,
     },
+    /// A translation of the selection, or of the sentence it stands in.
+    Translate {
+        sel: Selection,
+        words: Rc<Vec<Word>>,
+        /// The text that was sent.
+        source: String,
+        /// The request's number: an answer with an older number is stale.
+        seq: u64,
+        /// The answer, when it came.
+        result: Option<Result<Translation, String>>,
+        page: usize,
+    },
     /// A word-by-word gloss of the selection.
     Gloss {
         sel: Selection,
@@ -91,9 +110,10 @@ pub enum Overlay {
         link: Link,
         page: usize,
     },
+    /// The table of contents: the book's chapters as an outline that can
+    /// be folded (`aristotle_ui::screens::toc`).
     Toc {
-        items: Vec<TocItem>,
-        current: Option<usize>,
+        contents: Box<toc_ui::Contents>,
         page: usize,
     },
     Marks {
@@ -101,6 +121,13 @@ pub enum Overlay {
         page: usize,
     },
     Annotation {
+        text: RichText,
+        target: Option<Position>,
+        page: usize,
+    },
+    /// A thought the reader wrote on WeRead, or why a cloud note has no
+    /// position in this edition.
+    WereadThought {
         text: RichText,
         target: Option<Position>,
         page: usize,
@@ -137,7 +164,23 @@ impl Overlay {
             | Overlay::Dict { sel, words, .. }
             | Overlay::Dragging { sel, words }
             | Overlay::Actions { sel, words }
+            | Overlay::Translate { sel, words, .. }
             | Overlay::Gloss { sel, words, .. } => Some((sel, words)),
+            _ => None,
+        }
+    }
+
+    fn page(&self) -> Option<usize> {
+        match self {
+            Overlay::Dict { page, .. }
+            | Overlay::Translate { page, .. }
+            | Overlay::Gloss { page, .. }
+            | Overlay::Note { page, .. }
+            | Overlay::Toc { page, .. }
+            | Overlay::Marks { page, .. }
+            | Overlay::Annotation { page, .. }
+            | Overlay::WereadThought { page, .. }
+            | Overlay::Fonts { page, .. } => Some(*page),
             _ => None,
         }
     }
@@ -145,11 +188,13 @@ impl Overlay {
     fn page_mut(&mut self) -> Option<&mut usize> {
         match self {
             Overlay::Dict { page, .. }
+            | Overlay::Translate { page, .. }
             | Overlay::Gloss { page, .. }
             | Overlay::Note { page, .. }
             | Overlay::Toc { page, .. }
             | Overlay::Marks { page, .. }
             | Overlay::Annotation { page, .. }
+            | Overlay::WereadThought { page, .. }
             | Overlay::Fonts { page, .. } => Some(page),
             _ => None,
         }
@@ -162,6 +207,9 @@ pub struct MarkRow {
     pub meta: String,
     pub target: Option<Position>,
     pub detail: Option<String>,
+    /// The row comes from the WeRead cloud, so its detail sheet is not an
+    /// imported annotation.
+    pub weread: bool,
 }
 
 /// Nodes of the current overlay that change without a rebuild.
@@ -176,6 +224,8 @@ pub struct OverlayNodes {
     pub sheet: Option<NodeId>,
     pub slider: Option<NodeId>,
     pub label: Option<NodeId>,
+    /// The contents list's own nodes: the fold markers and the pager.
+    pub toc: Option<toc_ui::TocUi>,
 }
 
 /// Bounds to a UI rect.
@@ -190,7 +240,7 @@ fn nearest(words: &[Word], p: Point) -> Option<usize> {
 }
 
 impl App {
-    fn reading(&mut self) -> Option<&mut crate::Reading> {
+    pub(crate) fn reading(&mut self) -> Option<&mut crate::Reading> {
         match &mut self.screen {
             Screen::Reader(r) => Some(r),
             _ => None,
@@ -225,6 +275,7 @@ impl App {
                 | Overlay::Gloss { .. }
                 | Overlay::Note { .. }
                 | Overlay::Annotation { .. }
+                | Overlay::WereadThought { .. }
                 | Overlay::Sync { .. }
         ) {
             return None;
@@ -287,6 +338,7 @@ impl App {
                 .collect()
         };
         let h = self.ui.bounds().h;
+        let panel_size = self.ui.bounds().size();
         // Popup text the UI font can draw (see `overlay::printable`), and
         // Greek in dictionaries without length marks.
         let body =
@@ -297,6 +349,7 @@ impl App {
                 Some(Overlay::Gloss { text, .. }) => Some(overlay::dictionary_text(text)),
                 Some(Overlay::Note { text, .. }) => Some(text.clone()),
                 Some(Overlay::Annotation { text, .. }) => Some(text.clone()),
+                Some(Overlay::WereadThought { text, .. }) => Some(text.clone()),
                 Some(Overlay::Sync { text, .. }) => Some(RichText::plain(text)),
                 _ => None,
             }
@@ -304,6 +357,10 @@ impl App {
             .unwrap_or_default();
         // The dictionary popup's words the same way: the headword (the
         // title), the tapped word and the suggestions.
+        // The buttons of the overlay, measured with the text engine (the
+        // tree does not own it), and the room they have.
+        let buttons = self.overlay_buttons(&styles);
+        let available = sheet::available_width(&styles, self.ui.bounds().w);
         let shown_lookup = match self.reading().map(|r| &r.overlay) {
             Some(Overlay::Dict { lookup, .. }) => Some(lookup.clone()),
             _ => None,
@@ -326,6 +383,17 @@ impl App {
             }
             l
         });
+        // The typeset panel measures its labels with the text engine, so its
+        // view is taken out before the reading state is borrowed.
+        let typeset_view: Option<Box<aristotle_ui::screens::typeset::TypesetView>> =
+            match self.reading().map(|r| &r.overlay) {
+                Some(Overlay::Typeset { view, .. }) => Some((*view).clone()),
+                _ => None,
+            };
+        let Some(book_id) = self.reading().map(|r| r.session.id.clone()) else {
+            return Ok(());
+        };
+        let sync_channels = self.reader_sync_channels_all(&book_id);
         let Some(r) = self.reading() else {
             return Ok(());
         };
@@ -360,44 +428,39 @@ impl App {
             let max = fit.unwrap_or(room.clamp(h / 4, h * 3 / 4));
             let height = popup_height(&page_words, place, h, max, styles.density);
             let built = match overlay {
-                Overlay::Dict {
-                    lookup,
-                    highlight,
-                    full,
-                    ..
-                } => Some(dict_popup(
+                Overlay::Dict { lookup, .. } => Some(dict_popup(
                     t,
                     &styles,
                     shown_lookup.as_ref().unwrap_or(lookup),
                     &dicts,
                     &body,
-                    highlight.is_some(),
-                    *full,
+                    &buttons,
+                    available,
                     place,
                     height,
                 )),
                 Overlay::Waiting { .. } | Overlay::Dragging { .. } | Overlay::None => None,
                 Overlay::Actions { .. } => {
-                    let body = RichText::default();
-                    Some(overlay::popup(
+                    let sheet = selection_ui::build(
                         t,
                         &styles,
-                        &PopupSpec {
-                            title: tr(Msg::ReaderSelection).into(),
-                            subtitle: None,
-                            tabs: Vec::new(),
-                            body: &body,
-                            suggestions: Vec::new(),
-                            actions: vec![
-                                (tr(Msg::ReaderHighlight), act::HIGHLIGHT),
-                                (tr(Msg::ReaderDictionary), act::LOOKUP),
-                                (tr(Msg::ReaderTranslate), act::GLOSS),
-                                (tr(Msg::CommonCancel), act::CANCEL),
-                            ],
-                            place,
-                            height,
-                        },
-                    ))
+                        tr(Msg::ReaderSelection),
+                        &buttons,
+                        available,
+                        place.into(),
+                    );
+                    layers.push(sheet.root);
+                    None
+                }
+                Overlay::Translate { source, result, .. } => {
+                    let mut view = translate_view(source, result.as_ref());
+                    view.buttons = buttons.clone();
+                    let ui = translate_ui::build(t, &styles, &view, available, place.into(), h / 3);
+                    nodes.pages = Some(ui.pages);
+                    nodes.pager = Some(ui.pager);
+                    nodes.arrows = Some(ui.arrows);
+                    layers.push(ui.root);
+                    None
                 }
                 Overlay::Gloss { .. } => Some(overlay::popup(
                     t,
@@ -408,10 +471,8 @@ impl App {
                         tabs: Vec::new(),
                         body: &body,
                         suggestions: Vec::new(),
-                        actions: vec![
-                            (tr(Msg::ReaderHighlight), act::HIGHLIGHT),
-                            (tr(Msg::CommonClose), act::CANCEL),
-                        ],
+                        actions: buttons.clone(),
+                        available,
                         place,
                         height,
                     },
@@ -425,41 +486,42 @@ impl App {
                         tabs: Vec::new(),
                         body: &body,
                         suggestions: Vec::new(),
-                        actions: vec![
-                            (tr(Msg::ReaderGoToNote), act::GO_NOTE),
-                            (tr(Msg::CommonClose), act::CANCEL),
-                        ],
+                        actions: buttons.clone(),
+                        available,
                         place: Place::Bottom,
                         height: popup_height(&page_words, Place::Bottom, h, max, styles.density),
                     },
                 )),
-                Overlay::Annotation { target, .. } => {
-                    let mut actions = Vec::new();
-                    if target.is_some() {
-                        actions.push((tr(Msg::ReaderGo), act::GO_ANNOTATION));
-                    }
-                    actions.push((tr(Msg::CommonBack), act::NAV_MARKS));
-                    Some(overlay::popup(
-                        t,
-                        &styles,
-                        &PopupSpec {
-                            title: tr(Msg::ReaderImportedAnnotation).into(),
-                            subtitle: None,
-                            tabs: Vec::new(),
-                            body: &body,
-                            suggestions: Vec::new(),
-                            actions,
-                            place: Place::Bottom,
-                            height: popup_height(
-                                &page_words,
-                                Place::Bottom,
-                                h,
-                                max,
-                                styles.density,
-                            ),
-                        },
-                    ))
-                }
+                Overlay::Annotation { .. } => Some(overlay::popup(
+                    t,
+                    &styles,
+                    &PopupSpec {
+                        title: tr(Msg::ReaderImportedAnnotation).into(),
+                        subtitle: None,
+                        tabs: Vec::new(),
+                        body: &body,
+                        suggestions: Vec::new(),
+                        actions: buttons.clone(),
+                        available,
+                        place: Place::Bottom,
+                        height: popup_height(&page_words, Place::Bottom, h, max, styles.density),
+                    },
+                )),
+                Overlay::WereadThought { .. } => Some(overlay::popup(
+                    t,
+                    &styles,
+                    &PopupSpec {
+                        title: tr(Msg::WereadNotesThought).into(),
+                        subtitle: None,
+                        tabs: Vec::new(),
+                        body: &body,
+                        suggestions: Vec::new(),
+                        actions: buttons.clone(),
+                        available,
+                        place: Place::Bottom,
+                        height: popup_height(&page_words, Place::Bottom, h, max, styles.density),
+                    },
+                )),
                 Overlay::Sync { .. } => Some(overlay::popup(
                     t,
                     &styles,
@@ -469,40 +531,26 @@ impl App {
                         tabs: Vec::new(),
                         body: &body,
                         suggestions: Vec::new(),
-                        actions: vec![
-                            (tr(Msg::ReaderSyncGo), act::SYNC_GO),
-                            (tr(Msg::ReaderSyncStay), act::CANCEL),
-                        ],
+                        actions: buttons.clone(),
+                        available,
                         place: Place::Bottom,
                         height: popup_height(&page_words, Place::Bottom, h, max, styles.density),
                     },
                 )),
-                Overlay::Toc { items, current, .. } => {
-                    let rows: Vec<ListRow> = items
-                        .iter()
-                        .map(|it| ListRow {
-                            text: if it.title.is_empty() {
-                                "—".into()
-                            } else {
-                                it.title.clone()
-                            },
-                            meta: it.page.map(|p| (p + 1).to_string()),
-                            indent: it.depth,
-                            current: Some(it.index) == *current,
-                            lines: 2,
-                            family: None,
-                        })
-                        .collect();
-                    let l = overlay::list(
+                Overlay::Toc { contents, .. } => {
+                    let l = toc_ui::build(
                         t,
                         &styles,
+                        contents,
                         tr(Msg::MenuContents),
-                        &rows,
                         tr(Msg::ReaderNoContents),
                     );
                     nodes.pages = Some(l.pages);
                     nodes.pager = Some(l.pager);
-                    nodes.arrows = Some(l.arrows);
+                    // The pager's own buttons stay at the ends of the
+                    // list and grey out there, so the generic pager
+                    // (which hides its arrows) is not used here.
+                    nodes.toc = Some(l);
                     layers.push(l.root);
                     None
                 }
@@ -561,12 +609,9 @@ impl App {
                     layers.push(g.root);
                     None
                 }
-                Overlay::Typeset { view } => {
-                    let (typeset_root, _) =
-                        aristotle_ui::screens::typeset::build_typeset_screen(t, &styles, view);
-                    layers.push(typeset_root);
-                    None
-                }
+                // The typeset panel is built after the reading state is
+                // released: it measures its labels with the text engine.
+                Overlay::Typeset { .. } => None,
             };
             if let Some(p) = built {
                 nodes.pages = Some(p.pages);
@@ -577,12 +622,13 @@ impl App {
             }
             layers
         };
-        let (tree, menu, page_node, nav, progress) = crate::reader_tree_with(
+        let (mut tree, menu, page_node, nav, progress) = crate::reader_tree_with_sync_channels(
             &styles,
             &r.session.title,
             &r.settings,
             page,
             (0, 0),
+            sync_channels,
             &mut extra,
         );
         r.menu = menu;
@@ -590,6 +636,21 @@ impl App {
         r.nav = nav;
         r.progress = progress;
         r.nodes = nodes;
+        // The typeset panel goes over the page, under the menu.
+        if let Some(view) = typeset_view {
+            let (typeset_root, _) = aristotle_ui::screens::typeset::build_typeset_screen_for_size(
+                &mut tree,
+                &mut self.ui.text,
+                &styles,
+                &view,
+                panel_size,
+            );
+            if let Some(stack) = tree.root() {
+                let mut children = tree.node(stack).children.clone();
+                children.insert(1, typeset_root);
+                tree.set_children(stack, children);
+            }
+        }
         self.ui.set_tree_with(tree, refresh);
         let Some(r) = self.reading() else {
             return Ok(());
@@ -622,6 +683,13 @@ impl App {
         let (p, n) = self.ui.tree.page(pages);
         if let Some(cur) = r.overlay.page_mut() {
             *cur = p;
+        }
+        if let Some(toc) = r.nodes.toc {
+            // The contents list's own pager: the buttons stay at the
+            // ends of the list and grey out there.
+            toc.sync(&mut self.ui.tree);
+            self.ui.layout();
+            return;
         }
         let label = if n > 1 {
             format!("{}/{}", p + 1, n)
@@ -980,13 +1048,19 @@ impl App {
     /// Plato locations of this book's highlights and bookmarks, from the
     /// index, into the session (pages are redrawn with them).
     pub(crate) fn reload_marks(&mut self) {
+        // The cloud notes are placed from the cache: this reads memory only.
+        let hash = match &self.screen {
+            Screen::Reader(r) => r.session.id.clone(),
+            _ => return,
+        };
+        let cloud = self.weread_notes_positions(&hash);
         let Screen::Reader(r) = &mut self.screen else {
             return;
         };
         let Some(rec) = self.lib.book(&r.session.id) else {
             return;
         };
-        let raw_hl: Vec<(Option<usize>, Position, Position)> =
+        let mut raw_hl: Vec<(Option<usize>, Position, Position)> =
             marks::ours_versioned(rec, AnnotationKind::Highlight)
                 .into_iter()
                 .filter_map(|(id, s, e, version)| {
@@ -995,6 +1069,9 @@ impl App {
                     Some((Some(id), s, e))
                 })
                 .collect();
+        // Cloud highlights reuse the reader's mark path; they have no
+        // annotation index, so tapping one never offers "remove".
+        raw_hl.extend(cloud);
         let raw_bm: Vec<Position> = marks::ours_versioned(rec, AnnotationKind::Bookmark)
             .into_iter()
             .filter_map(|(_, s, _, version)| r.session.map_stored_position(&s, version))
@@ -1136,7 +1213,7 @@ impl App {
             .and_then(|a| a.position.clone());
         if let Some(pos) = target {
             self.lib.remove_annotations(&id, |a| {
-                a.source == marks::SOURCE
+                marks::is_editable_source(&a.source)
                     && a.kind == AnnotationKind::Highlight
                     && a.position.as_ref() == Some(&pos)
             });
@@ -1167,13 +1244,12 @@ impl App {
                 let book = r.session.book();
                 let at = book.position_at(b);
                 self.lib.remove_annotations(&id, |a| {
-                    a.source == marks::SOURCE
+                    marks::is_editable_source(&a.source)
                         && a.kind == AnnotationKind::Bookmark
                         && a.position
                             .as_ref()
                             .and_then(|p| marks::decode(&p.0))
-                            .as_ref()
-                            == Some(&at)
+                            .is_some_and(|pos| pos == at || book.location_of(&pos) == Some(b))
                 });
                 perf!("bookmark removed");
             }
@@ -1222,42 +1298,47 @@ impl App {
         let loc = r.session.current;
         let items = r.session.book().toc_items();
         let current = r.session.book().toc_current(loc);
-        // Start on the page that shows the current chapter.
-        let page = 0;
+        // The list is folded: only the group the reader is in is open,
+        // so the contents open at the chapter being read.
+        let entries = items
+            .into_iter()
+            .map(|it| toc_ui::Entry {
+                title: if it.title.is_empty() {
+                    "—".into()
+                } else {
+                    it.title
+                },
+                depth: it.depth,
+                index: it.index,
+                page: it.page,
+            })
+            .collect();
+        let contents = toc_ui::Contents::new(entries, current);
         r.overlay = Overlay::Toc {
-            items,
-            current,
-            page,
+            contents: Box::new(contents),
+            page: 0,
         };
         r.menu_open = false;
         self.rebuild_reader(Refresh::Auto)?;
         // Turn the list to the current entry.
         let target = match self.reading() {
             Some(r) => match (&r.overlay, r.nodes.pages) {
-                (
-                    Overlay::Toc {
-                        items,
-                        current: Some(c),
-                        ..
-                    },
-                    Some(pages),
-                ) => items
-                    .iter()
-                    .position(|it| it.index == *c)
-                    .map(|idx| (idx, pages)),
+                (Overlay::Toc { contents, .. }, Some(pages)) => {
+                    contents.current_row().map(|row| (row, pages))
+                }
                 _ => None,
             },
             None => None,
         };
-        if let Some((idx, pages)) = target {
-            let row = self.ui.tree.node(pages).children.get(idx).copied();
+        if let Some((row, pages)) = target {
+            let node = self.ui.tree.node(pages).children.get(row).copied();
             let mut p = 0;
             loop {
                 self.ui.tree.set_page(pages, p);
                 self.ui.layout();
                 let (cur, n) = self.ui.tree.page(pages);
                 // Only rows on the shown page can be hit.
-                let visible = row.is_some_and(|id| {
+                let visible = node.is_some_and(|id| {
                     let r = self.ui.tree.rect(id);
                     let c = Point {
                         x: r.x + r.w / 2,
@@ -1277,6 +1358,49 @@ impl App {
         }
         self.sync_pager();
         self.present_full()
+    }
+
+    /// What a tap in the contents list means.
+    fn toc_action(&mut self, action: toc_ui::TocAction) -> Result<(), Error> {
+        match action {
+            toc_ui::TocAction::Close => self.close_overlay(),
+            toc_ui::TocAction::PrevPage => self.overlay_page(-1),
+            toc_ui::TocAction::NextPage => self.overlay_page(1),
+            toc_ui::TocAction::Select(row) => self.list_item(row),
+            toc_ui::TocAction::Toggle(row) => self.toc_toggle(row),
+        }
+    }
+
+    /// Folds the children of the chapter on a row of the contents list
+    /// open or shut, and draws the list again.
+    fn toc_toggle(&mut self, row: usize) -> Result<(), Error> {
+        let Some(r) = self.reading() else {
+            return Ok(());
+        };
+        let Overlay::Toc { contents, .. } = &mut r.overlay else {
+            return Ok(());
+        };
+        if !contents.toggle_row(row) {
+            return Ok(());
+        }
+        self.rebuild_reader(Refresh::Auto)?;
+        self.present_full()
+    }
+
+    /// A page-turn key while the contents list is open: it turns the
+    /// list's own pages, not the book's.
+    pub(crate) fn toc_page_key(&mut self, dir: Turn) -> Result<(), Error> {
+        let open = matches!(
+            self.reading().map(|r| &r.overlay),
+            Some(Overlay::Toc { .. })
+        );
+        if !open {
+            return Ok(());
+        }
+        self.overlay_page(match dir {
+            Turn::Forward => 1,
+            Turn::Back => -1,
+        })
     }
 
     pub(crate) fn open_marks(&mut self) -> Result<(), Error> {
@@ -1299,9 +1423,10 @@ impl App {
                 .collect();
             all.sort_by_key(|x| x.0);
             for (_, a, p) in all {
+                let is_imported = !marks::is_editable_source(&a.source);
                 let date = a.created.as_deref().map(|c| c.get(..10).unwrap_or(c));
                 let meta: Vec<String> = [
-                    (a.source != marks::SOURCE)
+                    (is_imported || p.is_none())
                         .then(|| tr(Msg::ReaderImportedAnnotation).to_string()),
                     a.chapter.clone(),
                     aristotle_library::export::location_note(a.location),
@@ -1323,7 +1448,7 @@ impl App {
                         .map(aristotle_i18n::quoted)
                         .unwrap_or_else(|| tr(Msg::ReaderHighlight).to_string()),
                 };
-                let detail = (a.source != marks::SOURCE).then(|| {
+                let detail = (is_imported || a.note.is_some() || p.is_none()).then(|| {
                     let mut parts = vec![meta.join(" · "), text.clone()];
                     if let Some(note) = &a.note {
                         parts.push(note.clone());
@@ -1338,7 +1463,38 @@ impl App {
                     meta: meta.join(" · "),
                     target: p,
                     detail,
+                    weread: false,
                 });
+            }
+        }
+        // The WeRead cloud's highlights and thoughts come after the local
+        // ones, in page order. Their rows carry the thought (or the reason a
+        // note has no position) as the detail sheet.
+        if let Some(book_id) = self.weread.downloads.book_id_of_hash(&r.session.id) {
+            if let Some(positions) = self.weread.downloads.positions_of(&book_id) {
+                let cloud_rows = self.weread.notes.rows(&book_id, &positions);
+                let mut cloud: Vec<(usize, MarkRow)> = cloud_rows
+                    .into_iter()
+                    .map(|row| {
+                        let sort = row
+                            .target
+                            .as_ref()
+                            .and_then(|position| r.session.book().location_of(position))
+                            .unwrap_or(usize::MAX);
+                        (
+                            sort,
+                            MarkRow {
+                                text: row.text,
+                                meta: row.meta,
+                                target: row.target,
+                                detail: row.detail,
+                                weread: true,
+                            },
+                        )
+                    })
+                    .collect();
+                cloud.sort_by_key(|(sort, _)| *sort);
+                rows.extend(cloud.into_iter().map(|(_, row)| row));
             }
         }
         r.overlay = Overlay::Marks { rows, page: 0 };
@@ -1368,7 +1524,7 @@ impl App {
             return;
         };
         let detail = match r.session.book().known_page_count() {
-            Some(n) if r.session.book().engine() == Engine::Plato => {
+            Some(n) if matches!(r.session.book().engine(), Engine::Plato | Engine::Vertical) => {
                 tf!(
                     Msg::ReaderPageOf,
                     page = ((value * n as f32).ceil() as usize).clamp(1, n),
@@ -1483,6 +1639,10 @@ impl App {
             script_index: 0,
             gap_index: self.prefs.cjk_gap.min(2),
             underline_index: self.prefs.underline.min(2),
+            underline_scope: self.prefs.underline_scope.min(1),
+            fine_typesetting: self.prefs.fine_typesetting,
+            font_weight: self.prefs.font_weight,
+            writing_mode: self.prefs.writing_mode.min(1),
             trim_index: 0,
             anim_enabled: false,
             anim_speed: 1,
@@ -1727,6 +1887,23 @@ impl App {
                     prefs_changed = true;
                 }
             }
+            // The writing direction: horizontal or vertical. It picks the
+            // engine, so it needs a new layout, and the sheet's own close
+            // asks for one.
+            i if (a::WRITING_MODE_BASE..a::WRITING_MODE_BASE + 2).contains(&i) => {
+                let mode = (i - a::WRITING_MODE_BASE) as usize;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if mode != view.writing_mode {
+                    view.writing_mode = mode;
+                    self.prefs.writing_mode = mode;
+                    prefs_changed = true;
+                }
+            }
             i if (a::UNDERLINE_BASE..a::UNDERLINE_BASE + 3).contains(&i) => {
                 let idx = (i - a::UNDERLINE_BASE) as usize;
                 let Screen::Reader(r) = &mut self.screen else {
@@ -1742,6 +1919,75 @@ impl App {
                     underline_changed = true;
                 }
             }
+            // How wide the guide is: a render option like the guide itself,
+            // so the page is drawn again rather than laid out again.
+            i if (a::UNDERLINE_SCOPE_BASE..a::UNDERLINE_SCOPE_BASE + 2).contains(&i) => {
+                let idx = (i - a::UNDERLINE_SCOPE_BASE) as usize;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if idx != view.underline_scope {
+                    view.underline_scope = idx;
+                    self.prefs.underline_scope = idx;
+                    prefs_changed = true;
+                    underline_changed = true;
+                }
+            }
+            // Fine typesetting is a typographic setting: the engine takes
+            // it in the next layout, and the sheet's own close asks for
+            // one.
+            i if (a::FINE_BASE..a::FINE_BASE + 2).contains(&i) => {
+                let on = i == a::FINE_BASE;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if on != view.fine_typesetting {
+                    view.fine_typesetting = on;
+                    self.prefs.fine_typesetting = on;
+                    prefs_changed = true;
+                }
+            }
+            // The three quick buttons, then the stepper on either side of
+            // them. The weight is a typographic setting: it is laid out
+            // again when the sheet closes.
+            i if (a::WEIGHT_BASE..a::WEIGHT_DOWN).contains(&i) => {
+                let Some(&weight) = typeset::WEIGHT_PRESETS.get((i - a::WEIGHT_BASE) as usize)
+                else {
+                    return Ok(());
+                };
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if weight != view.font_weight {
+                    view.font_weight = weight;
+                    self.prefs.font_weight = weight;
+                    prefs_changed = true;
+                }
+            }
+            a::WEIGHT_DOWN | a::WEIGHT_UP => {
+                let up = id == a::WEIGHT_UP;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                let weight = typeset::weight_stepped(view.font_weight, up);
+                if weight != view.font_weight {
+                    view.font_weight = weight;
+                    self.prefs.font_weight = weight;
+                    prefs_changed = true;
+                }
+            }
             _ => return Ok(()),
         }
 
@@ -1752,8 +1998,17 @@ impl App {
             let Screen::Reader(r) = &mut self.screen else {
                 return Ok(());
             };
-            r.session.book().set_underline(self.prefs.underline());
-            r.session.clear_pages();
+            // A layout worker may hold the book for a moment; its result
+            // takes both settings from the preferences when it comes back
+            // (`adopt_*_restyle`), so nothing is lost by skipping here.
+            if r.session.has_book() {
+                let underline = self.prefs.underline();
+                let scope = self.prefs.underline_scope();
+                let book = r.session.book();
+                book.set_underline(underline);
+                book.set_underline_scope(scope);
+                r.session.clear_pages();
+            }
         }
 
         self.rebuild_reader(Refresh::Auto)?;
@@ -1784,12 +2039,24 @@ impl App {
         let Some(p) = r.overlay.page_mut() else {
             return Ok(());
         };
-        let new = (*p as i32 + delta).max(0) as usize;
-        if new == *p {
+        let before = *p;
+        let new = (before as i32 + delta).max(0) as usize;
+        if new == before {
+            // Already on the first page: there is nothing to draw, and
+            // a full update would only flash the screen.
             return Ok(());
         }
         *p = new;
         self.sync_pager();
+        let after = self
+            .reading()
+            .and_then(|r| r.overlay.page())
+            .unwrap_or(before);
+        if after == before {
+            // The list ends before the page asked for: the pager kept
+            // the page, so there is nothing to draw.
+            return Ok(());
+        }
         let full = matches!(
             self.reading().map(|r| &r.overlay),
             Some(Overlay::Toc { .. } | Overlay::Marks { .. } | Overlay::Fonts { .. })
@@ -1810,13 +2077,30 @@ impl App {
         ) {
             return self.handle_typeset_action(id);
         }
+        // The contents list's own actions: the way back, the pages of
+        // the list, a chapter and a fold. They are decoded, not read
+        // out of number ranges, so nothing else can land on them.
+        if matches!(
+            self.reading().map(|r| &r.overlay),
+            Some(Overlay::Toc { .. })
+        ) {
+            if let Some(action) = toc_ui::decode(id) {
+                return self.toc_action(action);
+            }
+        }
         match id {
+            // The translation sheet's own pager.
+            translate_ui::action::PREV => self.overlay_page(-1),
+            translate_ui::action::NEXT => self.overlay_page(1),
+            act::TRANSLATE => self.translate_selection(false),
+            act::TRANSLATE_SENTENCE => self.translate_selection(true),
             act::NAV_TOC => self.open_toc(),
             act::NAV_MARKS => self.open_marks(),
             act::NAV_GOTO => self.open_goto(),
             act::GO_ANNOTATION => {
                 let target = match self.reading().map(|r| &r.overlay) {
-                    Some(Overlay::Annotation { target, .. }) => target.clone(),
+                    Some(Overlay::Annotation { target, .. })
+                    | Some(Overlay::WereadThought { target, .. }) => target.clone(),
                     _ => None,
                 };
                 let location = target.and_then(|p| {
@@ -1954,10 +2238,20 @@ impl App {
         }
         if let Overlay::Marks { rows, .. } = &r.overlay {
             if let Some(row) = rows.get(i).filter(|row| row.detail.is_some()) {
-                let overlay = Overlay::Annotation {
-                    text: RichText::plain(row.detail.as_deref().unwrap_or_default()),
-                    target: row.target.clone(),
-                    page: 0,
+                let text = RichText::plain(row.detail.as_deref().unwrap_or_default());
+                let target = row.target.clone();
+                let overlay = if row.weread {
+                    Overlay::WereadThought {
+                        text,
+                        target,
+                        page: 0,
+                    }
+                } else {
+                    Overlay::Annotation {
+                        text,
+                        target,
+                        page: 0,
+                    }
                 };
                 if let Screen::Reader(r) = &mut self.screen {
                     r.overlay = overlay;
@@ -1967,8 +2261,8 @@ impl App {
             }
         }
         let target = match &r.overlay {
-            Overlay::Toc { items, .. } => {
-                let index = items.get(i).map(|it| it.index);
+            Overlay::Toc { contents, .. } => {
+                let index = contents.row_index(i);
                 index.and_then(|ix| r.session.book().toc_page(ix))
             }
             Overlay::Marks { rows, .. } => {
@@ -2104,6 +2398,146 @@ impl App {
         self.present_full()
     }
 
+    /// The buttons of the overlay: what the reader can do with what is
+    /// on the screen.
+    ///
+    /// They are measured here, because the tree does not own the text
+    /// engine, and the popups are built inside the reader's tree.
+    fn overlay_buttons(&mut self, st: &aristotle_ui::theme::Styles) -> Vec<Button> {
+        let items: Vec<(&str, ActionId)> = {
+            let Some(r) = self.reading() else {
+                return Vec::new();
+            };
+            match &r.overlay {
+                Overlay::Dict {
+                    lookup,
+                    highlight,
+                    full,
+                    ..
+                } => {
+                    // In a highlight the button takes the highlight away.
+                    let mut actions = vec![if highlight.is_some() {
+                        (tr(Msg::ReaderUnhighlight), act::UNHIGHLIGHT)
+                    } else {
+                        (tr(Msg::ReaderHighlight), act::HIGHLIGHT)
+                    }];
+                    if !*full && lookup.found.as_ref().is_some_and(dict::has_more) {
+                        actions.push((tr(Msg::CommonMore), act::MORE));
+                    }
+                    actions.push((tr(Msg::ReaderTranslate), act::TRANSLATE));
+                    actions.push((tr(Msg::ReaderTranslateSentence), act::TRANSLATE_SENTENCE));
+                    actions.push((tr(Msg::CommonClose), act::CANCEL));
+                    actions
+                }
+                Overlay::Actions { .. } => vec![
+                    (tr(Msg::ReaderHighlight), act::HIGHLIGHT),
+                    (tr(Msg::ReaderDictionary), act::LOOKUP),
+                    (tr(Msg::ReaderGloss), act::GLOSS),
+                    (tr(Msg::ReaderTranslate), act::TRANSLATE),
+                    (tr(Msg::ReaderTranslateSentence), act::TRANSLATE_SENTENCE),
+                    (tr(Msg::CommonCancel), act::CANCEL),
+                ],
+                Overlay::Translate { .. } => vec![(tr(Msg::CommonClose), act::CANCEL)],
+                Overlay::Gloss { .. } => vec![
+                    (tr(Msg::ReaderHighlight), act::HIGHLIGHT),
+                    (tr(Msg::CommonClose), act::CANCEL),
+                ],
+                Overlay::Note { .. } => vec![
+                    (tr(Msg::ReaderGoToNote), act::GO_NOTE),
+                    (tr(Msg::CommonClose), act::CANCEL),
+                ],
+                Overlay::Annotation { target, .. } | Overlay::WereadThought { target, .. } => {
+                    let mut actions = Vec::new();
+                    if target.is_some() {
+                        actions.push((tr(Msg::ReaderGo), act::GO_ANNOTATION));
+                    }
+                    actions.push((tr(Msg::CommonBack), act::NAV_MARKS));
+                    actions
+                }
+                Overlay::Sync { .. } => vec![
+                    (tr(Msg::ReaderSyncGo), act::SYNC_GO),
+                    (tr(Msg::ReaderSyncStay), act::CANCEL),
+                ],
+                _ => Vec::new(),
+            }
+        };
+        let text = &mut self.ui.text;
+        items
+            .into_iter()
+            .map(|(label, action)| Button::new(&mut *text, st, label, action))
+            .collect()
+    }
+
+    /// Translate the selected text, or the sentence it stands in.
+    ///
+    /// The service is on the network, so the sheet opens with the text
+    /// that was sent and fills in when the answer comes.
+    fn translate_selection(&mut self, sentence: bool) -> Result<(), Error> {
+        let Some(r) = self.reading() else {
+            return Ok(());
+        };
+        let (sel, words) = match &r.overlay {
+            Overlay::Actions { sel, words } | Overlay::Dict { sel, words, .. } => {
+                (*sel, words.clone())
+            }
+            _ => return Ok(()),
+        };
+        let (start, end) = if sentence {
+            selection::sentence(&words, &sel)
+        } else {
+            (sel.start, sel.end)
+        };
+        let source = selection::range_text(&words, start, end);
+        if source.trim().is_empty() {
+            return Ok(());
+        }
+        translation::allow_hosts();
+        let service = self
+            .translate
+            .get_or_insert_with(translation::Service::start);
+        let seq = service.ask(source.clone());
+        let Some(r) = self.reading() else {
+            return Ok(());
+        };
+        r.overlay = Overlay::Translate {
+            sel,
+            words,
+            source,
+            seq,
+            result: None,
+            page: 0,
+        };
+        r.menu_open = false;
+        self.rebuild_reader(Refresh::Auto)?;
+        self.present_full()
+    }
+
+    /// The translation service answered.
+    pub(crate) fn poll_translate(&mut self) -> Result<(), Error> {
+        let Some(reply) = self.translate.as_mut().and_then(|s| s.take()) else {
+            return Ok(());
+        };
+        let TranslateReply::Translated { seq, result } = reply;
+        let Some(r) = self.reading() else {
+            return Ok(());
+        };
+        let Overlay::Translate {
+            seq: current,
+            result: slot,
+            ..
+        } = &mut r.overlay
+        else {
+            return Ok(());
+        };
+        if *current != seq {
+            // A stale answer: the reader has asked again since.
+            return Ok(());
+        }
+        *slot = Some(result);
+        self.rebuild_reader(Refresh::Auto)?;
+        self.present_full()
+    }
+
     /// "Tłumacz": each word's first sense from the dictionaries.
     fn gloss_selection(&mut self) -> Result<(), Error> {
         let lang = self.book_lang();
@@ -2169,6 +2603,32 @@ impl App {
     }
 }
 
+/// What the translation sheet shows: the text that was sent, the
+/// translation, and where it came from.
+fn translate_view<'a>(
+    source: &'a str,
+    result: Option<&'a Result<Translation, String>>,
+) -> translate_ui::TranslateView<'a> {
+    let mut view = translate_ui::TranslateView {
+        title: tr(Msg::ReaderTranslateTitle),
+        original_label: tr(Msg::ReaderTranslateOriginal),
+        original: source,
+        translation: None,
+        origin: None,
+        status: None,
+        buttons: Vec::new(),
+    };
+    match result {
+        None => view.status = Some(tr(Msg::ReaderTranslateWaiting)),
+        Some(Ok(t)) => {
+            view.translation = Some(&t.text);
+            view.origin = Some(t.source.label());
+        }
+        Some(Err(e)) => view.status = Some(e.as_str()),
+    }
+    view
+}
+
 /// What the dictionary popup says: the senses (or with `full` the whole
 /// entry), or why there is nothing.
 fn dict_body(l: &Lookup, no_dicts: bool, full: bool) -> RichText {
@@ -2188,8 +2648,8 @@ fn dict_popup(
     l: &Lookup,
     dicts: &[String],
     body: &RichText,
-    in_highlight: bool,
-    full: bool,
+    buttons: &[Button],
+    available: i32,
     place: Place,
     height: i32,
 ) -> overlay::Popup {
@@ -2218,15 +2678,6 @@ fn dict_popup(
         Some(_) if differs => Some(tf!(Msg::DictBaseForm, word = l.word)),
         _ => None,
     };
-    let mut actions = vec![if in_highlight {
-        (tr(Msg::ReaderUnhighlight), act::UNHIGHLIGHT)
-    } else {
-        (tr(Msg::ReaderHighlight), act::HIGHLIGHT)
-    }];
-    if !full && l.found.as_ref().is_some_and(dict::has_more) {
-        actions.push((tr(Msg::CommonMore), act::MORE));
-    }
-    actions.push((tr(Msg::CommonClose), act::CANCEL));
     overlay::popup(
         t,
         st,
@@ -2236,7 +2687,8 @@ fn dict_popup(
             tabs,
             body,
             suggestions: l.suggestions.clone(),
-            actions,
+            actions: buttons.to_vec(),
+            available,
             place,
             height,
         },

@@ -64,21 +64,25 @@ fn build_host() {
     /// koreader/crengine 用到的第三方库，静态库不会自动传播依赖，需要手工链接。
     /// 顺序无所谓（都是动态库），但必须在 koreader_crengine 之后。
     const SYSTEM_LIBS: &[&str] = &[
-        "z",        // zlib
-        "png",      // libpng
-        "jpeg",     // jpeg
-        "freetype", // freetype
-        "harfbuzz", // harfbuzz
-        "fribidi",  // fribidi
-        "unibreak", // libunibreak
-        "utf8proc", // utf8proc
-        "zstd",     // zstd
+        "z",         // zlib
+        "png",       // libpng
+        "jpeg",      // jpeg
+        "webpdemux", // libwebpdemux (animated / multi-frame WebP)
+        "webp",      // libwebp
+        "sharpyuv",  // libsharpyuv (dep of libwebp)
+        "freetype",  // freetype
+        "harfbuzz",  // harfbuzz
+        "fribidi",   // fribidi
+        "unibreak",  // libunibreak
+        "utf8proc",  // utf8proc
+        "zstd",      // zstd
     ];
 
     let manifest_dir = PathBuf::from(
         env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set by cargo"),
     );
     let vendor = manifest_dir.join("vendor/koreader-crengine");
+    let lunasvg_vendor = manifest_dir.join("vendor/lunasvg");
     let cmake_dir = manifest_dir.join("cmake/koreader-crengine");
     let crsetup_h = cmake_dir.join("crsetup.h");
     let brew = brew_prefix();
@@ -87,11 +91,16 @@ fn build_host() {
         vendor.join("CMakeLists.txt").exists(),
         "找不到 vendor/koreader-crengine，请先运行 engine/fetch.sh"
     );
+    assert!(
+        lunasvg_vendor.join("CMakeLists.txt").exists(),
+        "找不到 vendor/lunasvg，请先运行 engine/fetch.sh"
+    );
 
     println!("cargo:rerun-if-changed=shim.cpp");
     println!("cargo:rerun-if-changed=shim.h");
     println!("cargo:rerun-if-changed=assets/default.css");
     println!("cargo:rerun-if-changed=vendor/koreader-crengine");
+    println!("cargo:rerun-if-changed=vendor/lunasvg");
     println!("cargo:rerun-if-changed=cmake/koreader-crengine/CMakeLists.txt");
     println!("cargo:rerun-if-changed=cmake/koreader-crengine/crsetup.h");
     println!("cargo:rerun-if-changed=patches");
@@ -138,6 +147,7 @@ fn build_host() {
         dst.join("lib").display()
     );
     println!("cargo:rustc-link-lib=static=koreader_crengine");
+    println!("cargo:rustc-link-lib=static=lunasvg");
     for lib in SYSTEM_LIBS {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }
@@ -157,8 +167,21 @@ fn build_cross(target: &str) {
     /// 依赖彼此的顺序也要对（harfbuzz 用 freetype，png16 和 freetype 用
     /// zlib，libc++ 用 libc++abi）。
     const STATIC_LIBS: &[&str] = &[
-        "freetype", "harfbuzz", "png16", "jpeg", "z", "fribidi", "unibreak", "utf8proc", "zstd",
-        "c++", "c++abi",
+        "lunasvg",
+        "freetype",
+        "harfbuzz",
+        "png16",
+        "jpeg",
+        "webpdemux",
+        "webp",
+        "sharpyuv",
+        "z",
+        "fribidi",
+        "unibreak",
+        "utf8proc",
+        "zstd",
+        "c++",
+        "c++abi",
     ];
 
     /// 交叉编译的编译参数。Cortex-A9 + NEON，和设备包里的 Plato 一样。
@@ -169,12 +192,17 @@ fn build_cross(target: &str) {
         env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set by cargo"),
     );
     let vendor = manifest_dir.join("vendor/koreader-crengine");
+    let lunasvg_vendor = manifest_dir.join("vendor/lunasvg");
     let cmake_dir = manifest_dir.join("cmake/koreader-crengine");
     let crsetup_h = cmake_dir.join("crsetup.h");
 
     assert!(
         vendor.join("CMakeLists.txt").exists(),
         "找不到 vendor/koreader-crengine，请先运行 engine/fetch.sh"
+    );
+    assert!(
+        lunasvg_vendor.join("CMakeLists.txt").exists(),
+        "找不到 vendor/lunasvg，请先运行 engine/fetch.sh"
     );
 
     /// 交叉编译需要的路径，都由 `aristotle/tools/build-engine.sh` 设好。

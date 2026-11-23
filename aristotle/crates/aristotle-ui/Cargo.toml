@@ -22,6 +22,8 @@ swash = { version = "0.2", default-features = false, features = ["std", "scale",
 zeno = { version = "0.3", default-features = false, features = ["std", "eval"] }
 unicode-linebreak = "0.1"
 tyme4rs = "1.5"
+# QR codes for the WeRead sign-in screen (MIT OR Apache-2.0).
+qrcode = { version = "0.14", default-features = false }
 serde = { version = "1", features = ["derive"] }
 png = { version = "0.18", optional = true }
 

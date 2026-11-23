@@ -22,6 +22,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use inkread_core::jianguoyun::{JianguoyunConfig, DEFAULT_WEBDAV_BASE};
+
 use crate::auth::{md5_hex, Credentials};
 use crate::kosync::{self, Account};
 use crate::policy::entry_for;
@@ -32,6 +34,7 @@ pub const FILE: &str = "accounts.json";
 pub const SYNC_FEATURE: &str = "sync";
 pub const READEST_FEATURE: &str = "readest";
 pub const OPDS_FEATURE: &str = "opds";
+pub const JIANGUOYUN_FEATURE: &str = "jianguoyun";
 
 fn yes() -> bool {
     true
@@ -221,6 +224,111 @@ impl SyncSettings {
     }
 }
 
+/// The Jianguoyun (Nutstore) WebDAV account and its sync bookkeeping
+/// (`sync-contract.md` §15.1, §15.4).
+///
+/// The password is the third-party application password from Nutstore's own
+/// security page, never the account password. It is stored as given because
+/// WebDAV Basic authentication needs it on every request, and
+/// [`fmt::Debug`] redacts it with `[REDACTED]`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JianguoyunSettings {
+    /// WebDAV endpoint; empty means the official `dav.jianguoyun.com`.
+    #[serde(default)]
+    pub server_url: String,
+    /// Nutstore account e-mail.
+    #[serde(default)]
+    pub username: String,
+    /// Third-party application password, never the login password.
+    #[serde(default)]
+    pub password: String,
+    /// Decoded sub-directory under the endpoint, e.g. `书库`.
+    #[serde(default)]
+    pub remote_dir: String,
+    /// Push the open book's progress when it is closed or the device sleeps.
+    #[serde(default = "yes")]
+    pub auto_push: bool,
+    /// The newest successful sync, in milliseconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_time: Option<i64>,
+    /// Books whose push failed and must be retried.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_queue: Vec<String>,
+}
+
+impl std::fmt::Debug for JianguoyunSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JianguoyunSettings")
+            .field("server_url", &self.server_url)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("remote_dir", &self.remote_dir)
+            .field("auto_push", &self.auto_push)
+            .field("last_sync_time", &self.last_sync_time)
+            .field("pending_queue", &self.pending_queue)
+            .finish()
+    }
+}
+
+impl JianguoyunSettings {
+    /// A signed-in account with nothing remembered yet.
+    pub fn new(
+        server_url: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+        remote_dir: impl Into<String>,
+    ) -> Self {
+        Self {
+            server_url: server_url.into(),
+            username: username.into(),
+            password: password.into(),
+            remote_dir: remote_dir.into(),
+            auto_push: true,
+            last_sync_time: None,
+            pending_queue: Vec::new(),
+        }
+    }
+
+    /// The official endpoint with no remote sub-directory.
+    pub fn official(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self::new(DEFAULT_WEBDAV_BASE, username, password, "")
+    }
+
+    /// The platform-independent client configuration these settings name.
+    ///
+    /// An empty `server_url` falls back to [`DEFAULT_WEBDAV_BASE`], so a
+    /// `jianguoyun.json` that only carries the account still works.
+    pub fn to_core_config(&self) -> JianguoyunConfig {
+        let server_url = match self.server_url.trim() {
+            "" => DEFAULT_WEBDAV_BASE,
+            url => url,
+        };
+        JianguoyunConfig::new(
+            server_url,
+            self.username.trim(),
+            self.password.clone(),
+            self.remote_dir.trim(),
+        )
+    }
+
+    /// Remember that `book` still has changes to push.
+    pub fn enqueue_push(&mut self, book: &str) {
+        if !self.pending_queue.iter().any(|pending| pending == book) {
+            self.pending_queue.push(book.to_string());
+        }
+    }
+
+    /// Forget `book` after its push went through.
+    pub fn dequeue_push(&mut self, book: &str) {
+        self.pending_queue.retain(|pending| pending != book);
+    }
+
+    /// How many books still have changes to push.
+    pub fn pending_pushes(&self) -> usize {
+        self.pending_queue.len()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogSettings {
     pub name: String,
@@ -294,6 +402,9 @@ pub struct Accounts {
     pub sync: Option<SyncSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readest: Option<ReadestSettings>,
+    /// The Jianguoyun (Nutstore) account, when the reader set one up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jianguoyun: Option<JianguoyunSettings>,
     /// The Readest endpoints, independent of the account so they survive a
     /// sign-out and can be set before the first sign-in. This is the only
     /// source; `readest_config()` falls back to the defaults for the parts
@@ -360,6 +471,21 @@ struct SyncFile {
 #[derive(Deserialize, Serialize)]
 struct CatalogsFile {
     catalogs: Vec<CatalogSettings>,
+}
+
+/// `jianguoyun.json`, the file the reader writes by hand (or copies over USB)
+/// until the on-screen keyboard is not the only way in.
+#[derive(Deserialize, Serialize)]
+struct JianguoyunFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server_url: Option<String>,
+    username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_push: Option<bool>,
 }
 
 /// Make sure `dir` can hold secrets: create it if missing, and refuse it
@@ -596,6 +722,12 @@ impl Accounts {
         if self.readest.is_some() || !self.readest_endpoints.is_empty() {
             out.extend(self.readest_allow_entries());
         }
+        // The Nutstore endpoint is registered only once the reader set the
+        // account up; the login page asks for `jianguoyun_allow_entries`
+        // before that, so a fresh `scoped` device can reach the official host.
+        if self.jianguoyun.is_some() {
+            out.extend(self.jianguoyun_allow_entries());
+        }
         for c in &self.catalogs {
             if let Some(e) = Url::parse(&c.url).ok().and_then(|u| entry_for(&u)) {
                 out.insert((e, OPDS_FEATURE));
@@ -617,6 +749,32 @@ impl Accounts {
             {
                 out.insert((e, READEST_FEATURE));
             }
+        }
+        out
+    }
+
+    /// The allowlist entry the Nutstore endpoint needs, with
+    /// [`JIANGUOYUN_FEATURE`].
+    ///
+    /// Without an account this is the official `dav.jianguoyun.com:443`, so
+    /// the first sign-in on a `scoped` device is not refused before the reader
+    /// has saved anything. A custom endpoint that plain HTTP outside loopback
+    /// and the private IPv4 ranges would leak the app password is not
+    /// registered.
+    pub fn jianguoyun_allow_entries(&self) -> BTreeSet<(String, &'static str)> {
+        let config = match &self.jianguoyun {
+            Some(settings) => settings.to_core_config(),
+            None => JianguoyunConfig::default(),
+        };
+        let mut out = BTreeSet::new();
+        if let Some(e) = config
+            .normalized_base_url()
+            .ok()
+            .and_then(|url| Url::parse(&url).ok())
+            .filter(crate::endpoint::is_allowed)
+            .and_then(|url| entry_for(&url))
+        {
+            out.insert((e, JIANGUOYUN_FEATURE));
         }
         out
     }
@@ -759,6 +917,86 @@ impl Accounts {
         self.imported.insert(file_key(file), md5_hex(&stored));
         Ok(Imported::Loaded)
     }
+
+    /// Read `jianguoyun.json` if it changed (or always, with `force`).
+    ///
+    /// The file carries `server_url` (optional; the official endpoint when
+    /// absent), `username`, `password`, `remote_dir` (optional) and `auto_push`
+    /// (optional). The password is stored in `accounts.json` and then erased
+    /// from the import file, exactly like `sync.json` and `catalogs.json`; a
+    /// later read of the rewritten file (no password) keeps the stored one as
+    /// long as the server and the account did not change.
+    pub fn import_jianguoyun(&mut self, file: &Path, force: bool) -> Result<Imported, ImportError> {
+        let Some(bytes) = read_if_changed(&self.imported, file, force)? else {
+            return Ok(if file.exists() {
+                Imported::Unchanged
+            } else {
+                Imported::Missing
+            });
+        };
+        let mut f: JianguoyunFile =
+            serde_json::from_slice(&bytes).map_err(|e| ImportError::Json(e.to_string()))?;
+        let server_url = match f.server_url.as_deref().map(str::trim) {
+            Some("") | None => DEFAULT_WEBDAV_BASE.trim_end_matches('/').to_string(),
+            Some(url) => valid_url(url, "server_url")?
+                .to_string()
+                .trim_end_matches('/')
+                .to_string(),
+        };
+        let username = f.username.trim().to_string();
+        if username.is_empty() {
+            return Err(ImportError::Invalid("username is empty".into()));
+        }
+        let remote_dir = f.remote_dir.as_deref().unwrap_or("").trim().to_string();
+        // Validating the pair before storing keeps a `..` or a plain-HTTP
+        // public endpoint out of the settings instead of failing every request
+        // later, when the reader has no idea which field is wrong.
+        let config = JianguoyunConfig::new(&server_url, &username, "", &remote_dir);
+        let normalized = config
+            .normalized_base_url()
+            .map_err(|e| ImportError::Invalid(e.to_string()))?;
+        let normalized_url = valid_url(normalized.trim_end_matches('/'), "server_url")?;
+        if !crate::endpoint::is_allowed(&normalized_url) {
+            return Err(ImportError::Invalid(format!(
+                "server_url: {server_url:?} may not be used for Jianguoyun"
+            )));
+        }
+        let old = self.jianguoyun.take();
+        let same = old.as_ref().is_some_and(|o| {
+            canonical_server_url(&o.server_url) == server_url && o.username == username
+        });
+        let password = match f
+            .password
+            .as_deref()
+            .filter(|password| !password.is_empty())
+        {
+            Some(password) => password.to_string(),
+            None if same => old.as_ref().map(|o| o.password.clone()).unwrap_or_default(),
+            None => String::new(),
+        };
+        self.jianguoyun = Some(JianguoyunSettings {
+            server_url: server_url.clone(),
+            username,
+            password,
+            remote_dir,
+            auto_push: f
+                .auto_push
+                .or(old.as_ref().map(|o| o.auto_push))
+                .unwrap_or(true),
+            last_sync_time: old.as_ref().and_then(|o| o.last_sync_time),
+            pending_queue: old.map(|o| o.pending_queue).unwrap_or_default(),
+        });
+        let mut stored = bytes;
+        if f.password.take().is_some() {
+            // The rewritten file keeps the endpoint the reader left out: a
+            // bare account still names the official server afterwards.
+            f.server_url = Some(server_url);
+            stored = pretty(&f)?;
+            write_private(file, &stored)?;
+        }
+        self.imported.insert(file_key(file), md5_hex(&stored));
+        Ok(Imported::Loaded)
+    }
 }
 
 /// Which sync setting a line of typed text is for.
@@ -774,6 +1012,17 @@ fn file_key(file: &Path) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_string()
+}
+
+/// The form of a WebDAV endpoint used to decide whether two accounts are the
+/// same: the parsed URL without a trailing slash, so a saved default with `/`
+/// and an import file without it still match.
+fn canonical_server_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    match Url::parse(trimmed) {
+        Ok(url) => url.to_string().trim_end_matches('/').to_string(),
+        Err(_) => trimmed.trim_end_matches('/').to_string(),
+    }
 }
 
 fn read_if_changed(
@@ -1355,5 +1604,171 @@ mod tests {
         assert_eq!(a.readest_config().api_base, def.api_base);
         assert_eq!(a.readest_config().supabase_url, def.supabase_url);
         assert_eq!(a.readest_config().supabase_anon_key, def.supabase_anon_key);
+    }
+
+    #[test]
+    fn jianguoyun_json_is_read_once_and_loses_its_password() {
+        let dir = testdir("jianguoyun-import");
+        let file = dir.join("jianguoyun.json");
+        fs::write(
+            &file,
+            r#"{"username": "reader@example.com", "password": "app-password", "remote_dir": "书库", "auto_push": false}"#,
+        )
+        .unwrap();
+        let mut a = Accounts::default();
+        assert_eq!(a.import_jianguoyun(&file, false).unwrap(), Imported::Loaded);
+        let s = a.jianguoyun.clone().unwrap();
+        assert_eq!(s.server_url, "https://dav.jianguoyun.com/dav");
+        assert_eq!(s.username, "reader@example.com");
+        assert_eq!(s.password, "app-password");
+        assert_eq!(s.remote_dir, "书库");
+        assert!(!s.auto_push);
+        assert_eq!(
+            s.to_core_config().normalized_base_url().unwrap(),
+            "https://dav.jianguoyun.com/dav/%E4%B9%A6%E5%BA%93/"
+        );
+
+        // The password is gone from the file, and the rewritten file counts
+        // as read; the endpoint survives even though the file omitted it.
+        let left = fs::read_to_string(&file).unwrap();
+        assert!(!left.contains("password"), "{left}");
+        assert!(left.contains("dav.jianguoyun.com"), "{left}");
+        assert_eq!(
+            a.import_jianguoyun(&file, false).unwrap(),
+            Imported::Unchanged
+        );
+        assert_eq!(a.import_jianguoyun(&file, true).unwrap(), Imported::Loaded);
+        assert_eq!(a.jianguoyun.as_ref().unwrap().password, "app-password");
+        assert_eq!(a.jianguoyun.as_ref().unwrap().remote_dir, "书库");
+        assert!(!a.jianguoyun.as_ref().unwrap().auto_push);
+
+        // A settings screen may save the official address with its trailing
+        // slash. Re-reading the wiped file must keep the stored password even
+        // though the two spellings differ.
+        a.jianguoyun.as_mut().unwrap().server_url = "https://dav.jianguoyun.com/dav/".to_string();
+        assert_eq!(a.import_jianguoyun(&file, true).unwrap(), Imported::Loaded);
+        assert_eq!(a.jianguoyun.as_ref().unwrap().password, "app-password");
+
+        // A missing file is not an error; a bad endpoint is, and the old
+        // settings stay.
+        assert_eq!(
+            a.import_jianguoyun(&dir.join("none.json"), true).unwrap(),
+            Imported::Missing
+        );
+        fs::write(
+            &file,
+            r#"{"server_url": "http://example.com/dav/", "username": "reader@example.com"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            a.import_jianguoyun(&file, false),
+            Err(ImportError::Invalid(_))
+        ));
+        assert_eq!(a.jianguoyun.as_ref().unwrap().password, "app-password");
+        fs::write(
+            &file,
+            r#"{"username": "reader@example.com", "password": "x", "remote_dir": "../etc"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            a.import_jianguoyun(&file, false),
+            Err(ImportError::Invalid(_))
+        ));
+        fs::write(
+            &file,
+            r#"{"server_url": "http://127.0.0.1:8080/dav", "username": "reader@example.com", "password": "app-password"}"#,
+        )
+        .unwrap();
+        assert_eq!(a.import_jianguoyun(&file, false).unwrap(), Imported::Loaded);
+        assert_eq!(
+            a.jianguoyun.as_ref().unwrap().server_url,
+            "http://127.0.0.1:8080/dav"
+        );
+    }
+
+    #[test]
+    fn jianguoyun_settings_redact_and_queue() {
+        let mut s = JianguoyunSettings::official("reader@example.com", "app-password");
+        assert!(s.auto_push);
+        let debug = format!("{s:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("app-password"));
+        assert!(debug.contains("reader@example.com"));
+        assert!(s.pending_queue.is_empty());
+        s.enqueue_push("book-a");
+        s.enqueue_push("book-a");
+        s.enqueue_push("book-b");
+        assert_eq!(s.pending_pushes(), 2);
+        s.dequeue_push("book-a");
+        assert_eq!(s.pending_queue, ["book-b"]);
+
+        let parsed: JianguoyunSettings =
+            serde_json::from_str(r#"{"server_url": "", "username": "u", "password": "p"}"#)
+                .unwrap();
+        assert!(parsed.auto_push);
+        assert!(parsed.pending_queue.is_empty());
+        assert!(parsed.last_sync_time.is_none());
+        assert_eq!(
+            parsed.to_core_config().normalized_base_url().unwrap(),
+            "https://dav.jianguoyun.com/dav/"
+        );
+    }
+
+    #[test]
+    fn jianguoyun_accounts_persist_private_and_stay_backward_compatible() {
+        // An accounts.json written before Jianguoyun existed still loads.
+        let dir = testdir("jianguoyun-legacy");
+        fs::write(dir.join(FILE), r#"{"device_id": "ABCDEF", "catalogs": []}"#).unwrap();
+        let mut a = Accounts::load(&dir);
+        assert!(a.jianguoyun.is_none());
+        assert!(!format!("{:?}", a).contains("dav.jianguoyun"));
+
+        a.jianguoyun = Some(JianguoyunSettings::official(
+            "reader@example.com",
+            "app-password",
+        ));
+        a.jianguoyun.as_mut().unwrap().enqueue_push("book-a");
+        a.save(&dir).unwrap();
+        let mode = fs::metadata(dir.join(FILE)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let loaded = Accounts::load(&dir);
+        assert_eq!(
+            loaded.jianguoyun.as_ref().unwrap().username,
+            "reader@example.com"
+        );
+        assert_eq!(
+            loaded.jianguoyun.as_ref().unwrap().pending_queue,
+            ["book-a"]
+        );
+        // The raw file holds the password the settings need, and the Debug
+        // output never does.
+        let raw = fs::read_to_string(dir.join(FILE)).unwrap();
+        assert!(raw.contains("app-password"));
+        assert!(raw.contains("\"jianguoyun\""));
+        assert!(!format!("{:?}", loaded.jianguoyun).contains("app-password"));
+
+        // A custom loopback endpoint is registered; a public plain-HTTP one
+        // never is, because the app password would be readable on the wire.
+        assert_eq!(
+            loaded
+                .jianguoyun_allow_entries()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [("dav.jianguoyun.com:443".to_string(), JIANGUOYUN_FEATURE)]
+        );
+        let mut scoped = loaded;
+        scoped.jianguoyun.as_mut().unwrap().server_url = "http://127.0.0.1:9/dav".into();
+        assert!(scoped
+            .allow_entries()
+            .contains(&("127.0.0.1:9".to_string(), JIANGUOYUN_FEATURE)));
+        assert!(!scoped
+            .allow_entries()
+            .contains(&("dav.jianguoyun.com:443".to_string(), JIANGUOYUN_FEATURE)));
+        scoped.jianguoyun.as_mut().unwrap().server_url = "http://example.com/dav".into();
+        assert!(scoped.jianguoyun_allow_entries().is_empty());
+        assert!(!scoped
+            .allow_entries()
+            .iter()
+            .any(|(_, feature)| *feature == JIANGUOYUN_FEATURE));
     }
 }

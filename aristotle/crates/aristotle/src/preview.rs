@@ -402,7 +402,14 @@ pub fn run(args: &Args, out: &Path, book: &Path) -> Result<(), Error> {
             .unwrap_or_else(|| Prefs::default().language),
         ..Prefs::default()
     };
-    let mut app = crate::build_app(&a, panel, prefs, service, crate::powerd::Sleep::none())?;
+    let mut app = crate::build_app(
+        &a,
+        panel,
+        prefs,
+        service,
+        crate::powerd::Sleep::none(),
+        args.preview_density.dpi(),
+    )?;
     // Exports as `--test-clippings` sends them: beside the PNGs.
     let export_root = out.join(format!("export-{stamp}"));
     fs::create_dir_all(&export_root)?;
@@ -437,7 +444,7 @@ pub fn run(args: &Args, out: &Path, book: &Path) -> Result<(), Error> {
     let menu = Point { x: 536, y: 70 };
     d.tap("menu", menu)?;
     d.snap("01-menu")?;
-    let p = d.button(act::NAV_TOC)?;
+    let p = d.button(aristotle_ui::screens::reader::action::CONTENTS)?;
     d.tap("contents", p)?;
     d.snap("02-contents")?;
     let ok = d.overlay_is(|o| matches!(o, Overlay::Toc { .. }));
@@ -549,15 +556,28 @@ pub fn run(args: &Args, out: &Path, book: &Path) -> Result<(), Error> {
 
     // Highlights list.
     d.tap("menu", menu)?;
-    let p = d.button(act::NAV_MARKS)?;
+    let p = d.button(aristotle_ui::screens::reader::action::MARKS)?;
     d.tap("highlights", p)?;
     d.snap("15-highlights")?;
+    // WR-006 evidence: a WeRead highlight's thought, when the preview's
+    // state folder carries a cached cloud note (see docs/tasks/WR-006).
+    if d.app.weread.notes.summary().0 > 0 {
+        // The scenario's own highlight and its bookmark fill the first two
+        // rows; the cached cloud highlight is the third.
+        if let Ok(p) = d.button(act::ITEM + 2) {
+            d.tap("weread thought", p)?;
+            d.snap("15b-weread-thought")?;
+            if let Ok(p) = d.button(act::NAV_MARKS) {
+                d.tap("back to highlights", p)?;
+            }
+        }
+    }
     let p = d.button(act::BACK)?;
     d.tap("back", p)?;
 
     // Go to 50 %.
     d.tap("menu", menu)?;
-    let p = d.button(act::NAV_GOTO)?;
+    let p = d.button(aristotle_ui::screens::reader::action::GOTO)?;
     d.tap("go to", p)?;
     for _ in 0..5 {
         let p = d.button(act::GOTO_PLUS10)?;
@@ -591,6 +611,7 @@ pub fn run(args: &Args, out: &Path, book: &Path) -> Result<(), Error> {
 
 fn layout_steps(mut d: Driver) -> Result<(), Error> {
     use aristotle_ui::screens::reader::action;
+    use aristotle_ui::screens::typeset::action as typeset;
 
     d.check_geometry()?;
     let bounds = d.app.ui.bounds();
@@ -618,14 +639,25 @@ fn layout_steps(mut d: Driver) -> Result<(), Error> {
         },
     )?;
     d.snap("02-menu")?;
-    let p = d.button(action::SIZE_UP)?;
+    let p = d.button(action::TYPESET)?;
+    d.tap("typeset", p)?;
     let before = d.app.prefs.size;
+    let p = d.button(typeset::SIZE_BASE + (before + 1) as ActionId)?;
     d.tap("larger text", p)?;
     if d.app.prefs.size != before + 1 {
         return Err(format_err!("text size did not change"));
     }
-    d.check_geometry()?;
     d.snap("03-larger-text")?;
+    let p = d.button(typeset::COLLAPSE)?;
+    d.tap("close typeset", p)?;
+    d.check_geometry()?;
+    d.tap(
+        "menu",
+        Point {
+            x: bounds.w / 2,
+            y: density.px(70),
+        },
+    )?;
 
     let p = d.button(action::NIGHT)?;
     d.tap("night on", p)?;

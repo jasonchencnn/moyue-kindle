@@ -830,8 +830,21 @@ impl MockServer {
         let mut authoritative_configs = Vec::new();
         let mut authoritative_notes = Vec::new();
 
-        // 1. Process books
-        for incoming in push_req.books {
+        // 1. Process books (matching transformBookToDB in transform.ts:68-119)
+        for mut incoming in push_req.books {
+            if incoming.book_hash.trim().is_empty() {
+                return Ok(HttpResponse::new(
+                    500,
+                    b"{\"error\":\"null value in column book_hash violates not-null constraint\"}"
+                        .to_vec(),
+                ));
+            }
+            if incoming.created_at.is_none() {
+                incoming.created_at = Some(now_str.clone());
+            }
+            if incoming.updated_at.is_none() {
+                incoming.updated_at = Some(now_str.clone());
+            }
             let key = (user_id.to_string(), incoming.book_hash.clone());
             let auth_book = match state.books.get(&key) {
                 Some(existing) => {
@@ -843,9 +856,6 @@ impl MockServer {
                     let mut b = incoming;
                     b.user_id = Some(user_id.to_string());
                     b.synced_at = Some(now_str.clone());
-                    if b.created_at.is_none() {
-                        b.created_at = Some(now_str.clone());
-                    }
                     b.updated_at = Some(now_str.clone()); // Upstream sync.ts:726-727: dbRec.updated_at = new Date().toISOString()
                     b
                 }
@@ -854,8 +864,18 @@ impl MockServer {
             authoritative_books.push(auth_book);
         }
 
-        // 2. Process configs & piggyback progress to books
-        for incoming in push_req.configs {
+        // 2. Process configs & piggyback progress to books (matching transformBookConfigToDB in transform.ts:16-41)
+        for mut incoming in push_req.configs {
+            if incoming.book_hash.trim().is_empty() {
+                return Ok(HttpResponse::new(
+                    500,
+                    b"{\"error\":\"null value in column book_hash violates not-null constraint\"}"
+                        .to_vec(),
+                ));
+            }
+            if incoming.updated_at.is_none() {
+                incoming.updated_at = Some(now_str.clone());
+            }
             let key = (user_id.to_string(), incoming.book_hash.clone());
             let auth_config = match state.configs.get(&key) {
                 Some(existing) => {
@@ -917,8 +937,21 @@ impl MockServer {
             authoritative_configs.push(auth_config);
         }
 
-        // 3. Process notes
-        for incoming in push_req.notes {
+        // 3. Process notes (matching transformBookNoteToDB in transform.ts:185-225)
+        for mut incoming in push_req.notes {
+            if incoming.book_hash.trim().is_empty() || incoming.id.trim().is_empty() {
+                return Ok(HttpResponse::new(
+                    500,
+                    b"{\"error\":\"null value in primary key violates not-null constraint\"}"
+                        .to_vec(),
+                ));
+            }
+            if incoming.created_at.is_none() {
+                incoming.created_at = Some(now_str.clone());
+            }
+            if incoming.updated_at.is_none() {
+                incoming.updated_at = Some(now_str.clone());
+            }
             let key = (
                 user_id.to_string(),
                 incoming.book_hash.clone(),

@@ -39,6 +39,13 @@ typedef struct CrDoc CrDoc;
  * css 为 NULL 或空串时不注入样式表。
  * embedded_styles 非 0 表示保留书内自带样式（<style>、外链 CSS、行内 style），
  * 0 表示只认注入的 css。对应 crengine 的 PROP_EMBEDDED_STYLES。
+ * fine_typesetting 非 0 表示启用现代精排：Web 盒模型与完整 block rendering
+ * 标志、HarfBuzz kerning/shaping、悬挂标点、书内嵌字体、按面板 DPI 缩放
+ * CSS 绝对单位。0 表示退回 crengine 的传统行为。DOM 版本不随开关切换，
+ * 两种状态都是 gDOMVersionCurrent：切换 DOM 版本会让已保存的 XPointer
+ * 阅读进度/高亮错位。
+ * font_weight 是正文字重（CSS font-weight 的 100..900）：超出范围时钳到
+ * 边界，<= 0 时用 400。对应 crengine 的 PROP_FONT_BASE_WEIGHT。
  * fallback_font_faces 是回退字体的 face 名列表，分号隔开（crengine 自己的
  * 写法，如 "Noto Sans SC"）。主字体里没有的字形交给它们：正文用 Literata，
  * 汉字交给中文字体。为 NULL 或空串时不用回退字体。
@@ -55,6 +62,9 @@ typedef struct {
     const char *css;
     int embedded_styles;
     const char *fallback_font_faces;
+    int fine_typesetting;
+    int font_weight;
+    int dpi;
 } CrLayout;
 
 /* 像素矩形。
@@ -271,12 +281,14 @@ int cr_doc_page_count(const CrDoc *doc);
  *
  * underline 是正文每行下方的引导线：0 不画、1 实线、2 点状虚线。
  * 引导线用引擎自己的行几何画在正文文字行下面，图片、页眉页脚不画。
- * underline_gray 是引导线的灰度（0 黑、255 白），0 表示用默认灰度。
+ * underline_gray 是引导线的灰度（0 黑、255 白），越界时钳到 0..255。
+ * underline_scope 是引导线的横向范围：0 只画文字宽度（TextOnly）、
+ * 1 画满正文区一整行（FullLine，短段落下方与空白行槽也按行高网格补满）。
  *
  * 成功返回 0，失败返回非 0，err 里是原因。 */
 int cr_doc_render_page(CrDoc *doc, int page, uint8_t *dst, size_t dst_len, int dst_width,
                         int dst_height, int invert_images, int underline, int underline_gray,
-                        char *err, size_t err_len);
+                        int underline_scope, char *err, size_t err_len);
 
 /* 换一套排版参数并重新排版。
  *

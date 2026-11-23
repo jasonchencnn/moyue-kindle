@@ -14,6 +14,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 DEVICE=$(cd "$HERE/.." && pwd)
 REPO=$(cd "$DEVICE/.." && pwd)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/moyue-ota-test.XXXXXX")
+# The version this checkout carries; the fake app bundle must match it or
+# tools/package.sh refuses to package the tree.
+WORKSPACE_VERSION=$(sed -n 's/^version = "\([0-9][0-9.]*\)"/\1/p' \
+    "$REPO/Cargo.toml" | head -n 1)
 failures=0
 server=
 PORT=
@@ -92,6 +96,12 @@ make_device() {
     printf 'G000LN0123456789\n' > "$r/proc/usid"
     printf 'Kindle 5.16.2.1.1 (test)\n' > "$r/etc/prettyversion.txt"
     cp -R "$DEVICE/extension" "$r/mnt/us/extensions/aristotle"
+    # The fake device runs the previous release, whatever the tree's own
+    # extension version is: rewrite the copied config so both halves agree.
+    sed -i '' 's|<version>[0-9.]*</version>|<version>0.3.1</version>|' \
+        "$r/mnt/us/extensions/aristotle/config.xml" 2>/dev/null \
+        || sed -i 's|<version>[0-9.]*</version>|<version>0.3.1</version>|' \
+        "$r/mnt/us/extensions/aristotle/config.xml"
     fake_app "$r/mnt/us/aristotle" 0.3.1
     printf 'login and settings\n' > "$r/mnt/us/.aristotle/reader.json"
     printf 'book bytes\n' > "$r/mnt/us/documents/book.epub"
@@ -136,7 +146,8 @@ for f in ("run-aristotle.sh", "takeover.sh", "open-kual.sh"):
 import shutil
 shutil.copytree(ext_src, ext)
 cfg = ext / "config.xml"
-cfg.write_text(cfg.read_text().replace("<version>0.3.1</version>", f"<version>{version}</version>"))
+import re
+cfg.write_text(re.sub(r"<version>[0-9.]+</version>", f"<version>{version}</version>", cfg.read_text(), count=1))
 if mutation == "version-mismatch":
     (app / "VERSION").write_text("9.9.9\n")
 elif mutation == "symlink":
@@ -196,14 +207,15 @@ digest_file() {
     fi
 }
 
-# manifest NAME VERSION DEVICE PKG SHA SIZE, package URL under the local server.
+# manifest NAME VERSION DEVICE PKG SHA SIZE [CHANNEL], package URL under the
+# local server.  The channel defaults to the fake device's own channel.
 manifest() {
-    name=$1 version=$2 device=$3 pkg=$4 sha=$5 size=$6
+    name=$1 version=$2 device=$3 pkg=$4 sha=$5 size=$6 channel=${7:-0LN-5.16.2.1.1}
     mkdir -p "$WORK/http"
     {
         echo "MOYUE-OTA-1"
         echo "product=moyue-preview"
-        echo "channel=ko2-preview"
+        echo "channel=$channel"
         echo "version=$version"
         echo "device=$device"
         echo "firmware=5.16"
@@ -217,7 +229,7 @@ manifest() {
 }
 
 run_update() {
-    r=$1 name=$2
+    r=$1 name=$2 channel=${3:-}
     AGENT_TEST_ROOT=$r \
         ARISTOTLE_EXT_DIR=$r/mnt/us/extensions/aristotle \
         ARISTOTLE_APP_DIR=$r/mnt/us/aristotle \
@@ -225,6 +237,7 @@ run_update() {
         MOYUE_OTA_MANIFEST_URL="http://127.0.0.1:$PORT/$name" \
         MOYUE_OTA_ALLOWED_PREFIX="http://127.0.0.1:$PORT/" \
         MOYUE_OTA_TEST_HTTP=1 \
+        MOYUE_OTA_CHANNEL="$channel" \
         PATH="$TEST_PATH" \
         sh "$r/mnt/us/extensions/aristotle/bin/ota-update.sh" install
     return $?
@@ -255,12 +268,12 @@ PORT=$(cat "$WORK/port")
 PKG="$WORK/http/pkg-0.3.2.tar.gz"
 SHA=$(digest_file "$PKG")
 SIZE=$(wc -c < "$PKG" | tr -d " ")
-manifest equal.txt 0.3.1 oasis2 pkg-0.3.2.tar.gz "$SHA" "$SIZE"
-manifest older.txt 0.3.0 oasis2 pkg-0.3.2.tar.gz "$SHA" "$SIZE"
-manifest wrong-device.txt 0.3.2 pw4 pkg-0.3.2.tar.gz "$SHA" "$SIZE"
-manifest bad-digest.txt 0.3.2 oasis2 pkg-0.3.2.tar.gz "$(printf '%064d' 0)" "$SIZE"
-manifest bad-size.txt 0.3.2 oasis2 pkg-0.3.2.tar.gz "$SHA" $((SIZE + 1))
-manifest good.txt 0.3.2 oasis2 pkg-0.3.2.tar.gz "$SHA" "$SIZE"
+manifest equal.txt 0.3.1 0LN pkg-0.3.2.tar.gz "$SHA" "$SIZE"
+manifest older.txt 0.3.0 0LN pkg-0.3.2.tar.gz "$SHA" "$SIZE"
+manifest wrong-device.txt 0.3.2 0PP pkg-0.3.2.tar.gz "$SHA" "$SIZE"
+manifest bad-digest.txt 0.3.2 0LN pkg-0.3.2.tar.gz "$(printf '%064d' 0)" "$SIZE"
+manifest bad-size.txt 0.3.2 0LN pkg-0.3.2.tar.gz "$SHA" $((SIZE + 1))
+manifest good.txt 0.3.2 0LN pkg-0.3.2.tar.gz "$SHA" "$SIZE"
 
 # Each failing case starts from a fresh fake device.
 fresh() {
@@ -284,7 +297,7 @@ check "older server version: refuses downgrade" \
     "[ $? = 0 ] && grep -q '不降级' $WORK/out && [ \"\$(cat $WORK/dev/mnt/us/aristotle/VERSION)\" = 0.3.1 ]"
 fresh
 run_update "$WORK/dev" wrong-device.txt > "$WORK/out" 2>&1
-check "different device: refused" "[ $? = 1 ] && grep -q '不是给 Oasis 2' $WORK/out"
+check "different device: refused" "[ $? = 1 ] && grep -q '不是给设备 0LN' $WORK/out"
 fresh
 sed -i '' 's|<version>0.3.1</version>|<version>0.3</version>|' "$WORK/dev/mnt/us/extensions/aristotle/config.xml" 2>/dev/null || sed -i 's|<version>0.3.1</version>|<version>0.3</version>|' "$WORK/dev/mnt/us/extensions/aristotle/config.xml"
 printf '0.3\n' > "$WORK/dev/mnt/us/aristotle/VERSION"
@@ -298,8 +311,20 @@ check "missing guard fails with a clear error" \
     "[ $? = 1 ] && grep -q '缺少设备守卫' $WORK/out"
 fresh
 run_update "$WORK/dev" missing.txt > "$WORK/out" 2>&1
-check "HTTP 404: clear failure, nothing changed" \
-    "[ $? = 1 ] && grep -q '无法下载版本清单' $WORK/out && [ \"\$(cat $WORK/dev/mnt/us/aristotle/VERSION)\" = 0.3.1 ]"
+check "no channel for the device: reports no update, nothing changed" \
+    "[ $? = 0 ] && grep -q '暂未提供在线更新' $WORK/out && [ \"\$(cat $WORK/dev/mnt/us/aristotle/VERSION)\" = 0.3.1 ]"
+
+printf '\nFirmware range channel\n'
+fresh
+mkdir -p "$WORK/http"
+cp "$WORK/http/good.txt" "$WORK/http/range.txt"
+sed -i '' 's|^firmware=.*|firmware=5.16|' "$WORK/http/range.txt" 2>/dev/null \
+    || sed -i 's|^firmware=.*|firmware=5.16|' "$WORK/http/range.txt"
+sed -i '' 's|^channel=.*|channel=0LN-5.16|' "$WORK/http/range.txt" 2>/dev/null \
+    || sed -i 's|^channel=.*|channel=0LN-5.16|' "$WORK/http/range.txt"
+run_update "$WORK/dev" range.txt 0LN-5.16 > "$WORK/out" 2>&1
+check "a firmware-range channel updates the device" \
+    "[ $? = 0 ] && grep -q '更新完成：0.3.2' $WORK/out && [ \"\$(cat $WORK/dev/mnt/us/aristotle/VERSION)\" = 0.3.2 ]"
 
 printf '\nPackage integrity and archive checks\n'
 fresh
@@ -314,7 +339,7 @@ for mutation in traversal symlink unexpected version-mismatch; do
     make_pkg "$WORK/http/pkg-$mutation.tar.gz" 0.3.2 "$mutation"
     msha=$(digest_file "$WORK/http/pkg-$mutation.tar.gz")
     msize=$(wc -c < "$WORK/http/pkg-$mutation.tar.gz" | tr -d " ")
-    manifest "$mutation.txt" 0.3.2 oasis2 "pkg-$mutation.tar.gz" "$msha" "$msize"
+    manifest "$mutation.txt" 0.3.2 0LN "pkg-$mutation.tar.gz" "$msha" "$msize"
     fresh
     run_update "$WORK/dev" "$mutation.txt" > "$WORK/out" 2>&1
     rc=$?
@@ -353,7 +378,7 @@ printf '\nRollback and interruption\n'
 make_pkg "$WORK/http/pkg-0.3.3.tar.gz" 0.3.3
 sha3=$(digest_file "$WORK/http/pkg-0.3.3.tar.gz")
 size3=$(wc -c < "$WORK/http/pkg-0.3.3.tar.gz" | tr -d " ")
-manifest rollback.txt 0.3.3 oasis2 pkg-0.3.3.tar.gz "$sha3" "$size3"
+manifest rollback.txt 0.3.3 0LN pkg-0.3.3.tar.gz "$sha3" "$size3"
 fresh
 mkdir -p "$WORK/dev/mnt/us/extensions/moyue-ota-recovery"
 chmod 500 "$WORK/dev/mnt/us/extensions"
@@ -400,11 +425,11 @@ check "eips status and errors are ASCII" \
 
 printf '\nPackaging includes diagnostics and no credentials\n'
 mkdir -p "$WORK/bundle/aristotle/licenses"
-fake_app "$WORK/bundle/aristotle" 0.3.1
+fake_app "$WORK/bundle/aristotle" "$WORKSPACE_VERSION"
 tar -czf "$WORK/fake-app.tar.gz" -C "$WORK/bundle" aristotle
 APP_BUNDLE="$WORK/fake-app.tar.gz" sh "$REPO/tools/package.sh" tree "$WORK/pkgtree" > "$WORK/out" 2>&1
-check "package.sh tree includes VERSION 0.3.1" \
-    "[ $? = 0 ] && [ \"\$(cat $WORK/pkgtree/aristotle/VERSION)\" = 0.3.1 ]"
+check "package.sh tree includes the workspace VERSION" \
+    "[ $? = 0 ] && [ \"\$(cat $WORK/pkgtree/aristotle/VERSION)\" = \"$WORKSPACE_VERSION\" ]"
 check "package.sh tree includes diagnostics and OTA menu" \
     "[ -f $WORK/pkgtree/extensions/aristotle/diagnostics/diagnostics.sh ] && grep -q '诊断日志' $WORK/pkgtree/extensions/aristotle/menu.json && grep -q '检查更新' $WORK/pkgtree/extensions/aristotle/menu.json"
 check "package tree has no endpoint.txt or token.txt" \

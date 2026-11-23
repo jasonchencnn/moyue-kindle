@@ -14,12 +14,15 @@
 use std::fmt;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::auth::{self, Credentials, Scheme};
+use crate::dial::{global_dns_cache, HappyEyeballsTcpConnector, SmartResolver};
 use crate::policy::Policy;
 use crate::url::{Url, UrlError};
+use ureq::unversioned::transport::Connector as _;
+use ureq::RequestExt as _;
 
 pub const MAX_REDIRECTS: usize = 5;
 const USER_AGENT: &str = concat!("Aristotle/", env!("CARGO_PKG_VERSION"));
@@ -75,6 +78,39 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// Whether this failure happened before any HTTP request bytes reached the
+    /// server (DNS, TCP connect/timeout, or non-clock TLS handshake failure),
+    /// making it safe to retry even for non-idempotent methods like `POST`.
+    pub fn is_pre_send_retryable(&self) -> bool {
+        matches!(self, Error::Connect(_) | Error::Tls { clock: false, .. })
+    }
+
+    /// Whether this failure is transient and safe to retry for idempotent
+    /// requests such as `GET` (adds post-send timeouts and abrupt peer
+    /// disconnects such as `UnexpectedEof` / `BrokenPipe` / `ConnectionAborted`).
+    pub fn is_idempotent_retryable(&self) -> bool {
+        if self.is_pre_send_retryable() || matches!(self, Error::Timeout) {
+            return true;
+        }
+        matches!(
+            self,
+            Error::Io(io)
+                if matches!(
+                    io.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::InvalidInput
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                )
+        )
+    }
+}
+
 impl From<UrlError> for Error {
     fn from(e: UrlError) -> Self {
         Error::Url(e)
@@ -90,6 +126,8 @@ impl From<std::io::Error> for Error {
 fn from_ureq(e: ureq::Error) -> Error {
     use ureq::Error as U;
     match e {
+        U::Timeout(ureq::Timeout::Resolve) => Error::Connect("resolve timed out".into()),
+        U::Timeout(ureq::Timeout::Connect) => Error::Connect("connect timed out".into()),
         U::Timeout(_) => Error::Timeout,
         U::HostNotFound => Error::Connect("host not found".into()),
         U::ConnectionFailed => Error::Connect("connection failed".into()),
@@ -108,6 +146,13 @@ fn from_ureq(e: ureq::Error) -> Error {
             clock: false,
             detail: d.into(),
         },
+        #[cfg(feature = "tls")]
+        U::Rustls(r) => {
+            let s = r.to_string();
+            let lower = s.to_ascii_lowercase();
+            let clock = lower.contains("expired") || lower.contains("notvalidyet");
+            Error::Tls { clock, detail: s }
+        }
         other => {
             let s = other.to_string();
             if s.contains("https") && s.to_ascii_lowercase().contains("tls") {
@@ -138,6 +183,14 @@ pub enum Method {
     Get,
     Post,
     Put,
+    /// `PROPFIND`, the WebDAV collection listing (RFC 4918 §9.1).
+    Propfind,
+    /// `MKCOL`, the WebDAV collection creation (RFC 4918 §9.3).
+    Mkcol,
+    /// `HEAD`, a `GET` whose body is not read.
+    Head,
+    /// `DELETE`, the WebDAV resource removal (RFC 9110 §9.3.5).
+    Delete,
 }
 
 impl Method {
@@ -146,7 +199,21 @@ impl Method {
             Method::Get => "GET",
             Method::Post => "POST",
             Method::Put => "PUT",
+            Method::Propfind => "PROPFIND",
+            Method::Mkcol => "MKCOL",
+            Method::Head => "HEAD",
+            Method::Delete => "DELETE",
         }
+    }
+
+    /// Whether repeating the request cannot change the server's state, so a
+    /// transient failure after the request bytes were sent is safe to retry.
+    ///
+    /// `DELETE` and `MKCOL` are deliberately excluded: both are idempotent in
+    /// RFC 7231 terms, but a lost response leaves the caller unable to tell
+    /// whether the collection is gone or was just created by another device.
+    pub fn is_idempotent_read(self) -> bool {
+        matches!(self, Method::Get | Method::Head | Method::Propfind)
     }
 }
 
@@ -195,7 +262,13 @@ fn headers_for_debug(headers: &[(String, String)]) -> Vec<(&str, &str)> {
 fn is_secret_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "authorization" | "proxy-authorization" | "cookie" | "apikey" | "x-api-key"
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "encryptkey"
+            | "apikey"
+            | "x-api-key"
     )
 }
 
@@ -226,6 +299,39 @@ impl Request {
         }
     }
 
+    /// A `PROPFIND` with the WebDAV query body (RFC 4918 §9.1).
+    pub fn propfind(url: Url, body: Vec<u8>) -> Request {
+        Request {
+            method: Method::Propfind,
+            body: Some(body),
+            ..Request::get(url)
+        }
+    }
+
+    /// A `MKCOL` with no body (RFC 4918 §9.3).
+    pub fn mkcol(url: Url) -> Request {
+        Request {
+            method: Method::Mkcol,
+            ..Request::get(url)
+        }
+    }
+
+    /// A `HEAD`; the response has no body (RFC 9110 §9.3.2).
+    pub fn head(url: Url) -> Request {
+        Request {
+            method: Method::Head,
+            ..Request::get(url)
+        }
+    }
+
+    /// A `DELETE` with no body (RFC 9110 §9.3.5).
+    pub fn delete(url: Url) -> Request {
+        Request {
+            method: Method::Delete,
+            ..Request::get(url)
+        }
+    }
+
     pub fn header(mut self, name: &str, value: &str) -> Request {
         self.headers.push((name.to_string(), value.to_string()));
         self
@@ -237,13 +343,25 @@ impl Request {
     }
 }
 
-#[derive(Debug)]
 pub struct Response {
     pub status: u16,
     /// Where the body came from, after redirects.
     pub url: Url,
     pub content_type: Option<String>,
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for Response {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("url", &self.url)
+            .field("content_type", &self.content_type)
+            .field("headers", &headers_for_debug(&self.headers))
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 impl Response {
@@ -253,7 +371,7 @@ impl Response {
 }
 
 /// Timeouts for one kind of work.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
     /// Connecting, including DNS.
     pub connect: Duration,
@@ -274,9 +392,77 @@ impl Timeouts {
     }
 }
 
+/// Bounded LRU pool of shared [`Client`] instances keyed by `(Policy, Timeouts)`.
+///
+/// Separate `Timeouts` values for the same [`Policy`] share one underlying
+/// `ureq::Agent` (via [`SHARED_AGENTS`]), so HTTP/1.1 Keep-Alive sockets,
+/// the parsed `rustls` root CA store, the TLS session cache, and the fast-IP
+/// DNS cache are preserved across `ReadestTransport::new`, `with_timeout(30)`,
+/// and `with_timeout(5)` calls alike.
+const SHARED_CLIENT_POOL_CAPACITY: usize = 8;
+
+/// Keep idle Keep-Alive sockets alive for 90s (matching Cloudflare's ~100s
+/// edge idle timeout instead of ureq's 15s default) so reading a page or two
+/// between sync taps stays on a warm TLS socket.
+const IDLE_CONNECTION_MAX_AGE: Duration = Duration::from_secs(90);
+
+type SharedClientPool = Mutex<Vec<((Policy, Timeouts), Arc<Client>)>>;
+type SharedAgentPool = Mutex<Vec<(Policy, ureq::Agent)>>;
+
+static SHARED_CLIENTS: OnceLock<SharedClientPool> = OnceLock::new();
+static SHARED_AGENTS: OnceLock<SharedAgentPool> = OnceLock::new();
+
+fn build_agent(t: Timeouts) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None)
+        .user_agent(USER_AGENT)
+        .no_delay(true)
+        // WebDAV's `PROPFIND` and `MKCOL` are extension methods; without this
+        // ureq-proto refuses them as "not valid for HTTP version HTTP/1.1".
+        .allow_non_standard_methods(true)
+        .max_idle_connections(16)
+        .max_idle_connections_per_host(6)
+        .max_idle_age(IDLE_CONNECTION_MAX_AGE)
+        .timeout_resolve(Some(t.connect))
+        .timeout_connect(Some(t.connect))
+        .timeout_send_request(Some(t.response))
+        .timeout_send_body(Some(t.response))
+        .timeout_recv_response(Some(t.response))
+        .timeout_recv_body(Some(t.body))
+        .build();
+    let cache = global_dns_cache();
+    let resolver = SmartResolver::new(Arc::clone(&cache));
+    let tcp = ().chain(HappyEyeballsTcpConnector::new(cache));
+    #[cfg(feature = "tls")]
+    let connector = tcp.chain(ureq::unversioned::transport::RustlsConnector::default());
+    #[cfg(not(feature = "tls"))]
+    let connector = tcp;
+    ureq::Agent::with_parts(config, connector, resolver)
+}
+
+fn shared_agent(policy: &Policy, default_timeouts: Timeouts) -> ureq::Agent {
+    let pool = SHARED_AGENTS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pos) = guard.iter().position(|(p, _)| p == policy) {
+        let entry = guard.remove(pos);
+        let agent = entry.1.clone();
+        guard.push(entry);
+        return agent;
+    }
+    let agent = build_agent(default_timeouts);
+    if guard.len() >= SHARED_CLIENT_POOL_CAPACITY {
+        guard.remove(0);
+    }
+    guard.push((policy.clone(), agent.clone()));
+    agent
+}
+
 pub struct Client {
     agent: ureq::Agent,
     policy: Policy,
+    timeouts: Timeouts,
     /// The scheme the last challenged origin asked for (Digest with its
     /// nonce count), so later requests authenticate without a 401 first.
     auth: Mutex<Option<(Url, AuthState)>>,
@@ -299,27 +485,53 @@ pub struct Downloaded {
 
 impl Client {
     pub fn new(policy: Policy, t: Timeouts) -> Client {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .proxy(None)
-            .user_agent(USER_AGENT)
-            .timeout_resolve(Some(t.connect))
-            .timeout_connect(Some(t.connect))
-            .timeout_send_request(Some(t.response))
-            .timeout_send_body(Some(t.response))
-            .timeout_recv_response(Some(t.response))
-            .timeout_recv_body(Some(t.body))
-            .build();
         Client {
-            agent: ureq::Agent::new_with_config(config),
+            agent: build_agent(t),
             policy,
+            timeouts: t,
             auth: Mutex::new(None),
         }
     }
 
+    /// Return a pooled [`Client`] for `(policy, t)`, creating one if needed.
+    ///
+    /// Repeated calls with identical policy and timeouts reuse the same
+    /// [`Client`], and calls with identical policy but different timeouts
+    /// share the same underlying `ureq::Agent` connection pool and TLS session
+    /// cache while applying per-request timeouts on each call.
+    pub fn shared(policy: Policy, t: Timeouts) -> Arc<Client> {
+        let pool = SHARED_CLIENTS.get_or_init(|| Mutex::new(Vec::new()));
+        let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = guard
+            .iter()
+            .position(|((p, timeouts), _)| *p == policy && *timeouts == t)
+        {
+            let entry = guard.remove(pos);
+            let client = Arc::clone(&entry.1);
+            guard.push(entry);
+            return client;
+        }
+        let agent = shared_agent(&policy, t);
+        let client = Arc::new(Client {
+            agent,
+            policy: policy.clone(),
+            timeouts: t,
+            auth: Mutex::new(None),
+        });
+        if guard.len() >= SHARED_CLIENT_POOL_CAPACITY {
+            guard.remove(0);
+        }
+        guard.push(((policy, t), Arc::clone(&client)));
+        client
+    }
+
     pub fn policy(&self) -> &Policy {
         &self.policy
+    }
+
+    /// The timeout configuration this client was created with.
+    pub fn timeouts(&self) -> Timeouts {
+        self.timeouts
     }
 
     /// Send `req` and read the body, at most `limit` bytes. Any status
@@ -328,6 +540,16 @@ impl Client {
     pub fn send(&self, req: &Request, limit: u64) -> Result<Response, Error> {
         let (mut resp, url) = self.exchange(req)?;
         let content_type = header(&resp, "content-type");
+        let headers = resp
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|val| (name.as_str().to_string(), val.to_string()))
+            })
+            .collect();
         let status = resp.status().as_u16();
         let body = resp
             .body_mut()
@@ -339,6 +561,7 @@ impl Client {
             status,
             url,
             content_type,
+            headers,
             body,
         })
     }
@@ -497,22 +720,48 @@ impl Client {
         let mut b = ureq::http::Request::builder()
             .method(req.method.as_str())
             .uri(url.to_string());
+        // An explicit `Authorization` (or cookie, or API key) belongs to the
+        // origin the caller addressed. After a redirect to another origin it
+        // would hand the credential to a server that never asked for it, so
+        // those headers are dropped for that hop. `credentials` is filtered
+        // the same way in `exchange`.
+        let same_origin = url.same_origin(&req.url);
         for (k, v) in &req.headers {
+            if !same_origin && is_secret_header(k) {
+                continue;
+            }
             b = b.header(k.as_str(), v.as_str());
         }
         if let Some(a) = authorization {
             b = b.header("authorization", a);
         }
+        let t = self.timeouts;
         let result = match &req.body {
             Some(body) => {
                 let r = b
                     .body(body.clone())
                     .map_err(|e| Error::Other(e.to_string()))?;
-                self.agent.run(r)
+                r.with_agent(&self.agent)
+                    .configure()
+                    .timeout_resolve(Some(t.connect))
+                    .timeout_connect(Some(t.connect))
+                    .timeout_send_request(Some(t.response))
+                    .timeout_send_body(Some(t.response))
+                    .timeout_recv_response(Some(t.response))
+                    .timeout_recv_body(Some(t.body))
+                    .run()
             }
             None => {
                 let r = b.body(()).map_err(|e| Error::Other(e.to_string()))?;
-                self.agent.run(r)
+                r.with_agent(&self.agent)
+                    .configure()
+                    .timeout_resolve(Some(t.connect))
+                    .timeout_connect(Some(t.connect))
+                    .timeout_send_request(Some(t.response))
+                    .timeout_send_body(Some(t.response))
+                    .timeout_recv_response(Some(t.response))
+                    .timeout_recv_body(Some(t.body))
+                    .run()
             }
         };
         result.map_err(from_ureq)
@@ -786,6 +1035,65 @@ mod tests {
     }
 
     #[test]
+    fn webdav_methods_reach_the_server() {
+        let s = Server::start(|r| match r.method.as_str() {
+            "HEAD" => Reply::text(200, ""),
+            _ => Reply::text(200, &format!("{} {}", r.method, r.body.len())),
+        });
+        let c = client(Policy::open());
+        let r = c
+            .send(
+                &Request::propfind(s.url("/dav/"), b"<propfind/>".to_vec()).header("Depth", "1"),
+                1000,
+            )
+            .unwrap();
+        assert_eq!((r.status, r.text().as_str()), (200, "PROPFIND 11"));
+        let r = c
+            .send(&Request::mkcol(s.url("/dav/.moyue/")), 1000)
+            .unwrap();
+        assert_eq!(r.text(), "MKCOL 0");
+        let r = c
+            .send(&Request::head(s.url("/dav/book.epub")), 1000)
+            .unwrap();
+        assert_eq!(r.text(), "");
+        let r = c
+            .send(&Request::delete(s.url("/dav/book.epub")), 1000)
+            .unwrap();
+        assert_eq!(r.text(), "DELETE 0");
+        assert!(Method::Get.is_idempotent_read());
+        assert!(Method::Head.is_idempotent_read());
+        assert!(Method::Propfind.is_idempotent_read());
+        assert!(!Method::Put.is_idempotent_read());
+        assert!(!Method::Mkcol.is_idempotent_read());
+        assert!(!Method::Delete.is_idempotent_read());
+        assert!(!Method::Post.is_idempotent_read());
+    }
+
+    #[test]
+    fn explicit_authorization_is_dropped_on_a_cross_origin_redirect() {
+        // The second origin reports any Authorization header it sees.
+        let other =
+            Server::start(|r| Reply::text(200, r.header("authorization").unwrap_or("none")));
+        let target = other.url("/file");
+        let first = Server::start(move |r| match r.path.as_str() {
+            "/hop" => Reply::redirect(&target.to_string()),
+            _ => Reply::text(200, r.header("authorization").unwrap_or("none")),
+        });
+        let c = client(Policy::open());
+        let req =
+            || Request::get(first.url("/book.epub")).header("Authorization", "Basic c2VjcmV0OnB3");
+        let r = c.send(&req(), 1000).unwrap();
+        assert_eq!(r.text(), "Basic c2VjcmV0OnB3");
+        let r = c
+            .send(
+                &Request::get(first.url("/hop")).header("Authorization", "Basic c2VjcmV0OnB3"),
+                1000,
+            )
+            .unwrap();
+        assert_eq!(r.text(), "none", "Authorization leaked to another origin");
+    }
+
+    #[test]
     fn refused_connections_and_https_without_tls() {
         let c = client(Policy::open());
         // A port nothing listens on (bound, then closed).
@@ -811,5 +1119,70 @@ mod tests {
             disposition_name(r#"attachment; filename="Pan Tadeusz.mobi""#).as_deref(),
             Some("Pan Tadeusz.mobi")
         );
+    }
+
+    #[test]
+    fn shared_client_reuses_same_instance_for_matching_key() {
+        let p = Policy {
+            scoped: true,
+            allowed: crate::policy::parse_allow("pool-test.example:443"),
+        };
+        let t = Timeouts {
+            connect: Duration::from_secs(7),
+            response: Duration::from_secs(21),
+            body: Duration::from_secs(29),
+        };
+        let c1 = Client::shared(p.clone(), t);
+        let c2 = Client::shared(p.clone(), t);
+        assert!(Arc::ptr_eq(&c1, &c2));
+
+        let other_t = Timeouts::quick(Duration::from_secs(3));
+        let c3 = Client::shared(p, other_t);
+        assert!(!Arc::ptr_eq(&c1, &c3));
+        assert_eq!(c3.timeouts(), other_t);
+    }
+
+    #[test]
+    fn from_ureq_distinguishes_pre_send_and_post_send_timeouts() {
+        let resolve = from_ureq(ureq::Error::Timeout(ureq::Timeout::Resolve));
+        assert!(matches!(resolve, Error::Connect(_)));
+        assert!(resolve.is_pre_send_retryable());
+        assert!(resolve.is_idempotent_retryable());
+
+        let connect = from_ureq(ureq::Error::Timeout(ureq::Timeout::Connect));
+        assert!(matches!(connect, Error::Connect(_)));
+        assert!(connect.is_pre_send_retryable());
+        assert!(connect.is_idempotent_retryable());
+
+        let recv = from_ureq(ureq::Error::Timeout(ureq::Timeout::RecvResponse));
+        assert!(matches!(recv, Error::Timeout));
+        assert!(!recv.is_pre_send_retryable());
+        assert!(recv.is_idempotent_retryable());
+
+        let tls_transient = Error::Tls {
+            clock: false,
+            detail: "handshake".into(),
+        };
+        assert!(tls_transient.is_pre_send_retryable());
+        assert!(tls_transient.is_idempotent_retryable());
+
+        for non_retryable in [
+            Error::NotAllowed("example.com:443".into()),
+            Error::NoTls,
+            Error::Tls {
+                clock: true,
+                detail: "certificate expired".into(),
+            },
+            Error::TooLarge(1024),
+            Error::Status(500, "err".into()),
+            Error::Unauthorized,
+            Error::Cancelled,
+        ] {
+            assert!(!non_retryable.is_pre_send_retryable(), "{non_retryable:?}");
+            assert!(
+                !non_retryable.is_idempotent_retryable(),
+                "{non_retryable:?}"
+            );
+        }
     }
 }

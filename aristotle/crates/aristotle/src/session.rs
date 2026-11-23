@@ -898,6 +898,17 @@ impl Session {
         self.book.as_ref()
     }
 
+    /// Whether the loaded book is laid out by the vertical engine.
+    ///
+    /// The preference alone does not say: PDF and FB2 books never open
+    /// vertically, and an EPUB or TXT the vertical engine cannot parse, or
+    /// has no font for, falls back to the horizontal engine (VERT-101).
+    pub fn is_vertical(&self) -> bool {
+        self.book
+            .as_ref()
+            .is_some_and(|book| book.engine() == Engine::Vertical)
+    }
+
     /// Whether the book is here rather than with a layout worker.
     pub fn has_book(&self) -> bool {
         self.book.is_some()
@@ -1437,6 +1448,13 @@ fn start_pagination(
     path: &Path,
     paginate_with: Option<&Path>,
 ) -> (bool, Option<Paginator>) {
+    if book.engine() == Engine::Vertical {
+        // The vertical engine finds its pages by laying them out, with no
+        // rendering and no cache: do it now, so the footer can show
+        // "x / y" from the first page on.
+        book.paginate();
+        return (true, None);
+    }
     if book.engine() != Engine::Plato {
         return (true, None);
     }

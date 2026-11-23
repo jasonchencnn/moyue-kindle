@@ -3,11 +3,13 @@
 
 pub mod cloud;
 pub mod hash;
+pub mod jianguoyun;
 pub mod library;
 pub mod merge;
 pub mod model;
 pub mod progress;
 pub mod sync;
+pub mod weread;
 
 pub use cloud::{
     derive_file_key, derive_file_key_r2, derive_file_key_s3, detect_meta_hash_matches,

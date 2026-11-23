@@ -24,6 +24,13 @@ use aristotle_library::index::{Annotation, AnnotationKind, BookRecord};
 use aristotle_render::book::Position;
 
 pub const SOURCE: &str = "aristotle";
+pub const READEST_SOURCE: &str = inkread_core::sync::local::READEST_SOURCE;
+
+/// Whether an annotation belongs to this device or its Readest cloud sync
+/// (as opposed to read-only sidecar/clippings imports).
+pub fn is_editable_source(source: &str) -> bool {
+    source == SOURCE || source == READEST_SOURCE
+}
 
 /// A navigation target only when the source provides an exact position.
 pub fn target(
@@ -33,7 +40,7 @@ pub fn target(
 ) -> Option<Position> {
     let start = &a.position.as_ref()?.0;
     match a.source.as_str() {
-        SOURCE => decode(start),
+        SOURCE | READEST_SOURCE => decode(start),
         "kindle-sidecar"
             if mobi.is_some_and(|m| m.version < 8 && m.kf8_boundary.is_none())
                 && matches!(
@@ -186,10 +193,16 @@ pub fn ours_versioned(
     book.annotations
         .iter()
         .enumerate()
-        .filter(|(_, a)| a.kind == kind && a.source == SOURCE)
+        .filter(|(_, a)| a.kind == kind && is_editable_source(&a.source))
         .filter_map(|(i, a)| {
             let (s, e) = a.position.as_ref()?;
-            Some((i, decode(s)?, decode(e)?, version_of(s)))
+            let start = decode(s)?;
+            let end = if e.trim().is_empty() {
+                start.clone()
+            } else {
+                decode(e)?
+            };
+            Some((i, start, end, version_of(s)))
         })
         .collect()
 }

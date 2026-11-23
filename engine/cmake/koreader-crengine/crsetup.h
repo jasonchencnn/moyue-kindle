@@ -24,11 +24,11 @@
 #define CHM_SUPPORT_ENABLED 0
 #define ENABLE_ANTIWORD 0
 #define USE_MD4C 0
-#define USE_GIF 0
-#define USE_LIBWEBP 0
-#define USE_LUNASVG 0
+#define USE_GIF 1
+#define USE_LIBWEBP 1
+#define USE_LUNASVG 1
 #define USE_NANOSVG 0
-#define MATHML_SUPPORT 0
+#define MATHML_SUPPORT 1
 #define USE_SRELL_REGEX 0
 
 #define COLOR_BACKBUFFER 0

@@ -51,7 +51,7 @@ pub fn cache_path(data_dir: &Path, book_id: &str, size: u64, mtime: i64, style: 
 /// bits, so 10.0 and 10.000001 differ as they do for the layout).
 fn style_key(s: &Style) -> String {
     format!(
-        "{}x{}@{} {} {} {} {:08x} {:08x} m{} t{} b{} {:?}",
+        "{}x{}@{} {} {} {} {:08x} {:08x} m{} t{} b{} w{} {:?}",
         s.width,
         s.height,
         s.dpi,
@@ -63,6 +63,7 @@ fn style_key(s: &Style) -> String {
         s.margin_mm,
         s.text_top,
         s.text_bottom,
+        s.writing_mode.index(),
         s.language
     )
 }
@@ -223,6 +224,10 @@ mod tests {
         wider.margin_mm = 8;
         let mut german = s.clone();
         german.language = Some("de".into());
+        // The vertical engine breaks pages at other places: a horizontal
+        // book's page file must not answer for a vertical one (VERT-101 S1).
+        let mut vertical = s.clone();
+        vertical.writing_mode = aristotle_render::style::WritingMode::VerticalRtl;
         // Another reading font, and the same family copied again after its
         // files changed (`fonts::prepare` names the folder by their stamp).
         let mut charis = s.clone();
@@ -251,6 +256,7 @@ mod tests {
             cache_path(dir, "abc", 100, 5, &looser),
             cache_path(dir, "abc", 100, 5, &wider),
             cache_path(dir, "abc", 100, 5, &german),
+            cache_path(dir, "abc", 100, 5, &vertical),
             cache_path(dir, "abc", 101, 5, &s),
             cache_path(dir, "abc", 100, 6, &s),
             cache_path(dir, "abd", 100, 5, &s),

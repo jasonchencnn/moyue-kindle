@@ -1,0 +1,45 @@
+{
+  "items": [
+    {
+      "name": "墨阅 SSH",
+      "items": [
+        {
+          "name": "安装并启动（仅限 PW4 5.18.1.1.1）",
+          "action": "sh ./sshctl install",
+          "exitmenu": false,
+          "status": false
+        },
+        {
+          "name": "启动（临时，不改变开机设置）",
+          "action": "sh ./sshctl start",
+          "exitmenu": false,
+          "status": false
+        },
+        {
+          "name": "停止（保持开机设置）",
+          "action": "sh ./sshctl stop",
+          "exitmenu": false,
+          "status": false
+        },
+        {
+          "name": "状态",
+          "action": "sh ./sshctl status",
+          "exitmenu": false,
+          "status": false
+        },
+        {
+          "name": "禁用开机启动",
+          "action": "sh ./sshctl disable",
+          "exitmenu": false,
+          "status": false
+        },
+        {
+          "name": "卸载服务（保留认证与配置）",
+          "action": "sh ./sshctl uninstall",
+          "exitmenu": false,
+          "status": false
+        }
+      ]
+    }
+  ]
+}

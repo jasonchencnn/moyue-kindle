@@ -166,13 +166,28 @@ pub fn merge_pulled_notes(
             continue;
         }
         match by_id.remove(wire.id.as_str()) {
-            Some(existing) if !existing.is_cloud_owned() => notes.push(existing.clone()),
+            Some(existing) if !existing.is_cloud_owned() && existing.source != "aristotle" => {
+                notes.push(existing.clone())
+            }
             Some(existing) => {
                 if let Some(mut cloud) = LocalNote::from_db_book_note(&wire) {
-                    // Keep the local-only fields a cloud note may have gained.
+                    // Keep the local-only fields and original syncable source tag.
                     cloud.page = existing.page.clone();
                     cloud.location = existing.location;
                     cloud.chapter = existing.chapter.clone();
+                    cloud.source = existing.source.clone();
+                    match (&cloud.position, &existing.position) {
+                        (None, Some(prev)) => {
+                            cloud.position = Some(prev.clone());
+                        }
+                        (Some((cs, ce)), Some((es, ee)))
+                            if crate::model::clean_xpointer(es) == *cs
+                                && (crate::model::clean_xpointer(ee) == *ce || ce.is_empty()) =>
+                        {
+                            cloud.position = Some((es.clone(), ee.clone()));
+                        }
+                        _ => {}
+                    }
                     notes.push(cloud);
                 }
             }

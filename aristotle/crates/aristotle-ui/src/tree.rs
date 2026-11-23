@@ -658,6 +658,24 @@ impl Tree {
         }
     }
 
+    /// Changes the ink of a text node, for a label that greys out (the
+    /// page buttons at the ends of a list).
+    pub fn set_text_gray(&mut self, id: NodeId, g: u8) {
+        let mut changed = false;
+        if let Kind::Text { para, cache } = &mut self.node_mut(id).kind {
+            if !para.spans.iter().all(|s| s.style.gray == g) {
+                for s in &mut para.spans {
+                    s.style.gray = g;
+                }
+                *cache = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.invalidate(id, Refresh::Auto);
+        }
+    }
+
     /// Changes the gray a node is filled with. For the page dots of the
     /// home screen, which fill and empty as the page changes.
     pub fn set_bg(&mut self, id: NodeId, g: u8) {

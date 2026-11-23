@@ -147,13 +147,27 @@ fn has_word(value: Option<&str>, words: &[&str]) -> bool {
     })
 }
 
-/// `epub:type="noteref"` or alike on the link itself.
+/// `epub:type="noteref"` or publisher-specific footnote link markup
+/// (including Duokan `duokan-footnote`, WeRead `qqreader-footnote`/`wr-footnote`,
+/// iReader/Zhangyue, and image-icon note links like `<a ...><img alt="注"/></a>`).
 fn noteref_markup(a: NodeRef) -> bool {
     has_word(a.attribute("epub:type"), &["noteref"])
         || has_word(a.attribute("role"), &["doc-noteref"])
         || a.classes().any(|c| {
             let c = c.to_ascii_lowercase();
-            c.contains("noteref") || c.contains("footnote") || c.contains("fnref")
+            c.contains("noteref")
+                || c.contains("note-ref")
+                || c.contains("footnote")
+                || c.contains("fnref")
+                || c.contains("zhushi")
+                || c == "zhu"
+        })
+        || a.descendants().any(|child| {
+            child.tag_name() == Some("img")
+                && child.attribute("alt").is_some_and(|alt| {
+                    let t = alt.trim();
+                    t == "注" || t == "註" || t.eq_ignore_ascii_case("note") || is_marker(t)
+                })
         })
 }
 
@@ -178,12 +192,15 @@ fn note_markup(n: NodeRef) -> bool {
         c.contains("footnote")
             || c.contains("endnote")
             || c.contains("przypis")
+            || c.contains("zhushi")
+            || c == "zhu"
             || c == "annotation"
     })
 }
 
 /// Ids publishers and converters give notes: fn3, ftn3, note-3, footnote3,
-/// przypis3, calibre's filepos12345, Word's _ftn3.
+/// przypis3, calibre's filepos12345, Word's _ftn3, Duokan's df-1/duokan-note-1,
+/// WeRead's reader_note_1, Chinese publisher zhu1/zhushi-1.
 pub fn note_id(id: &str) -> bool {
     let id = id.to_ascii_lowercase();
     let id = id.trim_start_matches('_');
@@ -198,6 +215,12 @@ pub fn note_id(id: &str) -> bool {
         "filepos",
         "en",
         "nt",
+        "df",
+        "duokan-note",
+        "reader_note",
+        "wrnote",
+        "zhushi",
+        "zhu",
         "annotation",
     ]
     .iter()
@@ -212,17 +235,22 @@ pub fn note_id(id: &str) -> bool {
     })
 }
 
-/// A footnote marker: 1, [12], (3), iv, *, †, a.
+/// A footnote marker: 1, [12], (3), 〔1〕, 【注】, ①, iv, *, †, ※, a.
 pub fn is_marker(text: &str) -> bool {
     let t = text
         .trim()
-        .trim_matches(|c: char| "[]()<>{}.".contains(c))
+        .trim_matches(|c: char| "[]()<>{}.〔〕【】（）「」『』".contains(c))
         .trim();
     if t.is_empty() || t.chars().count() > 4 {
         return false;
     }
+    let zh_stripped = t.strip_prefix('注').or_else(|| t.strip_prefix('註'));
+    if let Some(rest) = zh_stripped {
+        return rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit());
+    }
     t.chars().all(|c| c.is_ascii_digit())
-        || t.chars().all(|c| "*†‡§¶#".contains(c))
+        || t.chars().all(|c| "*†‡§¶#※＊".contains(c))
+        || t.chars().all(|c| ('①'..='⑳').contains(&c))
         || t.chars().all(|c| "ivxlcIVXLC".contains(c))
         || (t.chars().count() == 1 && t.chars().all(|c| c.is_alphabetic()))
         || t.chars().all(|c| "⁰¹²³⁴⁵⁶⁷⁸⁹".contains(c))
@@ -423,6 +451,32 @@ mod tests {
         let x = r#"<html><body><ol><li id="fn1"><p>Pierwsza uwaga. <a href="ch1.xhtml#r1">↩</a></p></li>
             <li id="fn2"><p>Druga.</p></li></ol></body></html>"#;
         assert_eq!(note(x, "fn1"), "Pierwsza uwaga.");
+    }
+
+    #[test]
+    fn duokan_and_chinese_refined_footnotes() {
+        for m in ["①", "⑫", "〔1〕", "【注】", "注1", "※"] {
+            assert!(is_marker(m), "{m}");
+        }
+        for id in ["df-1", "df12", "zhushi-3", "zhu_2", "reader_note_5"] {
+            assert!(note_id(id), "{id}");
+        }
+        let x = r##"<html><body>
+            <p>正文内容<a class="duokan-footnote" href="#df-1"><img src="../Images/note.png" alt="注"/></a>。</p>
+            <ol class="duokan-footnote-content">
+                <li class="duokan-footnote-item" id="df-1"><p>多看富文本注释：支持<b>加粗</b>与多段。</p></li>
+            </ol>
+        </body></html>"##;
+        let tree = XmlParser::new(x).parse();
+        let link = tree
+            .root()
+            .descendants()
+            .find(|n| n.tag_name() == Some("a"))
+            .expect("duokan link");
+        assert!(noteref_markup(link));
+        let item = tree.root().find_by_id("df-1").expect("df-1");
+        assert!(note_markup(item));
+        assert_eq!(note_text(item).text(), "多看富文本注释：支持加粗与多段。");
     }
 
     #[test]

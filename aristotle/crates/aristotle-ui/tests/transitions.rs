@@ -90,6 +90,13 @@ fn settings_tree(text: &mut TextEngine, night: bool, light: u32) -> (Tree, set_u
         refresh_interval: 1,
         wifi_transfer: "未开启",
         account: None,
+        enable_readest: true,
+        enable_weread: true,
+        enable_jianguoyun: true,
+        jianguoyun_account: Some("anna@example.com"),
+        weread_readtime: false,
+        weread_readtime_note: None,
+        weread_notes: None,
     };
     set_ui::Settings::build(text, &styles(), &v)
 }
@@ -274,16 +281,11 @@ fn in_screen_changes_are_one_quiet_update() {
 #[test]
 fn settings_controls_are_one_quiet_update() {
     let mut text = TextEngine::new(Fonts::embedded());
-    let (tree, ids) = settings_tree(&mut text, false, 2);
+    let (tree, _) = settings_tree(&mut text, false, 2);
     let mut ui = new_ui(tree);
-    ui.layout();
-    ids.sync(&mut ui.tree);
-    ui.render();
     // A light step: slider, value and preset chips change, in one update.
-    let (tree, ids) = settings_tree(&mut ui.text, false, 10);
+    let (tree, _) = settings_tree(&mut ui.text, false, 10);
     ui.set_tree_with(tree, Refresh::Auto);
-    ui.layout();
-    ids.sync(&mut ui.tree);
     let u = one_quiet(&ui.render());
     let night = (0..ui.tree.len())
         .map(|i| aristotle_ui::tree::NodeId(i as u32))
@@ -292,11 +294,9 @@ fn settings_controls_are_one_quiet_update() {
     assert!(u.rect.bottom() <= ui.tree.rect(night).y, "{u:?}");
     // The night switch: exactly one flash into the inverted state, and the
     // screen is inverted.
-    let (tree, ids) = settings_tree(&mut ui.text, true, 10);
+    let (tree, _) = settings_tree(&mut ui.text, true, 10);
     ui.set_night(true);
     ui.set_tree_with(tree, Refresh::Auto);
-    ui.layout();
-    ids.sync(&mut ui.tree);
     one_flash(&ui.render());
     assert_eq!(ui.screen().get(SCREEN_WIDTH - 2, SCREEN_HEIGHT - 2), 0);
     assert!(ui.render().is_empty());

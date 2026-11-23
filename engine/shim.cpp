@@ -14,6 +14,7 @@
 #include <lvfntman.h>
 #include <lvdrawbuf.h>
 #include <lvpagesplitter.h>
+#include <lvrend.h>
 #include <lvstring.h>
 
 #include <algorithm>
@@ -121,6 +122,20 @@ struct CrDoc {
     /* 页边距：页面坐标与文档流坐标的换算要用。 */
     int margin_left = 0;
     int margin_top = 0;
+    int margin_right = 0;
+    int margin_bottom = 0;
+    /* 正文行高（像素）：字号 × 行高百分比。整行划线在文字行不足时用它
+     * 推算空白行槽的网格。 */
+    int line_height_px = 0;
+    /* 精排开关与字重。
+     *
+     * crengine 的 DPI、字距模式（kerning）与基准字重是进程级全局设置：
+     * 换一本书、甚至另一个线程上的另一个文档都会改掉它们。渲染前要按这里
+     * 存的再设一次，否则同一份文档会因为别的文档改过全局设置而画出不同的
+     * 字形（与回退字体是同一个问题）。 */
+    bool fine_typesetting = true;
+    int font_weight = 400;
+    int render_dpi = 300;
     /* 这一版书的回退字体（face 名，分号隔开）。
      *
      * 回退字体在 crengine 里是进程级的设置，渲染前要按这里存的再设一次：
@@ -147,6 +162,51 @@ constexpr int kMaxPageDimension = 8192;
  * 排版、缓冲按调用方尺寸解读」，整页错行。Rust 层有同一套校验，这里再挡一道，
  * 保证 C 边界单独被调用时也不会出现不一致的尺寸。 */
 constexpr int kMinPageDimension = 80;
+
+/* 现代精排的 block rendering 标志。
+ *
+ * 头文件里没有叫 BLOCK_RENDERING_FLAGS_WEB 的宏：KOReader 的「Web 盒模型」
+ * 就是 lvrend.h 里的 BLOCK_RENDERING_FULL_FEATURED（0x7FFFFFFF），它把
+ * W3C 盒模型、外边距折叠、float/inline-block 等增强渲染全部打开。
+ * crengine 的 DEF_RENDER_BLOCK_RENDERING_FLAGS 也是这个值；这里显式写出来，
+ * 让「精排开/关」不依赖库的默认值。 */
+constexpr lUInt32 kFineBlockRenderingFlags = BLOCK_RENDERING_FULL_FEATURED;
+static_assert((kFineBlockRenderingFlags & BLOCK_RENDERING_USE_W3C_BOX_MODEL) != 0,
+              "fine typesetting must include the W3C box model");
+
+/* 精排时的默认渲染 DPI（以及合法范围）。
+ *
+ * crengine 的 1 CSS px 在 BASE_CSS_DPI（96）下等于 1 屏幕像素；CSS 里的
+ * pt / mm / in 按面板真实 DPI（如 167 / 212 / 300 ppi）换算才能与物理尺寸
+ * 一致。注意只改 CSS 绝对单位的换算（gRenderDPI），不打开
+ * PROP_RENDER_SCALE_FONT_WITH_DPI：字号是调用方按设备像素算好的，再乘
+ * dpi/96 会放大数倍。 */
+constexpr int kDefaultFineRenderDpi = 300;
+constexpr int kMinRenderDpi = 72;
+constexpr int kMaxRenderDpi = 600;
+
+int resolve_render_dpi(bool fine, int requested_dpi) {
+    if (!fine) {
+        return DEF_RENDER_DPI;
+    }
+    if (requested_dpi <= 0) {
+        return kDefaultFineRenderDpi;
+    }
+    return std::clamp(requested_dpi, kMinRenderDpi, kMaxRenderDpi);
+}
+
+/* 引导线的几何：2 像素线宽；点线 3 像素实、3 像素空。
+ *
+ * 墨水屏没有灰度渐变，线太细会被栅格化吃掉，点线的空档太大又会看起来
+ * 断断续续。3/3 在 300 ppi 上接近 0.25 mm 的点径，缩小看是一条灰线，
+ * 放大看仍能数出点。 */
+constexpr int kUnderlineThickness = 2;
+constexpr int kDottedRun = 3;
+constexpr int kDottedGap = 3;
+
+/* 引导线的横向范围。与 shim.h / inkread_engine::UnderlineScope 一致：
+ * 0 = TextOnly（文字宽度），1 = FullLine（整行）。 */
+constexpr int kUnderlineScopeFullLine = 1;
 
 /* C++ 异常时返回的错误码。与正常错误的 1..6 区分开。 */
 constexpr int kErrorException = 99;
@@ -258,128 +318,200 @@ CrRect to_page_rect(const lvRect &rc, int page_start, int margin_left, int margi
     return out;
 }
 
+/* 画一段引导线像素。
+ *
+ * 只负责页面坐标：调用方已经把文档流坐标换算好了。`y` 是线的第一行；
+ * 线宽是 kUnderlineThickness 像素。所有坐标都做严格边界校验：墨水屏的
+ * 页面缓冲是裸指针，任何一次 0 <= py < height、0 <= px < width 之外的写
+ * 都是越界写（KO2-UNDERLINE-001 的教训）。 */
+void draw_underline_pixels(uint8_t *dst, int width, int height, int y, int x0, int x1, int style,
+                           lUInt8 gray) {
+    if (dst == nullptr || width <= 0 || height <= 0 || style <= 0) {
+        return;
+    }
+    if (x0 < 0) {
+        x0 = 0;
+    }
+    if (x1 > width) {
+        x1 = width;
+    }
+    if (x0 >= x1 || y >= height || y <= -kUnderlineThickness) {
+        return;
+    }
+    for (int py = y; py < y + kUnderlineThickness; py++) {
+        if (py < 0 || py >= height) {
+            continue;
+        }
+        uint8_t *row = dst + static_cast<size_t>(py) * static_cast<size_t>(width);
+        if (style == 2) {
+            // 点状：3 像素实、3 像素空。
+            for (int px = x0; px < x1;) {
+                const int run_end = px + kDottedRun < x1 ? px + kDottedRun : x1;
+                for (int i = px; i < run_end; i++) {
+                    if (i >= 0 && i < width) {
+                        row[i] = gray;
+                    }
+                }
+                px = run_end + kDottedGap;
+            }
+        } else {
+            for (int px = x0; px < x1; px++) {
+                if (px >= 0 && px < width) {
+                    row[px] = gray;
+                }
+            }
+        }
+    }
+}
+
+/* 画一行文字下方的引导线（文档流坐标转页面坐标后落在页面缓冲里）。
+ *
+ * 只画文字宽度：x 范围来自这一行的文字矩形。 */
 void draw_underline_line(const CrDoc *doc, uint8_t *dst, int width, int height, int flow_top,
                          int flow_bottom, int flow_left, int flow_right, int page_start,
-                         int page_end, int style, lUInt8 gray, int thickness, int dotted_gap);
+                         int style, lUInt8 gray) {
+    const int margin_left = std::clamp(doc->margin_left, 0, width);
+    const int margin_top = std::clamp(doc->margin_top, 0, height);
+    const int top = flow_top - page_start + margin_top;
+    const int bottom = flow_bottom - page_start + margin_top;
+    const int y = bottom + 2;
+    if (y <= top) {
+        return; // 与文字重叠，不画
+    }
+    draw_underline_pixels(dst, width, height, y, flow_left + margin_left,
+                          flow_right + margin_left, style, gray);
+}
+
+/* 画一整行引导线：横跨正文区 margin_left..width-margin_right。 */
+void draw_underline_full_line(const CrDoc *doc, uint8_t *dst, int width, int height, int y,
+                              int style, lUInt8 gray) {
+    const int margin_left = std::clamp(doc->margin_left, 0, width);
+    const int margin_right = std::clamp(doc->margin_right, 0, width);
+    const int margin_top = std::clamp(doc->margin_top, 0, height);
+    if (y < margin_top) {
+        return; // 不进上边距
+    }
+    const int body_bottom = height - std::clamp(doc->margin_bottom, 0, height);
+    if (y + kUnderlineThickness > body_bottom) {
+        return; // 不进下边距
+    }
+    draw_underline_pixels(dst, width, height, y, margin_left, width - margin_right, style, gray);
+}
 
 /* 正文每行下方的引导线。
  *
  * 用的是 crengine 自己的行几何：getPageDocumentRange() 拿到本页的文档
  * 范围，getSegmentRects() 给出每个文本行一个矩形（默认不含图片）。
- * 所以引导线只落在正文文字行的下面，图片、页眉页脚都不会被画到。
+ * 所以文字划线只落在正文文字行的下面，图片、页眉页脚都不会被画到。
+ *
+ * FullLine 模式下线条横跨正文区（margin_left..width-margin_right），并且
+ * 按行高网格把段间空白、短段落下方和页面底部的空行槽补满，形成横格纸的
+ * 效果。行高优先用相邻文字行的间距（中位数，标题等不同字号不会把网格
+ * 带偏），行数不足时用排版参数算出的 line_height_px。
  *
  * 引导线画进 cr_doc_render_page 的页面缓冲里，和文字同一次渲染完成，
  * 翻页路径上不额外调用引擎。 */
 void draw_underline_guides(const CrDoc *doc, int page, uint8_t *dst, int width, int height,
-                           int style, int gray) {
-    if (style <= 0 || doc->view == nullptr || dst == nullptr) {
+                           int style, int gray, int scope) {
+    if (style <= 0 || doc->view == nullptr || dst == nullptr || width <= 0 || height <= 0) {
         return;
     }
-    LVRef<ldomXRange> range = doc->view->getPageDocumentRange(page);
-    if (range.isNull()) {
-        return; // 空页
-    }
-    LVArray<lvRect> rects;
-    range->getSegmentRects(rects); // 每个文本行一个矩形，图片不在其中
-    const int count = rects.length();
-    if (count <= 0) {
-        return;
-    }
-    const int page_start = page_flow_start(doc, page);
-    const int page_end = page_flow_end(doc, page);
     const lUInt8 g = static_cast<lUInt8>(std::clamp(gray, 0, 255));
-    // 实线 2 像素、点线 2 像素实 4 像素空。
-    const int thickness = 2;
-    const int dotted_gap = 4;
+    const bool full_line = scope == kUnderlineScopeFullLine;
 
-    /* 同一行可能有多个片段（双向文字），按行的 y 合并成一段，
-     * 免得一行被切成两截短线。 */
-    int line_top = 0;
-    int line_bottom = 0;
-    int line_left = 0;
-    int line_right = 0;
-    bool have_line = false;
-    for (int r = 0; r < count; r++) {
-        const lvRect &rc = rects[r];
-        if (rc.top >= page_end) {
-            break; // 其实在下一页
-        }
-        if (!have_line || rc.top != line_top) {
-            if (have_line) {
-                draw_underline_line(doc, dst, width, height, line_top, line_bottom, line_left,
-                                    line_right, page_start, page_end, style, g, thickness, dotted_gap);
+    LVRef<ldomXRange> range = doc->view->getPageDocumentRange(page);
+    std::vector<lvRect> rows;
+    if (!range.isNull()) {
+        LVArray<lvRect> rects;
+        range->getSegmentRects(rects); // 每个文本行一个矩形，图片不在其中
+        const int page_end = page_flow_end(doc, page);
+        const int count = rects.length();
+        for (int r = 0; r < count; r++) {
+            const lvRect &rc = rects[r];
+            if (rc.top >= page_end) {
+                break; // 其实在下一页
             }
-            line_top = rc.top;
-            line_bottom = rc.bottom;
-            line_left = rc.left;
-            line_right = rc.right;
-            have_line = true;
-            continue;
-        }
-        if (rc.bottom > line_bottom) {
-            line_bottom = rc.bottom;
-        }
-        if (rc.left < line_left) {
-            line_left = rc.left;
-        }
-        if (rc.right > line_right) {
-            line_right = rc.right;
-        }
-    }
-    if (have_line) {
-        draw_underline_line(doc, dst, width, height, line_top, line_bottom, line_left, line_right,
-                            page_start, page_end, style, g, thickness, dotted_gap);
-    }
-}
-
-/* 画一行文字下方的引导线（文档流坐标转页面坐标后落在页面缓冲里）。 */
-void draw_underline_line(const CrDoc *doc, uint8_t *dst, int width, int height, int flow_top,
-                         int flow_bottom, int flow_left, int flow_right, int page_start,
-                         int page_end, int style, lUInt8 gray, int thickness, int dotted_gap) {
-    (void)page_end;
-    const int top = flow_top - page_start + doc->margin_top;
-    const int bottom = flow_bottom - page_start + doc->margin_top;
-    const int left = flow_left + doc->margin_left;
-    const int right = flow_right + doc->margin_left;
-    // 引导线在文字下方 2 像素；行距不够时贴到文字下方 1 像素画一条细线。
-    int y = bottom + 2;
-    int thick = thickness;
-    if (y + thick > height) {
-        return;
-    }
-    if (y <= top) {
-        return; // 与文字重叠，不画
-    }
-    if (y >= height) {
-        return;
-    }
-    int x_end = right;
-    if (x_end > width) {
-        x_end = width;
-    }
-    int x = left;
-    if (x < 0) {
-        x = 0;
-    }
-    if (x >= x_end) {
-        return;
-    }
-    for (int py = y; py < y + thick && py < height; py++) {
-        uint8_t *row = dst + static_cast<size_t>(py) * static_cast<size_t>(width);
-        if (style == 2) {
-            // 点状：2 像素实、4 像素空。
-            for (int px = x; px < x_end;) {
-                const int run_end = px + thickness < x_end ? px + thickness : x_end;
-                for (int i = px; i < run_end; i++) {
-                    row[i] = gray;
+            if (!rows.empty() && rows.back().top == rc.top) {
+                // 同一行可能有多个片段（双向文字），合并成一段，
+                // 免得一行被切成两截短线。
+                lvRect &row = rows.back();
+                if (rc.bottom > row.bottom) {
+                    row.bottom = rc.bottom;
                 }
-                px = run_end + dotted_gap;
+                if (rc.left < row.left) {
+                    row.left = rc.left;
+                }
+                if (rc.right > row.right) {
+                    row.right = rc.right;
+                }
+                continue;
             }
-        } else {
-            for (int px = x; px < x_end; px++) {
-                row[px] = gray;
+            rows.push_back(rc);
+        }
+    }
+
+    if (!full_line) {
+        if (rows.empty()) {
+            return;
+        }
+        const int page_start = page_flow_start(doc, page);
+        for (const lvRect &row : rows) {
+            draw_underline_line(doc, dst, width, height, row.top, row.bottom, row.left, row.right,
+                                page_start, style, g);
+        }
+        return;
+    }
+
+    /* 行高（网格步长）：相邻文字行 top 的差（中位数）。
+     *
+     * 段间距、标题行高和正文不同，取中位数比取最小值稳：一两行标题不会
+     * 把整页的网格带偏。 */
+    std::vector<int> gaps;
+    for (size_t i = 1; i < rows.size(); i++) {
+        const int gap = rows[i].top - rows[i - 1].top;
+        if (gap > 0) {
+            gaps.push_back(gap);
+        }
+    }
+    int step = 0;
+    if (!gaps.empty()) {
+        std::sort(gaps.begin(), gaps.end());
+        step = gaps[gaps.size() / 2];
+    }
+    if (step <= 0) {
+        step = doc->line_height_px;
+    }
+    if (step < 4) {
+        step = 4;
+    }
+
+    const int page_start = page_flow_start(doc, page);
+    const int margin_top = std::clamp(doc->margin_top, 0, height);
+    const int body_bottom = height - std::clamp(doc->margin_bottom, 0, height);
+    int last_y = margin_top;
+    for (size_t i = 0; i < rows.size(); i++) {
+        const lvRect &row = rows[i];
+        const int y = row.bottom - page_start + margin_top + 2;
+        if (y <= row.top - page_start + margin_top) {
+            continue; // 与文字重叠，不画
+        }
+        draw_underline_full_line(doc, dst, width, height, y, style, g);
+        // 上一行与这一行之间的空白（段间距、标题后的留白）按网格补满。
+        if (i > 0 && y - last_y > step + step / 2) {
+            for (int fill = last_y + step; fill + kUnderlineThickness <= y - step / 2;
+                 fill += step) {
+                draw_underline_full_line(doc, dst, width, height, fill, style, g);
             }
         }
+        last_y = y;
+    }
+
+    // 短段落或整页空白：从最后一条线继续按网格补到正文区底部。
+    if (rows.empty()) {
+        last_y = margin_top;
+    }
+    for (int y = last_y + step; y + kUnderlineThickness <= body_bottom; y += step) {
+        draw_underline_full_line(doc, dst, width, height, y, style, g);
     }
 }
 
@@ -497,6 +629,121 @@ void apply_embedded_styles(LVDocView *view, bool enabled) {
     }
 }
 
+/* 把请求的基准字重换成字体管理器实际能画好的那一个。
+ *
+ * crengine 的字面选择是「最近字重」：字面只有 400/700 时，请求 600 会选中
+ * 700 的粗体字面，然后用 FT_Outline_Embolden 的负强度把它削细。负强度会把
+ * 笔画侵蚀掉，600 画出来反而比 500 还细（TYPE-101 在 macOS 宋体上实测）。
+ *
+ * 负强度不可靠，所以这里只在「请求值比两个字面的中点更靠近更重的那一侧，
+ * 而且负强度已经大到接近 0.5 像素」时把基准降到中点：字体管理器会选较轻
+ * 的字面，再向上合成加粗。字面本身有请求的字重（半粗字面或可变字体）时
+ * 原样下发；负强度很小的字重（例如 650 落在 400/700 中间）保留原值，让
+ * 粗体字面只被轻微调整。
+ *
+ * 例如宋体有 300/400/700/900：请求 600 会下发 550（400 加合成加粗），
+ * 请求 500 / 650 / 690 原样下发。
+ *
+ * 调用方必须已持有 font_mutex()：这里要读字体管理器的字面列表，而
+ * std::mutex 不可重入，所以本函数自己不加锁。 */
+int resolve_base_weight_locked(LVDocView *view, int weight) {
+    if (view == nullptr || fontMan == nullptr || weight <= 0) {
+        return weight;
+    }
+    LVArray<int> weights;
+    fontMan->GetAvailableFontWeights(weights, view->getDefaultFontFace());
+    if (weights.length() <= 0) {
+        return weight;
+    }
+    int lower = 0;
+    int upper = 0;
+    for (int i = 0; i < weights.length(); i++) {
+        const int w = weights[i];
+        if (w == weight) {
+            return weight; // 字面本身就有这个字重
+        }
+        if (w < weight && w > lower) {
+            lower = w;
+        }
+        if (w > weight && (upper == 0 || w < upper)) {
+            upper = w;
+        }
+    }
+    if (lower > 0 && upper > 0) {
+        const int midpoint = (lower + upper) / 2;
+        // 负强度按 (requested - 字面字重)/6400 em 计算：75 在 46px 字号上
+        // 约 0.54 像素，再大就会把粗体笔画削得比常规字重还细。
+        constexpr int kMinErodingWeight = 75;
+        if (weight > midpoint && upper - weight >= kMinErodingWeight) {
+            return midpoint;
+        }
+    }
+    return weight;
+}
+
+/* 把现代精排开关与字重套到 LVDocView 上。
+ *
+ * 用 propsApply 而不是直接改文档：这些属性库里都有现成的应用逻辑，而且
+ * 文档还没建好（LoadDocument 之前）时会把值存进 m_props，等
+ * createEmptyDocument() 建文档时再落到 doc flags 上（DOM 版本、block
+ * rendering 标志、内嵌字体都是解析期行为，必须在 LoadDocument 之前设，
+ * 见 ENG-009）。文档已经建好时 propsApply 会直接改 doc flags 并请求重排。
+ *
+ * 只在打开文档和改排版时调。DPI、kerning、基准字重是进程级全局设置，
+ * 别的文档会改掉它们，渲染前由 apply_render_globals() 直接恢复，不能再走
+ * propsApply()（它会 requestRender，把已经翻到的页清掉）。
+ *
+ * font_weight 越界时钳到 100..900；<= 0 时按 400 处理。 */
+void apply_fine_typesetting(LVDocView *view, bool fine, int font_weight, int dpi) {
+    if (view == nullptr) {
+        return;
+    }
+    if (font_weight <= 0) {
+        font_weight = 400;
+    }
+    font_weight = std::clamp(font_weight, 100, 900);
+    {
+        // 查字面列表要读进程级字体管理器，持锁范围只包住这次查询：
+        // 后面的 propsApply 不需要这把锁，也不能在持锁时调用（不可重入）。
+        std::lock_guard<std::mutex> guard(font_mutex());
+        font_weight = resolve_base_weight_locked(view, font_weight);
+    }
+    const int render_dpi = resolve_render_dpi(fine, dpi);
+
+    CRPropRef props = LVCreatePropsContainer();
+    // Web 盒模型与增强 block rendering。关掉精排时传 0：crengine 会退回
+    // 传统（box-sizing: border-box）的布局，不再设置 ENHANCED 位。
+    props->setInt(PROP_RENDER_BLOCK_RENDERING_FLAGS,
+                  static_cast<int>(fine ? kFineBlockRenderingFlags : 0));
+    // DOM 版本固定用当前版本，不随精排开关切换。旧的归一化版本会改变
+    // DocFragment 的节点结构，用户来回切换精排时，已保存的 XPointer 阅读
+    // 进度和高亮会跟着错位；DOM 版本只能在解析前决定，事后再改只会重排。
+    props->setInt(PROP_REQUESTED_DOM_VERSION, gDOMVersionCurrent);
+    // 悬挂标点（crengine 里叫 floating punctuation）。
+    props->setBool(PROP_FLOATING_PUNCTUATION, fine);
+    // 书内嵌字体。
+    props->setBool(PROP_EMBEDDED_FONTS, fine);
+    // 页下注（配合 -cr-hint: footnote-inpage，让多看与 EPUB3 脚注在引用页底部呈现）。
+    props->setBool(PROP_FOOTNOTES, fine);
+    // 激活 CJK 语言管线：精排模式默认按 zh-CN 启用简中标点挤压表与 libunibreak
+    // 中文避头尾禁则，并开启内嵌语言识别（书内 xml:lang="zh-TW"/"ja"/"en" 自动切换）。
+    props->setString(PROP_TEXTLANG_MAIN_LANG, fine ? lString32(U"zh-CN") : lString32(U"en"));
+    props->setBool(PROP_TEXTLANG_EMBEDDED_LANGS_ENABLED, fine);
+    // HarfBuzz kerning/shaping：3 = KERNING_MODE_HARFBUZZ（完整 shaping，
+    // 含连字、字偶距、CJK 标点挤压与中西文 1/4em 留白）。关掉精排时不启用。
+    props->setInt(PROP_FONT_KERNING, fine ? KERNING_MODE_HARFBUZZ : KERNING_MODE_DISABLED);
+    // 自动 hinting 是 crengine 的现代默认；传统模式用 FreeType 的字节码
+    // 解释器。两者都不改变行宽（只影响字形栅格化）。
+    props->setInt(PROP_FONT_HINTING,
+                  fine ? HINTING_MODE_AUTOHINT : HINTING_MODE_BYTECODE_INTERPRETOR);
+    // CSS 绝对单位按面板真实 DPI 换算。不缩放字号本身。
+    props->setInt(PROP_RENDER_DPI, render_dpi);
+    props->setInt(PROP_RENDER_SCALE_FONT_WITH_DPI, 0);
+    // 基准字重：书里每个元素的字重都会加上 (weight - 400) 的偏移。
+    props->setInt(PROP_FONT_BASE_WEIGHT, font_weight);
+    view->propsApply(props);
+}
+
 /* 把回退字体名单交给字体管理器。
  *
  * 名单是分号隔开的 face 名（crengine 自己的写法），空串表示不用回退字体。
@@ -519,6 +766,44 @@ void apply_fallback_faces(const char *faces) {
 std::string fallback_faces_of(const CrLayout &layout) {
     return layout.fallback_font_faces == nullptr ? std::string()
                                                   : std::string(layout.fallback_font_faces);
+}
+
+/* 把这一份文档自己的排版参数记在 CrDoc 上。
+ *
+ * 页边距用于文档流坐标换算；精排开关、字重、行高是进程级全局设置的
+ * 「本档副本」，渲染前要按它们再设一次（别的文档会改掉全局那份）。 */
+void remember_layout(CrDoc *doc, const CrLayout &layout) {
+    // 页边距是页面坐标换算的输入，必须用 LVDocView 真正生效的那一份：
+    // 取引擎实际生效边距，防止后续引擎版本引入钳制后坐标失配。当前 vendored
+    // 版本的 setPageMargins() 是直接赋值（lvdocview.cpp:415-427），两边相同；
+    // 读回来是为了不依赖这个实现细节。取不到时退回钳过界的原始参数。
+    if (doc->view != nullptr) {
+        const lvRect margins = doc->view->getPageMargins();
+        doc->margin_left = margins.left;
+        doc->margin_top = margins.top;
+        doc->margin_right = margins.right;
+        doc->margin_bottom = margins.bottom;
+    } else {
+        doc->margin_left = std::clamp(layout.margin_left, 0, doc->width);
+        doc->margin_top = std::clamp(layout.margin_top, 0, doc->height);
+        doc->margin_right = std::clamp(layout.margin_right, 0, doc->width);
+        doc->margin_bottom = std::clamp(layout.margin_bottom, 0, doc->height);
+    }
+    doc->fine_typesetting = layout.fine_typesetting != 0;
+    int weight = layout.font_weight <= 0 ? 400 : layout.font_weight;
+    doc->font_weight = std::clamp(weight, 100, 900);
+    doc->render_dpi = resolve_render_dpi(doc->fine_typesetting, layout.dpi);
+    doc->fallback_font_faces = fallback_faces_of(layout);
+
+    // 行高网格：字号 × 行高百分比。layout 里没给时用引擎当前值。
+    int font_size = layout.font_size;
+    if (font_size <= 0 && doc->view != nullptr) {
+        font_size = doc->view->getFontSize();
+    }
+    font_size = std::clamp(font_size, 1, 4096);
+    int spacing = layout.line_spacing_percent > 0 ? layout.line_spacing_percent : 100;
+    spacing = std::clamp(spacing, 1, 1000);
+    doc->line_height_px = std::max(4, (font_size * spacing + 50) / 100);
 }
 
 /* 去掉文本节点开头的全角空格（U+3000）。
@@ -569,6 +854,10 @@ void apply_layout(LVDocView *view, const CrLayout &layout) {
     if (layout.line_spacing_percent > 0) {
         view->setDefaultInterlineSpace(layout.line_spacing_percent);
     }
+    // 精排属性要在文档解析前就位（DOM 版本、block rendering 标志、内嵌
+    // 字体），文档已建好时它们会触发重排。字重是全局设置，每次渲染前
+    // 还会再按文档自己的值设一次。
+    apply_fine_typesetting(view, layout.fine_typesetting != 0, layout.font_weight, layout.dpi);
     // 文档已经建好了，这里要重新打一次标记：换排版参数时可能改了开关。
     apply_embedded_styles(view, layout.embedded_styles != 0);
     // lvRect(left, top, right, bottom) 记的是页边距，不是页面矩形。
@@ -576,6 +865,43 @@ void apply_layout(LVDocView *view, const CrLayout &layout) {
                                  layout.margin_bottom));
     // 回退字体要在渲染之前定下来：字形是渲染时现找的。
     apply_fallback_faces(layout.fallback_font_faces);
+}
+
+/* 渲染前恢复进程级的字体设置。
+ *
+ * 这些设置（kerning / hinting / 基准字重 / 渲染 DPI）是全局的，别的文档会
+ * 改掉它们；但渲染路径不能再用 propsApply() 重放一遍：propsApply 里的
+ * 若干分支会 requestRender()，把已经翻到的页清掉，下一次 Draw 又从第 0 页
+ * 画起（TYPE-101 实测：连渲染 4 页得到同一张图）。这里直接写全局变量，
+ * 值没变就不碰字体缓存。
+ *
+ * fontMan 的读写整段在 font_mutex() 下完成，只调不加锁的
+ * resolve_base_weight_locked()：std::mutex 不可重入，绝不能在这里再套一层。 */
+void apply_render_globals(LVDocView *view, bool fine, int font_weight, int render_dpi) {
+    if (view == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(font_mutex());
+    if (fontMan == nullptr) {
+        return;
+    }
+    const kerning_mode_t kerning = fine ? KERNING_MODE_HARFBUZZ : KERNING_MODE_DISABLED;
+    if (fontMan->GetKerningMode() != kerning) {
+        fontMan->SetKerningMode(kerning);
+    }
+    const hinting_mode_t hinting =
+            fine ? HINTING_MODE_AUTOHINT : HINTING_MODE_BYTECODE_INTERPRETOR;
+    if (fontMan->GetHintingMode() != hinting) {
+        fontMan->SetHintingMode(hinting);
+    }
+    const int weight = std::clamp(font_weight <= 0 ? 400 : font_weight, 100, 900);
+    const int base_weight = resolve_base_weight_locked(view, weight);
+    if (LVRendGetBaseFontWeight() != base_weight) {
+        LVRendSetBaseFontWeight(base_weight);
+    }
+    gRenderDPI = render_dpi > 0 ? render_dpi : (fine ? kDefaultFineRenderDpi : DEF_RENDER_DPI);
+    // 字号始终按设备像素算，不跟着 DPI 再缩放一次。
+    gRenderScaleFontWithDPI = false;
 }
 
 /* 异常守卫。
@@ -987,13 +1313,17 @@ extern "C" CrDoc *cr_doc_open(const char *path, int width, int height, const CrL
         set_error(err, err_len, "missing layout");
         return nullptr;
     }
-    if (fontMan == nullptr) {
-        set_error(err, err_len, "font manager not initialized");
-        return nullptr;
+    {
+        // fontMan 可能在另一个线程上初始化（cr_fonts_init 持同一把锁），
+        // 读这个全局指针本身也要在锁内。
+        std::lock_guard<std::mutex> guard(font_mutex());
+        if (fontMan == nullptr) {
+            set_error(err, err_len, "font manager not initialized");
+            return nullptr;
+        }
     }
 
     setStorageMaxUncompressedSizeFactor(g_storage_size_factor);
-
     CrDocOwner owner;
     owner.doc = new CrDoc();
     CrDoc *doc = owner.doc;
@@ -1018,9 +1348,7 @@ extern "C" CrDoc *cr_doc_open(const char *path, int width, int height, const CrL
     // KOReader 亦是先设置全部排版参数后再加载文档。
     view->Resize(width, height);
     apply_layout(view, *layout);
-    doc->margin_left = layout->margin_left;
-    doc->margin_top = layout->margin_top;
-    doc->fallback_font_faces = fallback_faces_of(*layout);
+    remember_layout(doc, *layout);
 
     doc->callback.view = doc->view;
     doc->callback.reset(true, progress_cb, user_data);
@@ -1031,9 +1359,12 @@ extern "C" CrDoc *cr_doc_open(const char *path, int width, int height, const CrL
         return nullptr;
     }
 
-    // 段首全角空格是内容里的缩进标记，统一去掉；首行缩进由 CSS 控制。
-    if (ldomDocument *dom = view->getDocument()) {
-        strip_leading_ideographic_spaces(dom->getRootNode());
+    // 仅在关闭精排（强制统一极简排版）时剥离段首全角空格 U+3000；
+    // 精排模式下保留原书全角空格，避免破坏古诗、信件、落款、对联等刻意排版。
+    if (!doc->fine_typesetting) {
+        if (ldomDocument *dom = view->getDocument()) {
+            strip_leading_ideographic_spaces(dom->getRootNode());
+        }
     }
 
     doc->opened_from_cache = (view->getDocument() != nullptr && view->getDocument()->isTocFromCacheValid());
@@ -1083,7 +1414,8 @@ extern "C" int cr_doc_page_count(const CrDoc *doc) {
 
 extern "C" int cr_doc_render_page(CrDoc *doc, int page, uint8_t *dst, size_t dst_len, int dst_width,
                                   int dst_height, int invert_images, int underline,
-                                  int underline_gray, char *err, size_t err_len) {
+                                  int underline_gray, int underline_scope, char *err,
+                                  size_t err_len) {
     CR_GUARD_BEGIN
     if (doc == nullptr || doc->view == nullptr || doc->buf == nullptr) {
         set_error(err, err_len, "document not opened");
@@ -1111,9 +1443,11 @@ extern "C" int cr_doc_render_page(CrDoc *doc, int page, uint8_t *dst, size_t dst
     }
 
     LVDocView *view = doc->view;
-    // 回退字体是进程级的设置，换一本书就会改掉全局那份。渲染前按这一版书
-    // 自己存的名单再设一次：不设回来的话，字形会拿别的书的回退字体排。
+    // 回退字体、精排开关（kerning/DPI）与字重都是进程级的设置，换一本书
+    // 或另一个线程上的文档就会改掉全局那份。渲染前按这一版书自己存的参数
+    // 再设一次：不设回来的话，字形会拿别的书的设置排。
     apply_fallback_faces(doc->fallback_font_faces.c_str());
+    apply_render_globals(view, doc->fine_typesetting, doc->font_weight, doc->render_dpi);
     if (!view->goToPage(page)) {
         set_error(err, err_len, "goToPage failed");
         return 6;
@@ -1140,7 +1474,8 @@ extern "C" int cr_doc_render_page(CrDoc *doc, int page, uint8_t *dst, size_t dst
     }
     // 正文每行下方的引导线：和文字同一次渲染画进页面缓冲，
     // 翻页时不用额外调用引擎。
-    draw_underline_guides(doc, page, dst, doc->width, doc->height, underline, underline_gray);
+    draw_underline_guides(doc, page, dst, doc->width, doc->height, underline, underline_gray,
+                          underline_scope);
     return 0;
     CR_GUARD_END(err, err_len, kErrorException)
 }
@@ -1158,9 +1493,7 @@ extern "C" int cr_doc_set_layout(CrDoc *doc, const CrLayout *layout,
         return 2;
     }
     apply_layout(doc->view, *layout);
-    doc->margin_left = layout->margin_left;
-    doc->margin_top = layout->margin_top;
-    doc->fallback_font_faces = fallback_faces_of(*layout);
+    remember_layout(doc, *layout);
     doc->callback.reset(false, progress_cb, user_data);
     doc->view->Render();
     if (doc->view->getPageCount() <= 0) {
@@ -1240,9 +1573,7 @@ extern "C" int cr_doc_set_viewport(CrDoc *doc, int width, int height, const CrLa
     // m_dx/m_dy 算页面矩形）。顺序和 cr_doc_open 里一样。
     view->Resize(width, height);
     apply_layout(view, *layout);
-    doc->margin_left = layout->margin_left;
-    doc->margin_top = layout->margin_top;
-    doc->fallback_font_faces = fallback_faces_of(*layout);
+    remember_layout(doc, *layout);
     txn.publish(width, height);
 
     doc->callback.reset(false, progress_cb, user_data);
@@ -1561,9 +1892,10 @@ extern "C" int cr_doc_page_links(const CrDoc *doc, int page, CrLinkList *out, ch
         item.is_internal = 0;
         item.target_xpointer = nullptr;
         item.target_page = -1;
-        // 链接的矩形：跨行时每行一个。
+        // 链接的矩形：跨行时每行一个；includeImages=true 保证多看/微信读书等
+        // 纯图片脚注图标（<a class="duokan-footnote"><img .../></a>）也能命中点击热区。
         LVArray<lvRect> rects;
-        link_range->getSegmentRects(rects);
+        link_range->getSegmentRects(rects, true);
         const int rect_count = rects.length();
         // 本页范围之外的链接丢掉：它们其实排在下一页。
         if (rect_count <= 0 || rects[0].top >= page_end) {

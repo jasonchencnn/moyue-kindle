@@ -95,10 +95,48 @@ pub mod action {
     pub const LIGHT_UP: ActionId = 51;
     pub const LIGHT_SET: ActionId = 52;
     pub const NIGHT: ActionId = 60;
-    /// Pull the open book's cloud progress and notes (SYNC-111).
+    /// Pull the open book's Readest cloud progress and notes (SYNC-111).
     pub const PULL_SYNC: ActionId = 70;
-    /// Push the open book's progress, notes and tombstones (SYNC-111).
+    /// Push the open book's progress, notes and tombstones to Readest (SYNC-111).
     pub const PUSH_SYNC: ActionId = 71;
+    /// Pull the open book's WeRead cloud progress and notes.
+    pub const WEREAD_PULL_SYNC: ActionId = 72;
+    /// Force-push the open book's progress and reading time to WeRead.
+    pub const WEREAD_PUSH_SYNC: ActionId = 73;
+    /// Pull the open book's Nutstore progress and notes.
+    pub const JIANGUOYUN_PULL_SYNC: ActionId = 74;
+    /// Push the open book's progress and notes to Nutstore.
+    pub const JIANGUOYUN_PUSH_SYNC: ActionId = 75;
+}
+
+/// Which cloud channels the reader's sync row shows.
+///
+/// Each channel that is on gets its own labelled Pull/Push pair, so the
+/// Readest buttons are never taken over by WeRead or Nutstore.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReaderSyncChannels {
+    /// The Readest cloud library.
+    pub readest: bool,
+    /// The WeRead library.
+    pub weread: bool,
+    /// The Nutstore (Jianguoyun) library.
+    pub jianguoyun: bool,
+}
+
+impl ReaderSyncChannels {
+    /// The two channels the older call sites know about.
+    pub fn readest_and_weread(readest: bool, weread: bool) -> Self {
+        Self {
+            readest,
+            weread,
+            jianguoyun: false,
+        }
+    }
+
+    /// How many channels are on.
+    pub fn count(self) -> usize {
+        usize::from(self.readest) + usize::from(self.weread) + usize::from(self.jianguoyun)
+    }
 }
 
 /// Where a tap on the page lands.
@@ -166,6 +204,39 @@ pub fn zones(screen: Rect) -> [(Zone, Rect); 4] {
 
 pub fn zone_at(screen: Rect, p: Point) -> Zone {
     zones(screen)
+        .iter()
+        .find(|(_, r)| r.contains(p))
+        .map(|(z, _)| *z)
+        .unwrap_or(Zone::Next)
+}
+
+/// The tap zones of a vertically set page (VERT-101).
+///
+/// The menu bands are the same as [`zones`], but the page turns the other
+/// way: the text runs right to left, so the left half of the screen goes
+/// forward and the right half back, the way a right-to-left book is read.
+pub fn vertical_zones(screen: Rect) -> [(Zone, Rect); 4] {
+    let top = screen.h * 12 / 100;
+    let bottom = screen.h * 12 / 100;
+    let left = screen.w * 50 / 100;
+    let middle_y = screen.y + top;
+    let middle_h = screen.h - top - bottom;
+    [
+        (Zone::Menu, Rect::new(screen.x, screen.y, screen.w, top)),
+        (Zone::Next, Rect::new(screen.x, middle_y, left, middle_h)),
+        (
+            Zone::Prev,
+            Rect::new(screen.x + left, middle_y, screen.w - left, middle_h),
+        ),
+        (
+            Zone::Menu,
+            Rect::new(screen.x, screen.y + top + middle_h, screen.w, bottom),
+        ),
+    ]
+}
+
+pub fn vertical_zone_at(screen: Rect, p: Point) -> Zone {
+    vertical_zones(screen)
         .iter()
         .find(|(_, r)| r.contains(p))
         .map(|(z, _)| *z)
@@ -370,9 +441,15 @@ pub struct Menu {
     pub btn_typeset: NodeId,
     pub btn_light: NodeId,
     pub btn_night: NodeId,
-    /// Pull / push the open book's cloud state, when the menu offers them.
+    /// Pull / push the open book's Readest cloud state, when enabled.
     pub btn_pull: Option<NodeId>,
     pub btn_push: Option<NodeId>,
+    /// Pull / push the open book's WeRead cloud state, when enabled.
+    pub btn_weread_pull: Option<NodeId>,
+    pub btn_weread_push: Option<NodeId>,
+    /// Pull / push the open book's Nutstore cloud state, when enabled.
+    pub btn_jianguoyun_pull: Option<NodeId>,
+    pub btn_jianguoyun_push: Option<NodeId>,
     /// One line of feedback under the sync row ("Pushing…", "Push failed:
     /// network unavailable"), hidden while there is nothing to say.
     pub sync_status: Option<NodeId>,
@@ -383,6 +460,42 @@ pub struct Menu {
 /// with chapter skips, then six entry buttons: 目录, 标注, 跳转, 排版, 前光, 夜间).
 /// No dimming mask over page text.
 pub fn build_menu(t: &mut Tree, st: &Styles, spec: &MenuSpec, s: &Settings) -> Menu {
+    build_menu_for_channels(t, st, spec, s, spec.sync, false)
+}
+
+/// Builds the reader menu with explicit per-channel sync button rows
+/// (`sync_readest` and `sync_weread`), omitting any channel turned off in
+/// Settings so Readest and WeRead stay clearly separated.
+pub fn build_menu_for_channels(
+    t: &mut Tree,
+    st: &Styles,
+    spec: &MenuSpec,
+    s: &Settings,
+    sync_readest: bool,
+    sync_weread: bool,
+) -> Menu {
+    build_menu_for_sync_channels(
+        t,
+        st,
+        spec,
+        s,
+        ReaderSyncChannels::readest_and_weread(sync_readest, sync_weread),
+    )
+}
+
+/// Builds the reader menu with explicit per-channel sync button rows, for
+/// every cloud channel Settings turns on: Readest, WeRead and Nutstore.
+///
+/// Channels that are off are omitted cleanly, so the reader never shows a
+/// button for a channel the account is not signed into.
+pub fn build_menu_for_sync_channels(
+    t: &mut Tree,
+    st: &Styles,
+    spec: &MenuSpec,
+    s: &Settings,
+    channels: ReaderSyncChannels,
+) -> Menu {
+    let (sync_readest, sync_weread) = (channels.readest, channels.weread);
     // 1. Top bar: height 104px, background CARD, bottom border radius 32px, padding 0 88px.
     // Back to library button (action::BACK)
     let back_icon = t.icon(Icon::ChevronLeft, 28, INK);
@@ -657,17 +770,30 @@ pub fn build_menu(t: &mut Tree, st: &Styles, spec: &MenuSpec, s: &Settings) -> M
     // six action buttons above already share the row to its limit, and these
     // two carry a label long enough ("Pull progress") to need half the width
     // each. Every target stays 88 px high.
-    let (sync_row, sync_status_opt, btn_pull, btn_push) = if spec.sync {
+    // Channel-labeled cloud sync buttons (Readest and/or WeRead). Each enabled
+    // channel gets its own clearly labeled Pull/Push pair so Readest buttons
+    // are never hijacked by WeRead, and disabled channels are omitted cleanly.
+    let (
+        sync_row,
+        sync_status_opt,
+        btn_pull,
+        btn_push,
+        btn_weread_pull,
+        btn_weread_push,
+        btn_jianguoyun_pull,
+        btn_jianguoyun_push,
+    ) = if channels.count() > 0 {
+        let btn_h = if channels.count() > 1 { 72 } else { 88 };
         let wide_btn = |t: &mut Tree, st: &Styles, icon: Icon, label: &str, act: ActionId| {
-            let ic = t.icon(icon, 32, INK);
+            let ic = t.icon(icon, 28, INK);
             let lb = t.label(label, st.font_xs().gray(INK));
-            let g12 = t.gap(12, 1);
-            let row = t.add(Node::row(0).cross(Cross::Center), [ic, g12, lb]);
+            let g10 = t.gap(10, 1);
+            let row = t.add(Node::row(0).cross(Cross::Center), [ic, g10, lb]);
             let center = t.align(0.5, 0.5, row);
             t.add(
                 Node::new(Kind::Fixed {
                     w: None,
-                    h: Some(88),
+                    h: Some(btn_h),
                 })
                 .flex(1)
                 .bg(PAPER)
@@ -677,31 +803,91 @@ pub fn build_menu(t: &mut Tree, st: &Styles, spec: &MenuSpec, s: &Settings) -> M
                 [center],
             )
         };
-        let pull = wide_btn(
-            t,
-            st,
-            Icon::Download,
-            tr(Msg::MenuPullSync),
-            action::PULL_SYNC,
-        );
-        let push = wide_btn(
-            t,
-            st,
-            Icon::Upload,
-            tr(Msg::MenuPushSync),
-            action::PUSH_SYNC,
-        );
-        let g16_s = t.gap(16, 1);
-        let row = t.add(Node::row(0).cross(Cross::Center), [pull, g16_s, push]);
-        let row = t.fixed(None, Some(88), Some(row));
+        let mut rows = Vec::new();
+        let (btn_pull, btn_push) = if sync_readest {
+            let pull = wide_btn(
+                t,
+                st,
+                Icon::Download,
+                tr(Msg::MenuReadestPull),
+                action::PULL_SYNC,
+            );
+            let push = wide_btn(
+                t,
+                st,
+                Icon::Upload,
+                tr(Msg::MenuReadestPush),
+                action::PUSH_SYNC,
+            );
+            let g16_s = t.gap(16, 1);
+            let row = t.add(Node::row(0).cross(Cross::Center), [pull, g16_s, push]);
+            rows.push(t.fixed(None, Some(btn_h), Some(row)));
+            (Some(pull), Some(push))
+        } else {
+            (None, None)
+        };
+        let (btn_weread_pull, btn_weread_push) = if sync_weread {
+            let w_pull = wide_btn(
+                t,
+                st,
+                Icon::Download,
+                tr(Msg::MenuWereadPull),
+                action::WEREAD_PULL_SYNC,
+            );
+            let w_push = wide_btn(
+                t,
+                st,
+                Icon::Upload,
+                tr(Msg::MenuWereadPush),
+                action::WEREAD_PUSH_SYNC,
+            );
+            let g16_w = t.gap(16, 1);
+            let row = t.add(Node::row(0).cross(Cross::Center), [w_pull, g16_w, w_push]);
+            rows.push(t.fixed(None, Some(btn_h), Some(row)));
+            (Some(w_pull), Some(w_push))
+        } else {
+            (None, None)
+        };
+        let (btn_jianguoyun_pull, btn_jianguoyun_push) = if channels.jianguoyun {
+            let j_pull = wide_btn(
+                t,
+                st,
+                Icon::Download,
+                tr(Msg::MenuJianguoyunPull),
+                action::JIANGUOYUN_PULL_SYNC,
+            );
+            let j_push = wide_btn(
+                t,
+                st,
+                Icon::Upload,
+                tr(Msg::MenuJianguoyunPush),
+                action::JIANGUOYUN_PUSH_SYNC,
+            );
+            let g16_j = t.gap(16, 1);
+            let row = t.add(Node::row(0).cross(Cross::Center), [j_pull, g16_j, j_push]);
+            rows.push(t.fixed(None, Some(btn_h), Some(row)));
+            (Some(j_pull), Some(j_push))
+        } else {
+            (None, None)
+        };
         let mut status = Paragraph::plain("", st.font_xs().gray(INK_2), Align::Left);
         status.style.max_lines = Some(1);
         let status_line = t.text(status);
         t.set_hidden(status_line, true);
-        let col = t.add(Node::column(8), [row, status_line]);
-        (Some(col), Some(status_line), Some(pull), Some(push))
+        rows.push(status_line);
+        let col = t.add(Node::column(10), rows);
+        (
+            Some(col),
+            Some(status_line),
+            btn_pull,
+            btn_push,
+            btn_weread_pull,
+            btn_weread_push,
+            btn_jianguoyun_pull,
+            btn_jianguoyun_push,
+        )
     } else {
-        (None, None, None, None)
+        (None, None, None, None, None, None, None, None)
     };
 
     let g20_nav = t.gap(1, 20);
@@ -756,6 +942,10 @@ pub fn build_menu(t: &mut Tree, st: &Styles, spec: &MenuSpec, s: &Settings) -> M
         btn_night,
         btn_pull,
         btn_push,
+        btn_weread_pull,
+        btn_weread_push,
+        btn_jianguoyun_pull,
+        btn_jianguoyun_push,
         sync_status: sync_status_opt,
     };
     menu.update_light(t, s.light);
@@ -1471,6 +1661,29 @@ mod tests {
             assert!((bar_end - rule..bar_end + 1).all(blank), "{rule}");
             assert!((sheet_start - 1..sheet_start + rule).all(blank), "{rule}");
         }
+    }
+
+    #[test]
+    fn vertical_zones_mirror_the_page_turns() {
+        let s = Rect::screen();
+        // The left half goes forward, the right half back: the vertical
+        // book is read right to left.
+        assert_eq!(vertical_zone_at(s, Point { x: 100, y: 800 }), Zone::Next);
+        assert_eq!(vertical_zone_at(s, Point { x: 800, y: 800 }), Zone::Prev);
+        // The menu bands stay where they were.
+        assert_eq!(vertical_zone_at(s, Point { x: 500, y: 60 }), Zone::Menu);
+        assert_eq!(
+            vertical_zone_at(
+                s,
+                Point {
+                    x: 500,
+                    y: s.h - 20
+                }
+            ),
+            Zone::Menu
+        );
+        let area: i64 = vertical_zones(s).iter().map(|(_, r)| r.area()).sum();
+        assert_eq!(area, s.area());
     }
 
     #[test]

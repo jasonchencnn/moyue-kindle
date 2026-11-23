@@ -22,6 +22,13 @@ are its section below.
 
 ### Changed
 
+## [0.3.2] - 2026-11-18
+
+- 排版面板在 600 x 800（Kindle 10）下按面板宽度分配控件，窄屏自动堆叠，不再重叠或裁切
+- Kindle 10（2019）加入共享基线：实测几何 608 x 10752 / stride 608 / rotate 3，167 dpi
+- PW2 使用 212 dpi；旧内核触摸时钟不可用时回退到单调时钟，恢复启动
+- Version metadata, the extension version and the About screen use 0.3.2.
+
 ## [0.3.1] - 2026-11-14
 
 The KO2 preview adds manual over-the-air updates and brings the support

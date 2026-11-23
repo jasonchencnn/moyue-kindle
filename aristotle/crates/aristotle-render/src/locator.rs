@@ -49,7 +49,10 @@ pub fn positions(
         // older engine (MuPDF reflow put TXT progress there) or a bare
         // fraction stored as page 0: neither names a crengine page, so the
         // fraction below is the only honest place to open.
-        Locator::Page { index } if engine != Engine::Crengine => {
+        // The vertical engine pages a book differently from every other
+        // one, so a page index a horizontal engine wrote names no vertical
+        // page: only the fraction below can open the book.
+        Locator::Page { index } if !matches!(engine, Engine::Crengine | Engine::Vertical) => {
             out.push(Position::Page(*index as usize));
         }
         // An XPointer names a place in the book; only crengine-ng places
@@ -207,6 +210,39 @@ mod tests {
         assert_eq!(
             positions(Engine::Crengine, Some(&p), false),
             vec![Position::Fraction(0.0)]
+        );
+    }
+
+    #[test]
+    fn the_vertical_engine_opens_at_the_fraction_only() {
+        // Every locator a horizontal engine writes names its own pages or
+        // its own spine offsets, neither of which the vertical engine
+        // shares; the fraction is the one place both agree on.
+        let p = progress(Locator::Page { index: 41 }, 0.62);
+        assert_eq!(
+            positions(Engine::Vertical, Some(&p), false),
+            vec![Position::Fraction(0.62)]
+        );
+        let p = progress(
+            Locator::Epub {
+                spine: 3,
+                offset: 1200,
+            },
+            0.4,
+        );
+        assert_eq!(
+            positions(Engine::Vertical, Some(&p), false),
+            vec![Position::Fraction(0.4)]
+        );
+        let p = progress(
+            Locator::XPointer {
+                xpointer: "/body/DocFragment[3]".into(),
+            },
+            0.6,
+        );
+        assert_eq!(
+            positions(Engine::Vertical, Some(&p), false),
+            vec![Position::Fraction(0.6)]
         );
     }
 

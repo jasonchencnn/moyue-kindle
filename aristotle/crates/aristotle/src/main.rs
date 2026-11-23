@@ -59,10 +59,12 @@ mod custom_quotes;
 mod device;
 mod dict;
 mod fonts;
+mod jianguoyun;
 mod launcher;
 mod marks;
 mod net;
 mod open;
+mod ota;
 mod overlay;
 mod pagecache;
 mod panel;
@@ -83,9 +85,12 @@ mod snapshot;
 mod speed;
 mod stats;
 mod sync;
+mod transition;
+mod translate;
 mod turns;
 mod usb_watch;
 mod wake;
+mod weread;
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -103,11 +108,13 @@ use aristotle_hal::power::{Battery, Frontlight, LIGHT_STEPS};
 use aristotle_hal::system;
 use aristotle_library::library::{resolve_library_destination, scan_root, ScanAdmission};
 use aristotle_library::{Library, ScanOptions, Status};
+use aristotle_net::http::Client;
+use aristotle_net::ota::OtaStage;
 use aristotle_net::transfer;
 use aristotle_render::formatting_progress::ProgressAction;
 use aristotle_render::page::Page;
 use aristotle_render::plato_core::anyhow::{bail, format_err, Context, Error};
-use aristotle_render::style::Style;
+use aristotle_render::style::{Style, UnderlineScope};
 use aristotle_screen::usb::{handle_usb_transition, reconcile, UsbAction, UsbEvent, UsbMode};
 use aristotle_ui::geom::{Density, Insets, Rect, Screen as ScreenProfile, Size};
 use aristotle_ui::input::{Direction, Phase, TouchEvent};
@@ -125,11 +132,12 @@ use aristotle_ui::screens::home as ui_home;
 use aristotle_ui::screens::library::{self as ui_lib, CoverMode, Filter, View};
 use aristotle_ui::screens::marks as ui_marks;
 use aristotle_ui::screens::mine as ui_mine;
+use aristotle_ui::screens::ota as ui_ota;
 use aristotle_ui::screens::quote_add as ui_quote_add;
 use aristotle_ui::screens::quotes as ui_quotes;
 use aristotle_ui::screens::reader as ui_reader;
 use aristotle_ui::screens::reader::{
-    action as menu_action, build_menu, Menu, MenuSpec, ProgressNodes, Settings,
+    action as menu_action, Menu, MenuSpec, ProgressNodes, Settings,
 };
 use aristotle_ui::screens::readest_login as ui_readest_login;
 use aristotle_ui::screens::scan as ui_scan;
@@ -138,6 +146,7 @@ use aristotle_ui::screens::settings::{self as set_ui, SystemView, LIGHT_PRESETS,
 use aristotle_ui::screens::sleep;
 use aristotle_ui::screens::sleep_images as ui_sleep_images;
 use aristotle_ui::screens::typeset as ui_typeset;
+use aristotle_ui::screens::weread_shelf as ui_weread_shelf;
 use aristotle_ui::screens::wifi as ui_wifi;
 use aristotle_ui::status::{Loading, LoadingNodes};
 use aristotle_ui::text::{FamilyId, FontData, Fonts, TextEngine};
@@ -160,6 +169,7 @@ use crate::session::{Prepared, Session, Source};
 use crate::shelf::{Covers, HomeModel, Nav, ShelfModel, Target, SORTS};
 use crate::speed::Speed;
 use crate::stats::Stats;
+use crate::translate::Service as TranslateService;
 use crate::turns::{Intent, Turn, TurnGestures};
 use aristotle_i18n::{
     fmt_clock_date, fmt_clock_day, fmt_clock_weekday, fmt_time, tf, tr, trn, Msg, Plural,
@@ -204,6 +214,7 @@ extern "C" fn on_signal(_: libc::c_int) {
 #[derive(Clone)]
 struct Args {
     data: PathBuf,
+    transition: Option<String>,
     library: PathBuf,
     root: PathBuf,
     turn_mode: Option<u32>,
@@ -232,7 +243,8 @@ fn usage() -> &'static str {
     "usage: aristotle [--data DIR] [--library DIR] [--root DIR] [--fonts DIR] [--turn-mode 9|7] \
      [--night-method software|hardware] [--no-scan] [--bench-open TITLE] [--open TITLE] \
      [--dict DIR]... [--index-dicts] [--test-clippings PATH] [--lang en|pl] \
-     [--preview OUT BOOK] [--preview-layout OUT BOOK WIDTH HEIGHT] [--dpi DPI]"
+     [--preview OUT BOOK] [--preview-layout OUT BOOK WIDTH HEIGHT] [--dpi DPI] \
+     [--transition prepare|restoring|watch]"
 }
 
 fn parse_args() -> Result<Args, Error> {
@@ -243,6 +255,7 @@ fn parse_args() -> Result<Args, Error> {
     let cwd = std::env::current_dir()?;
     let mut a = Args {
         data: exe_dir.join("data"),
+        transition: None,
         library: std::env::var_os("ARISTOTLE_DATA")
             .map_or_else(|| PathBuf::from("/mnt/us/.aristotle"), PathBuf::from),
         root: PathBuf::from("/mnt/us/documents"),
@@ -267,6 +280,7 @@ fn parse_args() -> Result<Args, Error> {
         let mut value = |name: &str| it.next().ok_or_else(|| format_err!("{name} needs a value"));
         match arg.as_str() {
             "--data" => a.data = cwd.join(value("--data")?),
+            "--transition" => a.transition = Some(value("--transition")?),
             "--library" => a.library = cwd.join(value("--library")?),
             "--root" => a.root = cwd.join(value("--root")?),
             "--fonts" => a.fonts = cwd.join(value("--fonts")?),
@@ -315,7 +329,7 @@ fn parse_args() -> Result<Args, Error> {
         }
     }
     if a.preview_density != Density::default() && a.preview_size.is_none() {
-        bail!("--dpi requires --preview-layout; device density stays at 300 DPI");
+        bail!("--dpi requires --preview-layout");
     }
     Ok(a)
 }
@@ -333,11 +347,38 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<u8, Error> {
-    let args = parse_args()?;
+    let mut args = parse_args()?;
     // SAFETY: the handler only stores to an atomic.
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+    }
+    if let Some(stage) = &args.transition {
+        return transition::run(&args, stage).map(|()| 0);
+    }
+    // Kobo first: its user store is /mnt/onboard and it has no Kindle
+    // powerd/LIPC. Detecting it before the Kindle paths are created keeps
+    // startup from failing on the missing /mnt/us (KOBO-ADAPT-001).
+    let kobo = aristotle_hal::platform::detect_kobo()?;
+    if let Some(identity) = &kobo {
+        if std::env::var_os("ARISTOTLE_DATA").is_none()
+            && args.library == Path::new("/mnt/us/.aristotle")
+        {
+            args.library = PathBuf::from("/mnt/onboard/.aristotle");
+        }
+        if args.root == Path::new("/mnt/us/documents") {
+            args.root = PathBuf::from("/mnt/onboard");
+        }
+        if args.fonts == Path::new(fonts::DEFAULT_DIR) {
+            args.fonts = PathBuf::from("/mnt/onboard/fonts");
+        }
+        args.accounts = args.library.join("accounts");
+        perf!(
+            "device: Kobo {} ({}) firmware {}",
+            identity.model.name(),
+            identity.model.model_code(),
+            identity.firmware.as_deref().unwrap_or("unknown")
+        );
     }
     // Plato opens its fonts and patterns relative to the current directory.
     aristotle_render::use_data_dir(&args.data)?;
@@ -390,10 +431,9 @@ fn run() -> Result<u8, Error> {
         prefs.language = code.clone();
         let _ = prefs.save(&args.library);
     }
-    // Which Kindle this is decides the EPDC update ABI, the touchscreen's
-    // orientation and the page-turn buttons. It is read from the device's
-    // serial number, not guessed.
-    let model = Platform::model().context("can't read the device model")?;
+    // Which device this is decides the EPDC update ABI, the touchscreen's
+    // orientation and the page-turn buttons. Kindles are read from the
+    // serial number; a Kobo was detected above and is never guessed at.
     let panel = Panel::open(prefs.turn_mode).context("can't open the framebuffer")?;
     let (w, h) = panel.size();
     // The framebuffer's rotation, read once at startup: on the Oasis 2 it
@@ -404,7 +444,20 @@ fn run() -> Result<u8, Error> {
     if rotate == 1 || rotate == 3 {
         perf!("input: framebuffer rotate {rotate} is landscape and not supported; read as 0");
     }
-    let mut input = Input::open(model, w, h, rotate).context("can't open the input devices")?;
+    let (mut input, dpi) = match &kobo {
+        Some(identity) => (
+            Input::open_kobo(identity.model, w, h, rotate)
+                .context("can't open the Kobo input devices")?,
+            identity.model.dpi(),
+        ),
+        None => {
+            let model = Platform::model().context("can't read the device model")?;
+            (
+                Input::open(model, w, h, rotate).context("can't open the input devices")?,
+                model.dpi(),
+            )
+        }
+    };
     input.touch_mut().grab(true)?;
     perf!(
         "input: touch {} ({}) rotate {rotate} transform {:?}",
@@ -424,11 +477,25 @@ fn run() -> Result<u8, Error> {
         (None, None) => perf!("input: this model has no page-turn buttons"),
     }
     // Our screensaver replaces the stock one, and powerd's events drive it
-    // (powerd.rs). Put back as found on exit.
-    let sleep_ctl = powerd::Sleep::start().context("can't acquire the screensaver")?;
-    let mut app = build_app(&args, panel, prefs, start_dictionaries(&args), sleep_ctl)?;
+    // (powerd.rs). A Kobo has neither powerd nor LIPC: its first release has
+    // no managed sleep, so the app's own screensaver is used and startup
+    // never waits for a missing Kindle daemon.
+    let sleep_ctl = if kobo.is_some() {
+        powerd::Sleep::none()
+    } else {
+        powerd::Sleep::start().context("can't acquire the screensaver")?
+    };
+    let mut app = build_app(
+        &args,
+        panel,
+        prefs,
+        start_dictionaries(&args),
+        sleep_ctl,
+        dpi,
+    )?;
     perf!("startup: first frame submitted");
     open::warm_up();
+    app.readest_prewarm();
 
     if args.scan {
         if let Err(e) = app.scan(&args.root) {
@@ -506,15 +573,30 @@ fn export_paths(args: &Args) -> ExportPaths {
 /// The app on `panel`, showing the library.
 fn build_app(
     args: &Args,
-    panel: Panel,
+    mut panel: Panel,
     prefs: Prefs,
     dict: Service,
     sleep_ctl: powerd::Sleep,
+    dpi: u16,
 ) -> Result<App, Error> {
     let (w, h) = panel.size();
     aristotle_i18n::set_language(&prefs.language);
-    let profile =
-        ScreenProfile::new(w, h, args.preview_density.dpi()).map_err(|e| format_err!("{e}"))?;
+    let profile = ScreenProfile::new(w, h, dpi).map_err(|e| format_err!("{e}"))?;
+    // The data directory is the current directory by now.
+    let mut ui = Ui::with_screen(
+        Tree::new(),
+        TextEngine::new(ui_fonts(Path::new("serif"), Path::new("fonts"))?),
+        profile,
+    );
+    perf!("startup: UI fonts ready");
+    if let Err(error) = transition::show(
+        &mut panel,
+        &mut ui,
+        aristotle_ui::screens::transition::Stage::Loading,
+        Refresh::Full,
+    ) {
+        eprintln!("aristotle: loading transition: {error:#}");
+    }
     let lib = Library::open(&args.library)?;
     let saver = Saver::new(&args.library);
     perf!(
@@ -530,13 +612,6 @@ fn build_app(
         sort: prefs.sort,
         ..Nav::default()
     };
-    // The data directory is the current directory by now.
-    let ui = Ui::with_screen(
-        Tree::new(),
-        TextEngine::new(ui_fonts(Path::new("serif"), Path::new("fonts"))?),
-        profile,
-    );
-    perf!("startup: UI fonts ready");
     let light = Frontlight::open().ok();
     // When powerd owns sleep it owns the light too, on its own 0..=24 scale
     // (the stock reader's); otherwise the app sets the hardware itself.
@@ -583,6 +658,11 @@ fn build_app(
         battery: Battery::open().ok(),
         mobi_cache: args.library.join("epub-cache"),
         root: args.root.clone(),
+        data: args.data.clone(),
+        ota: ota::State::new(ota::current_version()),
+        ota_generation: 0,
+        ota_busy: false,
+        ota_cancel: None,
         lib,
         saver,
         snapshots: snapshot::Writer::new(&args.library),
@@ -609,6 +689,7 @@ fn build_app(
         sleep_ctl,
         swallow: false,
         dict: Some(dict),
+        translate: None,
         speed: Speed::load(&args.library),
         stats: Stats::new(&args.library),
         exports: export_paths(args),
@@ -619,6 +700,8 @@ fn build_app(
         sync: sync::SyncState::default(),
         readest: readest::ReadestState::new(),
         cloud: cloud::CloudState::default(),
+        jianguoyun: jianguoyun::JianguoyunState::default(),
+        weread: weread::WereadState::new(),
         catalogs: catalogs::CatalogState::default(),
         fonts_dir: args.fonts.clone(),
         font_faces: HashMap::new(),
@@ -645,6 +728,17 @@ fn build_app(
         usb_watch: usb_watch::UsbWatch::new(usb_mode),
         saved_reading: None,
     };
+    if let Err(error) = transition::show(
+        &mut app.panel,
+        &mut app.ui,
+        aristotle_ui::screens::transition::Stage::Ready,
+        Refresh::Auto,
+    ) {
+        eprintln!("aristotle: ready transition: {error:#}");
+    }
+    app.weread.downloads.ensure_loaded(&app.net.paths.state);
+    app.cloud.preload_cache(app.lib.data_dir());
+    app.jianguoyun.preload_cache(app.lib.data_dir());
     app.load_font();
     app.apply_night();
     // The home page is where the reader is expected to land: it holds the
@@ -740,6 +834,29 @@ struct Reading {
     nodes: OverlayNodes,
     /// Page turns since the last full flash, for the refresh interval.
     turns_since_flash: u32,
+    /// Whether the reader explicitly turned a page or jumped since opening.
+    turned: bool,
+    /// The locator at the moment the reader entered this book, used to avoid
+    /// stamping a fresh timestamp or pushing unchanged progress on exit.
+    opened_locator: aristotle_library::Locator,
+    /// Snapshot of local annotations and tombstones when the book opened, so
+    /// annotation edits still flush even if the reader never turned a page.
+    opened_annotations: Vec<aristotle_library::index::Annotation>,
+    opened_tombstones: Vec<aristotle_library::index::AnnotationTombstone>,
+}
+
+/// Whether closing, sleeping, or leaving an open book should stamp a fresh
+/// progress timestamp and overwrite or push reading progress.
+///
+/// Returns `false` when the reader neither turned a page nor moved away from
+/// the locator the book opened on, preventing offline or quick-close opens
+/// from clobbering newer cloud progress via LWW.
+fn should_save_progress(
+    turned: bool,
+    opened: &aristotle_library::Locator,
+    current: &aristotle_library::Locator,
+) -> bool {
+    turned || opened != current
 }
 
 // One screen exists at a time and it is never moved in a hot path, so the
@@ -859,6 +976,21 @@ enum Screen {
     Cloud(Box<ui_cloud::CloudUi>),
     /// Editing one Readest endpoint.
     ReadestEdit(Box<readest::ReadestEditScreen>),
+    /// The WeRead sign-in: a QR code and its state.
+    WereadLogin,
+    /// The WeRead shelf: the account's books, read-only.
+    WereadShelf(Box<ui_weread_shelf::WereadShelfUi>),
+    /// The Nutstore (Jianguoyun) WebDAV shelf.
+    JianguoyunShelf(Box<aristotle_ui::screens::jianguoyun_shelf::JianguoyunShelfUi>),
+    /// The Nutstore (Jianguoyun) WebDAV account setup screen.
+    JianguoyunLogin,
+    /// The software update: what the device has, what the server has, and
+    /// the way from one to the other.
+    Ota {
+        /// The nodes the screen draws.
+        #[allow(dead_code)]
+        view: ui_ota::OtaUi,
+    },
 }
 
 /// Where the page of a feature that is not built yet leads back to.
@@ -1049,6 +1181,19 @@ struct App {
     battery: Option<Battery>,
     mobi_cache: PathBuf,
     root: PathBuf,
+    /// The app's own data folder: the update keeps its packages and its
+    /// handover here, never in the book library.
+    data: PathBuf,
+    /// The software update. It belongs to the app, not to the page: a
+    /// download keeps running when the reader leaves the page.
+    ota: ota::State,
+    /// The number of the run that is under way. A report that carries
+    /// another number is thrown away.
+    ota_generation: u64,
+    /// Whether a run is under way.
+    ota_busy: bool,
+    /// The handle that asks the run under way to stop.
+    ota_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     lib: Library,
     saver: Saver,
     snapshots: snapshot::Writer,
@@ -1096,6 +1241,9 @@ struct App {
     swallow: bool,
     /// Dictionary lookups (a thread of their own).
     dict: Option<Service>,
+    /// Translations (a thread of their own), started when the reader
+    /// asks for one.
+    translate: Option<TranslateService>,
     speed: Speed,
     /// Page stays for the statistics screens and the sync (stats.rs).
     stats: Stats,
@@ -1109,6 +1257,9 @@ struct App {
     readest: readest::ReadestState,
     /// The cloud shelf's book list and download (cloud.rs).
     cloud: cloud::CloudState,
+    jianguoyun: jianguoyun::JianguoyunState,
+    /// The WeRead account, sign-in and shelf (weread.rs).
+    weread: weread::WereadState,
     /// The catalog screens' requests (catalogs.rs).
     catalogs: catalogs::CatalogState,
     /// The user's fonts folder (fonts.rs).
@@ -1442,6 +1593,22 @@ enum Flow {
     Quit,
 }
 
+/// The stage of the update, as the screen shows it.
+fn ota_stage(stage: OtaStage) -> ui_ota::Stage {
+    match stage {
+        OtaStage::Idle => ui_ota::Stage::Idle,
+        OtaStage::Checking => ui_ota::Stage::Checking,
+        OtaStage::Available => ui_ota::Stage::Available,
+        OtaStage::UpToDate => ui_ota::Stage::UpToDate,
+        OtaStage::Downgrade => ui_ota::Stage::Downgrade,
+        OtaStage::Downloading => ui_ota::Stage::Downloading,
+        OtaStage::Verifying => ui_ota::Stage::Verifying,
+        OtaStage::Staging => ui_ota::Stage::Staging,
+        OtaStage::ReadyToApply => ui_ota::Stage::ReadyToApply,
+        OtaStage::Failed => ui_ota::Stage::Failed,
+    }
+}
+
 fn ui_event(ev: &aristotle_hal::input::TouchEvent) -> TouchEvent {
     TouchEvent {
         phase: match ev.phase {
@@ -1596,7 +1763,7 @@ fn opening_label(title: &str) -> String {
 
 /// The line of the status bar for a book laid out again after a change of
 /// typography.
-fn restyle_label() -> String {
+pub(crate) fn restyle_label() -> String {
     tr(Msg::StatusRestyle).to_string()
 }
 
@@ -1751,10 +1918,88 @@ impl App {
     /// Switches to another section of the app.
     fn switch_section(&mut self, tab: ui_nav::Tab) -> Result<(), Error> {
         self.cancel_cloud_on_leave();
+        self.weread.cancel_login();
         match tab {
             ui_nav::Tab::Home => self.show_home(Refresh::Full),
             ui_nav::Tab::Library => self.show_library(Refresh::Full),
             ui_nav::Tab::Mine => self.show_mine(Refresh::Full),
+        }
+    }
+
+    /// Which cloud channels are enabled in Settings for the segmented control.
+    pub(crate) fn channel_visibility(&self) -> ui_lib::ChannelVisibility {
+        ui_lib::ChannelVisibility {
+            readest: self.prefs.enable_readest,
+            weread: self.prefs.enable_weread,
+            jianguoyun: self.prefs.enable_jianguoyun,
+        }
+    }
+
+    /// Origin channels resolved from downloaded/synced channel stores so
+    /// books keep their true WeRead/Jianguoyun/Readest/Local badges regardless of folder.
+    pub(crate) fn channel_sources(&self) -> crate::shelf::ChannelSources {
+        crate::shelf::ChannelSources {
+            weread_hashes: self.weread.downloads.known_hashes(),
+            jianguoyun_hashes: self.jianguoyun.channel_hashes.clone(),
+            readest_hashes: self.cloud.channel_hashes.clone(),
+        }
+    }
+
+    /// Origin channel tag (`WeRead`, `Jianguoyun`, `Readest`, or `Local`) for `book_id`,
+    /// matching the badge resolution used on Home and Library shelves.
+    pub(crate) fn book_source(&self, book_id: &str) -> ui_lib::BookSource {
+        if self.is_weread_book(book_id) {
+            return ui_lib::BookSource::WeRead;
+        }
+        if let Some(rec) = self.lib.book(book_id) {
+            return self.channel_sources().resolve(rec);
+        }
+        let lower = book_id.to_ascii_lowercase();
+        if self.jianguoyun.channel_hashes.contains(&lower) {
+            ui_lib::BookSource::Jianguoyun
+        } else if self.cloud.channel_hashes.contains(&lower) {
+            ui_lib::BookSource::Readest
+        } else {
+            ui_lib::BookSource::Local
+        }
+    }
+
+    /// Which cloud sync controls (`(show_readest, show_weread)`) belong in the
+    /// reader menu for `book_id`, determined by the book's channel source tag
+    /// and Settings toggles.
+    pub(crate) fn reader_sync_channels(&self, book_id: &str) -> (bool, bool) {
+        let ch = self.reader_sync_channels_all(book_id);
+        (ch.readest, ch.weread)
+    }
+
+    /// All three cloud sync channels (`readest`, `weread`, `jianguoyun`) for
+    /// `book_id` in the reader menu:
+    /// - WeRead books show only WeRead pull/push (when WeRead is enabled).
+    /// - Jianguoyun books show only Jianguoyun pull/push (when Jianguoyun is enabled).
+    /// - Readest books show only Readest pull/push (when Readest is enabled).
+    /// - Local books show Readest (when enabled) and Jianguoyun (when enabled and configured).
+    pub(crate) fn reader_sync_channels_all(&self, book_id: &str) -> ui_reader::ReaderSyncChannels {
+        match self.book_source(book_id) {
+            ui_lib::BookSource::WeRead => ui_reader::ReaderSyncChannels {
+                readest: false,
+                weread: self.prefs.enable_weread,
+                jianguoyun: false,
+            },
+            ui_lib::BookSource::Jianguoyun => ui_reader::ReaderSyncChannels {
+                readest: false,
+                weread: false,
+                jianguoyun: self.prefs.enable_jianguoyun && self.jianguoyun_configured(),
+            },
+            ui_lib::BookSource::Readest => ui_reader::ReaderSyncChannels {
+                readest: self.prefs.enable_readest,
+                weread: false,
+                jianguoyun: false,
+            },
+            ui_lib::BookSource::Local => ui_reader::ReaderSyncChannels {
+                readest: self.prefs.enable_readest,
+                weread: false,
+                jianguoyun: self.prefs.enable_jianguoyun && self.jianguoyun_configured(),
+            },
         }
     }
 
@@ -1766,7 +2011,8 @@ impl App {
     /// The home screen, on the page of the books opened lately.
     fn show_home_at(&mut self, refresh: Refresh, page: usize) -> Result<(), Error> {
         let t0 = Instant::now();
-        let mut model = HomeModel::build(&self.lib, &mut self.covers);
+        let sources = self.channel_sources();
+        let mut model = HomeModel::build_with_sources(&self.lib, &mut self.covers, &sources);
         let facts = Facts::status(&self.battery);
         // The statistics of today are read once, here, from the file of
         // this month. Nothing on the home screen keeps them alive.
@@ -1821,8 +2067,9 @@ impl App {
             quote,
             pet: self.prefs.home_pet,
         };
-        let screen_w = self.ui.bounds().w;
-        let (tree, view) = ui_home::HomeUi::build(&mut self.ui.text, &self.styles, &home, screen_w);
+        let screen_size = self.ui.bounds().size();
+        let (tree, view) =
+            ui_home::HomeUi::build_for_size(&mut self.ui.text, &self.styles, &home, screen_size);
         self.ui.set_tree_with(tree, refresh);
         self.ui.layout();
         if page > 0 {
@@ -1868,7 +2115,13 @@ impl App {
             streak,
             entries: self.library_entries(),
         };
-        let (tree, _view) = ui_mine::MineUi::build(&mut self.ui.text, &self.styles, &mine);
+        let bounds = self.ui.bounds();
+        let (tree, _view) = ui_mine::MineUi::build_for_size(
+            &mut self.ui.text,
+            &self.styles,
+            &mine,
+            aristotle_ui::geom::Size::new(bounds.w, bounds.h),
+        );
         self.ui.set_tree_with(tree, refresh);
         self.ui.layout();
         self.section = ui_nav::Tab::Mine;
@@ -1956,7 +2209,9 @@ impl App {
             can_prev: month > earliest,
             can_next: month < current,
         };
-        let (tree, _view) = ui_cal::CalendarUi::build(&mut self.ui.text, &self.styles, &cal);
+        let screen_size = self.ui.bounds().size();
+        let (tree, _view) =
+            ui_cal::CalendarUi::build_for_size(&mut self.ui.text, &self.styles, &cal, screen_size);
         self.ui.set_tree_with(tree, refresh);
         self.ui.layout();
         let old = std::mem::replace(
@@ -2270,7 +2525,9 @@ impl App {
             .as_ref()
             .is_some_and(|firewall| firewall.is_open());
         let model = wifi_model(&facts, address, &state, self.wifi.is_some(), firewall_open);
-        let (tree, view) = ui_wifi::WifiUi::build(&mut self.ui.text, &self.styles, &model);
+        let screen_size = self.ui.bounds().size();
+        let (tree, view) =
+            ui_wifi::WifiUi::build_for_size(&mut self.ui.text, &self.styles, &model, screen_size);
         self.ui.set_tree_with(tree, refresh);
         self.ui.layout();
         let old = std::mem::replace(
@@ -2546,8 +2803,13 @@ impl App {
             confirm_delete,
         };
 
-        let (tree, _view) =
-            ui_quotes::QuoteUi::build(&mut self.ui.text, &self.styles, &screen_data);
+        let screen_size = self.ui.bounds().size();
+        let (tree, _view) = ui_quotes::QuoteUi::build_for_size(
+            &mut self.ui.text,
+            &self.styles,
+            &screen_data,
+            screen_size,
+        );
         self.ui.set_tree_with(tree, refresh);
         self.ui.layout();
         let old = std::mem::replace(&mut self.screen, Screen::QuoteLibrary { tab, page });
@@ -2637,6 +2899,217 @@ impl App {
         submitted
     }
 
+    // --- Software update --------------------------------------------------
+
+    /// The software update page: the version that is installed, the one on
+    /// the server, and the way from one to the other.
+    fn show_ota(&mut self, refresh: Refresh) -> Result<(), Error> {
+        let facts = Facts::read(&self.battery, &self.root);
+        let view = ui_ota::Ota {
+            status: facts.status_line(),
+            current_version: self.ota.current_version.clone(),
+            remote_version: self.ota.remote_version.clone(),
+            stage: ota_stage(self.ota.stage),
+            percent: self.ota.percent,
+            downloaded_bytes: self.ota.downloaded_bytes,
+            total_bytes: self.ota.total_bytes,
+            message: self.ota.message.clone(),
+        };
+        let (tree, ids) = ui_ota::OtaUi::build(&mut self.ui.text, &self.styles, &view);
+        self.ui.set_tree_with(tree, refresh);
+        self.ui.layout();
+        let old = std::mem::replace(&mut self.screen, Screen::Ota { view: ids });
+        let submitted = self.render_ui();
+        drop(old);
+        submitted
+    }
+
+    /// The number of the run that starts now.
+    ///
+    /// Every run carries its number, so the report of a run that was given
+    /// up on never lands on the screen of the run that replaced it.
+    fn next_ota_generation(&mut self) -> u64 {
+        self.ota_generation = self.ota_generation.wrapping_add(1);
+        self.ota_generation
+    }
+
+    /// Asks the update under way to stop.
+    ///
+    /// The handle is shared with the worker, so the download stops at the
+    /// next chunk instead of at the end of the package.
+    fn cancel_ota(&mut self) {
+        if let Some(cancel) = self.ota_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.ota_busy = false;
+    }
+
+    /// The update failed: the page says so.
+    fn set_ota_error(&mut self, message: &str) {
+        self.ota.stage = OtaStage::Failed;
+        self.ota.message = Some(message.to_string());
+    }
+
+    /// The software update page: the button that does the next step, and the
+    /// way back.
+    fn on_ota_event(&mut self, ev: UiEvent) -> Result<Flow, Error> {
+        use ui_ota::action as a;
+        let UiEvent::Action { id, .. } = ev else {
+            return Ok(Flow::Continue);
+        };
+        match id {
+            a::BACK => self.show_mine(Refresh::Full)?,
+            a::PRIMARY => match self.ota.stage {
+                OtaStage::Available => self.start_ota_download()?,
+                OtaStage::ReadyToApply => return self.apply_ota(),
+                _ => self.start_ota_check()?,
+            },
+            _ => {}
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Looks for a release of this device.
+    fn start_ota_check(&mut self) -> Result<(), Error> {
+        // One update at a time: two workers would write the same file.
+        if self.ota_busy {
+            return Ok(());
+        }
+        let Some((code, firmware)) = ota::device() else {
+            self.set_ota_error("the device does not say which model it is");
+            return self.show_ota(Refresh::Full);
+        };
+        self.cancel_ota();
+        self.ota.stage = OtaStage::Checking;
+        self.ota.message = None;
+        self.show_ota(Refresh::Full)?;
+        let client = Client::new(crate::net::Net::policy(), ota::timeouts());
+        let dir = ota::ota_dir(&self.data);
+        let version = ota::current_version();
+        let generation = self.next_ota_generation();
+        let cancel = ota::cancel_handle();
+        self.ota_cancel = Some(cancel.clone());
+        self.ota_busy = true;
+        self.net.spawn("ota-check", move |tx| {
+            ota::spawn(
+                tx, generation, client, code, firmware, dir, None, version, cancel, true,
+            )
+        });
+        Ok(())
+    }
+
+    /// Brings the package of the release in.
+    fn start_ota_download(&mut self) -> Result<(), Error> {
+        if self.ota_busy {
+            return Ok(());
+        }
+        let Some(manifest) = self.ota.manifest.clone() else {
+            self.set_ota_error("there is no release to download");
+            return self.show_ota(Refresh::Full);
+        };
+        self.cancel_ota();
+        self.ota.stage = OtaStage::Downloading;
+        self.ota.message = None;
+        self.ota.percent = 0;
+        self.ota.downloaded_bytes = 0;
+        self.show_ota(Refresh::Full)?;
+        let client = Client::new(crate::net::Net::policy(), ota::timeouts());
+        let dir = ota::ota_dir(&self.data);
+        let version = ota::current_version();
+        let generation = self.next_ota_generation();
+        let cancel = ota::cancel_handle();
+        self.ota_cancel = Some(cancel.clone());
+        self.ota_busy = true;
+        self.net.spawn("ota-download", move |tx| {
+            ota::spawn(
+                tx,
+                generation,
+                client,
+                String::new(),
+                String::new(),
+                dir,
+                Some(manifest),
+                version,
+                cancel,
+                false,
+            )
+        });
+        Ok(())
+    }
+
+    /// Hands the package to the device's updater and stops.
+    ///
+    /// The reader never replaces its own files while it runs: it writes the
+    /// handover and leaves, and the updater does the swap outside it.
+    fn apply_ota(&mut self) -> Result<Flow, Error> {
+        let Some((manifest, package)) = self.ota.manifest.clone().zip(self.ota.package.clone())
+        else {
+            return Ok(Flow::Continue);
+        };
+        let dir = ota::ota_dir(&self.data);
+        if let Err(e) = ota::write_handover(&dir, &manifest, &package) {
+            self.set_ota_error(&format!("the handover could not be written: {e}"));
+            self.show_ota(Refresh::Full)?;
+            return Ok(Flow::Continue);
+        }
+        Ok(Flow::Quit)
+    }
+
+    /// What the update worker reports.
+    fn on_ota_report(&mut self, generation: u64, report: ota::Report) -> Result<(), Error> {
+        // A report of a run that was given up on does not belong here.
+        if generation != self.ota_generation {
+            return Ok(());
+        }
+        let open = matches!(self.screen, Screen::Ota { .. });
+        match report {
+            ota::Report::Progress(progress) => {
+                let previous = self.ota.clone();
+                self.ota.apply(progress);
+                if self.ota.worth_drawing(&previous) && open {
+                    self.show_ota(Refresh::Auto)?;
+                }
+            }
+            ota::Report::Checked(result) => {
+                self.ota_busy = false;
+                self.ota_cancel = None;
+                match result {
+                    Ok((check, manifest)) => {
+                        let version = manifest.version.clone();
+                        self.ota.remote_version = Some(version);
+                        self.ota.manifest = Some(manifest);
+                        self.ota.stage = match check {
+                            ota::Check::Available => OtaStage::Available,
+                            ota::Check::UpToDate => OtaStage::UpToDate,
+                            ota::Check::Downgrade => OtaStage::Downgrade,
+                        };
+                        self.ota.message = None;
+                    }
+                    Err(e) => self.set_ota_error(&e),
+                }
+                if open {
+                    self.show_ota(Refresh::Full)?;
+                }
+            }
+            ota::Report::Verified(result) => {
+                self.ota_busy = false;
+                self.ota_cancel = None;
+                match result {
+                    Ok(path) => {
+                        self.ota.package = Some(path);
+                        self.ota.stage = OtaStage::ReadyToApply;
+                        self.ota.percent = 100;
+                    }
+                    Err(e) => self.set_ota_error(&e),
+                }
+                if open {
+                    self.show_ota(Refresh::Full)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // --- Library ----------------------------------------------------------
 
     fn show_library(&mut self, refresh: Refresh) -> Result<(), Error> {
@@ -2660,14 +3133,17 @@ impl App {
         let t0 = Instant::now();
         let mode = self.prefs.covers.mode();
         let layout = self.prefs.library_layout.mode();
-        let model = ShelfModel::build(&self.lib, &self.nav, layout);
+        let sources = self.channel_sources();
+        let model = ShelfModel::build_with_sources(&self.lib, &self.nav, layout, &sources);
         let facts = Facts::status(&self.battery);
-        let width = self.ui.bounds().w;
-        let (tree, view) = ui_lib::Library::build_shelf_for_width(
+        let bounds = self.ui.bounds();
+        let channels = self.channel_visibility();
+        let (tree, view) = ui_lib::Library::build_shelf_with_channels(
             &mut self.ui.text,
             &self.styles,
             &model.shelf(facts.status_line(), mode),
-            width,
+            aristotle_ui::geom::Size::new(bounds.w, bounds.h),
+            channels,
         );
         self.ui.set_tree_with(tree, refresh);
         self.ui.layout();
@@ -2695,6 +3171,14 @@ impl App {
             Screen::Settings { ids: Some(ids), .. } => self.ui.tree.page(ids.list).0,
             Screen::Network(ns) => ns.frame.as_ref().map_or(0, |f| self.ui.tree.page(f.list).0),
             Screen::Cloud(view) => self.ui.tree.page(view.list).0,
+            Screen::WereadShelf(view) => view.page,
+            Screen::JianguoyunShelf(view) => {
+                if view.list == NodeId(0) {
+                    0
+                } else {
+                    self.ui.tree.page(view.list).0
+                }
+            }
             _ => 0,
         }
     }
@@ -2850,7 +3334,15 @@ impl App {
             state: state.clone(),
             local_books_count: self.lib.books().len(),
         };
-        let (tree, view) = ui_scan::ScanUi::build(&mut self.ui.text, &self.styles, &screen_model);
+        let screen_size = self.ui.bounds().size();
+        let channels = self.channel_visibility();
+        let (tree, view) = ui_scan::ScanUi::build_with_channels_for_size(
+            &mut self.ui.text,
+            &self.styles,
+            &screen_model,
+            channels,
+            screen_size,
+        );
         self.ui.set_tree_with(tree, refresh);
         self.ui.layout();
         self.section = ui_nav::Tab::Library;
@@ -3278,7 +3770,9 @@ impl App {
                         // The scan ran on a copy of the index; fold it into
                         // the one the reader has been using (FIX-106).
                         self.lib.absorb_scan(scanned);
+                        self.seed_cloud_progress_into_library();
                         self.saver.save(&self.lib);
+                        self.weread_open_pending()?;
                         perf!(
                             "scan: folded in ({} updated, {} restored, {} removed, {} waiting)",
                             report.updated,
@@ -3288,9 +3782,13 @@ impl App {
                         );
                         self.covers_fill = None;
                         self.covers_fill_started = false;
+                        self.jianguoyun.indexing.clear();
                         if matches!(self.screen, Screen::Cloud(_)) {
                             let page = self.list_page();
                             self.show_cloud(Refresh::Auto, page)?;
+                        } else if matches!(self.screen, Screen::JianguoyunShelf(_)) {
+                            let page = self.list_page();
+                            self.show_jianguoyun_shelf(Refresh::Auto, page)?;
                         }
                     }
                     _ => {
@@ -3471,7 +3969,9 @@ impl App {
             .book(book_id)
             .cloned()
             .ok_or_else(|| format_err!("no book {book_id} in the library"))?;
-        let book = crate::shelf::screen_book(&self.lib, &rec, &mut self.covers);
+        let sources = self.channel_sources();
+        let book =
+            crate::shelf::screen_book_with_sources(&self.lib, &rec, &mut self.covers, &sources);
         // The statistics are read once, here: how long the book has been
         // read, and the day it was opened the first time.
         let store = crate::stats::Store::new(self.lib.data_dir());
@@ -3715,6 +4215,10 @@ impl App {
             script_index: 0,
             gap_index: self.prefs.cjk_gap.min(2),
             underline_index: self.prefs.underline.min(2),
+            underline_scope: self.prefs.underline_scope.min(1),
+            fine_typesetting: self.prefs.fine_typesetting,
+            font_weight: self.prefs.font_weight,
+            writing_mode: self.prefs.writing_mode.min(1),
             trim_index: 0,
             anim_enabled: false,
             anim_speed: 1,
@@ -3728,7 +4232,14 @@ impl App {
         settings_page: usize,
     ) -> Result<(), Error> {
         let mut tree = Tree::new();
-        let (root, _ids) = ui_typeset::build_typeset_screen(&mut tree, &self.styles, &view);
+        let size = self.ui.bounds().size();
+        let (root, _ids) = ui_typeset::build_typeset_screen_for_size(
+            &mut tree,
+            &mut self.ui.text,
+            &self.styles,
+            &view,
+            size,
+        );
         tree.set_root(root);
         self.ui.set_tree_with(tree, refresh);
         self.ui.layout();
@@ -3833,6 +4344,14 @@ impl App {
                     prefs_changed = true;
                 }
             }
+            i if (a::WRITING_MODE_BASE..a::WRITING_MODE_BASE + 2).contains(&i) => {
+                let mode = (i - a::WRITING_MODE_BASE) as usize;
+                if mode != view.writing_mode {
+                    view.writing_mode = mode;
+                    self.prefs.writing_mode = mode;
+                    prefs_changed = true;
+                }
+            }
             i if (a::UNDERLINE_BASE..a::UNDERLINE_BASE + 3).contains(&i) => {
                 let idx = (i - a::UNDERLINE_BASE) as usize;
                 if idx < 3 {
@@ -3840,6 +4359,33 @@ impl App {
                     self.prefs.underline = idx;
                     prefs_changed = true;
                 }
+            }
+            i if (a::UNDERLINE_SCOPE_BASE..a::UNDERLINE_SCOPE_BASE + 2).contains(&i) => {
+                let idx = (i - a::UNDERLINE_SCOPE_BASE) as usize;
+                if idx < ui_typeset::UNDERLINE_SCOPE_RANGE {
+                    view.underline_scope = idx;
+                    self.prefs.underline_scope = idx;
+                    prefs_changed = true;
+                }
+            }
+            i if (a::FINE_BASE..a::FINE_BASE + 2).contains(&i) => {
+                view.fine_typesetting = i == a::FINE_BASE;
+                self.prefs.fine_typesetting = view.fine_typesetting;
+                prefs_changed = true;
+            }
+            i if (a::WEIGHT_BASE..a::WEIGHT_DOWN).contains(&i) => {
+                let Some(&weight) = ui_typeset::WEIGHT_PRESETS.get((i - a::WEIGHT_BASE) as usize)
+                else {
+                    return Ok(Flow::Continue);
+                };
+                view.font_weight = weight;
+                self.prefs.font_weight = weight;
+                prefs_changed = true;
+            }
+            a::WEIGHT_DOWN | a::WEIGHT_UP => {
+                view.font_weight = ui_typeset::weight_stepped(view.font_weight, id == a::WEIGHT_UP);
+                self.prefs.font_weight = view.font_weight;
+                prefs_changed = true;
             }
             _ => {}
         }
@@ -3869,6 +4415,11 @@ impl App {
             .light
             .as_ref()
             .map(|l| (l.step().unwrap_or(0), LIGHT_STEPS));
+        let readtime_note = self.weread_readtime_note();
+        let weread_notes = {
+            let (books, highlights, thoughts) = self.weread_notes_summary();
+            (books + highlights + thoughts > 0).then_some((books, highlights, thoughts))
+        };
         let font_label = ui_typeset::display_font_name(self.prefs.font_cjk_in_use());
         let wifi_transfer_label = if self.prefs.language == "zh" {
             "未开启"
@@ -3904,6 +4455,22 @@ impl App {
             refresh_interval: self.prefs.refresh_interval as usize,
             wifi_transfer: wifi_transfer_label,
             account: self.net.accounts.readest.as_ref().map(|r| r.email.as_str()),
+            enable_readest: self.prefs.enable_readest,
+            enable_weread: self.prefs.enable_weread,
+            enable_jianguoyun: self.prefs.enable_jianguoyun,
+            jianguoyun_account: self
+                .net
+                .accounts
+                .jianguoyun
+                .as_ref()
+                .map(|j| j.username.as_str()),
+            weread_readtime: self.prefs.weread_readtime,
+            weread_readtime_note: readtime_note
+                .as_ref()
+                .map(|(note, resume)| (note.as_str(), *resume)),
+            weread_notes: weread_notes.map(|(books, highlights, thoughts)| {
+                (books as u32, highlights as u32, thoughts as u32)
+            }),
         };
         let (tree, ids) = set_ui::Settings::build(&mut self.ui.text, &self.styles, &view);
         self.ui.set_tree_with(tree, refresh);
@@ -3970,7 +4537,8 @@ impl App {
             page,
             pages,
         };
-        let (tree, _ids) = ui_sleep_images::build(&self.styles, &view, self.ui.bounds().w);
+        let (tree, _ids) =
+            ui_sleep_images::build_for_size(&self.styles, &view, self.ui.bounds().size());
         self.ui.set_tree_with(tree, refresh);
         self.ui.layout();
         self.screen = Screen::SleepImages { pictures, page };
@@ -4237,6 +4805,52 @@ impl App {
                     .show_wifi_transfer(Refresh::Full, SoonBack::Settings { page })
                     .map(|_| Flow::Continue);
             }
+            a::ENABLE_READEST => {
+                self.prefs.enable_readest = !self.prefs.enable_readest;
+                let _ = self.prefs.save(self.lib.data_dir());
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::ENABLE_WEREAD => {
+                self.prefs.enable_weread = !self.prefs.enable_weread;
+                let _ = self.prefs.save(self.lib.data_dir());
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::ENABLE_JIANGUOYUN => {
+                self.prefs.enable_jianguoyun = !self.prefs.enable_jianguoyun;
+                let _ = self.prefs.save(self.lib.data_dir());
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
+            // The account row opens what the state calls for: the shelf when
+            // an account is set up (where "set up" reopens the form), the
+            // setup screen when there is none.
+            a::JIANGUOYUN_ACCOUNT => {
+                return self.open_jianguoyun().map(|_| Flow::Continue);
+            }
+            a::WEREAD_READTIME => {
+                let enabled = !self.prefs.weread_readtime;
+                self.set_weread_readtime(enabled);
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::WEREAD_READTIME_RESUME => {
+                self.resume_weread_readtime();
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::WEREAD_NOTES_CLEAR => {
+                self.weread_notes_clear();
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
             a::USB => {
                 let storage = match system::usb_mode() {
                     Some(system::UsbMode::Storage { .. }) => false,
@@ -4317,15 +4931,21 @@ impl App {
         if let Screen::Reader(r) = &mut self.screen {
             r.gestures.reset();
         }
-        if let Screen::Reader(r) = &self.screen {
-            let now = aristotle_library::library::now();
-            self.lib
-                .set_progress(&r.session.id, r.session.progress(now));
-        }
+        let (push_progress, push_readest) = self.save_reader_progress_on_exit();
+        self.weread_web_book_close_blocking();
+        self.weread_readtime_sleep();
         // Push while the radio is still up. Each push has a short timeout and
         // a failure is queued, so a dead network cannot hold the sleep.
-        self.sync_push(false, true);
-        self.readest_push(false, true);
+        if push_progress {
+            self.sync_push(false, true);
+        }
+        if push_readest {
+            self.readest_push(false, true);
+        }
+        if let Screen::Reader(r) = &self.screen {
+            let book_id = r.session.id.clone();
+            self.jianguoyun_auto_push_on_sleep(&book_id);
+        }
         // The device is going to sleep: nothing listens on the network now.
         self.stop_wifi();
         self.save_snapshot();
@@ -4409,8 +5029,10 @@ impl App {
             return self.submit_ui(Content::Chrome);
         }
         let book_rec = shelf::current_book(&self.lib).cloned();
+        let sources = self.channel_sources();
         let book = book_rec.as_ref().map(|rec| {
-            let mut book = shelf::screen_book(&self.lib, rec, &mut self.covers);
+            let mut book =
+                shelf::screen_book_with_sources(&self.lib, rec, &mut self.covers, &sources);
             // The screensaver shows one book large: its own cover at the
             // size of the sleep screen, made from the book the first time.
             book.cover = self.covers.get_large(&self.lib, rec);
@@ -4493,6 +5115,8 @@ impl App {
         }
         self.last_touch = Instant::now();
         self.sleep_ctl.awake(by_powerd, self.last_touch);
+        self.weread_web_resume();
+        self.weread_readtime_wake();
         self.prewarm.input();
         perf!(
             "sleep: woken ({})",
@@ -4514,6 +5138,7 @@ impl App {
             Screen::Search { .. } => self.show_search(refresh),
             Screen::Mine => self.show_mine(refresh),
             Screen::About => self.show_about(refresh),
+            Screen::Ota { .. } => self.show_ota(refresh),
             Screen::ComingSoon { title, back } => {
                 let title = title.clone();
                 self.show_coming_soon(refresh, &title, *back)
@@ -4587,6 +5212,16 @@ impl App {
                 let page = self.list_page();
                 self.show_cloud(refresh, page)
             }
+            Screen::WereadLogin => self.show_weread_login(refresh),
+            Screen::WereadShelf(_) => {
+                let page = self.list_page();
+                self.show_weread_shelf(refresh, page)
+            }
+            Screen::JianguoyunLogin => self.show_jianguoyun_login(refresh),
+            Screen::JianguoyunShelf(_) => {
+                let page = self.list_page();
+                self.show_jianguoyun_shelf(refresh, page)
+            }
         }
     }
 
@@ -4598,7 +5233,10 @@ impl App {
         let Some(watch) = self.startup_watch else {
             return Ok(());
         };
-        if self.asleep.is_some() || Instant::now() >= watch.until {
+        if self.asleep.is_some()
+            || matches!(self.screen, Screen::Reader(_) | Screen::Opening)
+            || Instant::now() >= watch.until
+        {
             self.startup_watch = None;
             return Ok(());
         }
@@ -4731,11 +5369,6 @@ impl App {
                 Err(e) => return Err(e.into()),
             };
             wake::drain();
-            // Input means the reader is looking at the screen: stop
-            // repairing the first frame under their hands.
-            if !events.touch.is_empty() || !events.keys.is_empty() {
-                self.startup_watch = None;
-            }
             for ev in &events.touch {
                 if self.on_touch(ev)? == Flow::Quit {
                     return Ok(());
@@ -4749,8 +5382,6 @@ impl App {
             if let Err(e) = self.on_power(Some(input)) {
                 eprintln!("aristotle: error handling power/usb event: {e}");
             }
-            self.watch_startup()?;
-
             // Item 5 / Review 3: Fallback bidirectional reconciliation between UsbMode and
             // volumd state. The lipc queries run in `usb_watch`'s thread, which wakes this
             // poll only when a powerd event was missed; nothing here waits for volumd.
@@ -4781,6 +5412,7 @@ impl App {
                     self.render_ui()?;
                 }
             }
+            self.watch_startup()?;
             self.panel.poll();
             if self.usb_mode != UsbMode::DriveMode {
                 self.background()?;
@@ -4875,15 +5507,15 @@ impl App {
                     r.gestures.reset();
                 }
 
-                // 2. Set current reading progress in library (in memory):
-                if let Screen::Reader(r) = &self.screen {
-                    let now = aristotle_library::library::now();
-                    self.lib
-                        .set_progress(&r.session.id, r.session.progress(now));
-                }
+                // 2. Set current reading progress in library (in memory) only if moved:
+                let (push_progress, push_readest) = self.save_reader_progress_on_exit();
                 // Push before the radio stops; failures are queued.
-                self.sync_push(false, true);
-                self.readest_push(false, true);
+                if push_progress {
+                    self.sync_push(false, true);
+                }
+                if push_readest {
+                    self.readest_push(false, true);
+                }
                 self.stop_wifi();
 
                 // Only perform disk writes if userstore (/mnt/us) is still available (Review 1 & 2):
@@ -4908,6 +5540,7 @@ impl App {
                     self.speed.save();
                     self.stats.finish_page(Instant::now());
                     self.stats.flush();
+                    self.weread_readtime_sleep();
                 } else {
                     perf!(
                         "usb: userstore already unavailable; skipping disk writes, keeping progress in memory"
@@ -4976,7 +5609,12 @@ impl App {
             | Screen::ReadestLogin(_)
             | Screen::ReadestStatus
             | Screen::ReadestEdit(_)
-            | Screen::Cloud(_) => true,
+            | Screen::Cloud(_)
+            | Screen::WereadLogin
+            | Screen::Ota { .. }
+            | Screen::WereadShelf(_)
+            | Screen::JianguoyunLogin
+            | Screen::JianguoyunShelf(_) => true,
             Screen::Reader(r) => r.menu_open || !r.overlay.is_none(),
             Screen::Opening => self.opening.as_ref().is_some_and(|o| o.menu_open),
         }
@@ -5009,7 +5647,12 @@ impl App {
         // comes back.
         self.poll_restyle()?;
         self.poll_lookup()?;
+        self.poll_translate()?;
         self.poll_net()?;
+        self.poll_weread()?;
+        self.poll_weread_web()?;
+        self.poll_weread_readtime();
+        self.poll_weread_notes()?;
         self.poll_scan()?;
         self.poll_covers()?;
         self.poll_wifi()?;
@@ -5122,7 +5765,7 @@ impl App {
     }
 
     /// The progress bar of the reader, with the line of text beside it.
-    fn show_formatting_progress(
+    pub(crate) fn show_formatting_progress(
         &mut self,
         nodes: ProgressNodes,
         label: &str,
@@ -5179,7 +5822,7 @@ impl App {
         Ok(())
     }
 
-    fn hide_formatting_progress(&mut self) -> Result<(), Error> {
+    pub(crate) fn hide_formatting_progress(&mut self) -> Result<(), Error> {
         let nodes = if let Some(o) = &self.opening {
             Some(o.progress)
         } else if let Screen::Reader(r) = &self.screen {
@@ -5256,7 +5899,13 @@ impl App {
             Key::PageBack => Turn::Back,
         };
         if let Screen::Reader(r) = &mut self.screen {
-            if r.menu_open || !r.overlay.is_none() || r.gestures.holding() {
+            if r.menu_open || r.gestures.holding() {
+                return Ok(Flow::Continue);
+            }
+            if !r.overlay.is_none() {
+                // An overlay is up: the contents list takes the keys and
+                // turns its own pages with them, never the book's.
+                self.toc_page_key(dir)?;
                 return Ok(Flow::Continue);
             }
         } else if let Screen::Settings { ids: Some(ids), .. } = &mut self.screen {
@@ -5342,6 +5991,7 @@ impl App {
             Screen::Calendar { .. } => self.on_calendar_event(ev),
             Screen::BookStats { .. } => self.on_book_stats_event(ev),
             Screen::About => self.on_about_event(ev),
+            Screen::Ota { .. } => self.on_ota_event(ev),
             Screen::ComingSoon { .. } => self.on_coming_soon_event(ev),
             Screen::Library { .. } => self.on_library_event(ev),
             Screen::Search { .. } => self.on_search_event(ev),
@@ -5358,6 +6008,10 @@ impl App {
             Screen::ReadestStatus => self.on_readest_status_event(ev),
             Screen::ReadestEdit(_) => self.on_readest_edit_event(ev),
             Screen::Cloud(_) => self.on_cloud_event(ev),
+            Screen::WereadLogin => self.on_weread_login_event(ev),
+            Screen::WereadShelf(_) => self.on_weread_shelf_event(ev),
+            Screen::JianguoyunLogin => self.on_jianguoyun_login_event(ev),
+            Screen::JianguoyunShelf(_) => self.on_jianguoyun_shelf_event(ev),
             Screen::Reader(_) => {
                 if self.reader_event_needs_book(&ev) {
                     self.settle_restyle()?;
@@ -5502,6 +6156,7 @@ impl App {
                 );
             }
             a::ABOUT => self.show_about(Refresh::Full)?,
+            a::ENTRY_OTA => self.show_ota(Refresh::Full)?,
             // The features the prototype links to are not built yet: they
             // open the page that says so.
             a::CALENDAR | a::STATS_CALENDAR | a::ENTRY_CALENDAR => {
@@ -6351,6 +7006,12 @@ impl App {
             a::CLOUD_LIBRARY => {
                 self.open_cloud()?;
             }
+            a::WEREAD_LIBRARY => {
+                self.open_weread()?;
+            }
+            a::JIANGUOYUN_LIBRARY => {
+                self.open_jianguoyun()?;
+            }
             a::CANCEL_SCAN => {
                 self.cancel_scan()?;
             }
@@ -6444,6 +7105,12 @@ impl App {
                 a::CLOUD_LIBRARY => {
                     self.open_cloud()?;
                 }
+                a::WEREAD_LIBRARY => {
+                    self.open_weread()?;
+                }
+                a::JIANGUOYUN_LIBRARY => {
+                    self.open_jianguoyun()?;
+                }
                 a::SCAN => {
                     // The sources are chosen first, and kept for the next
                     // scan; the destination stays as it was.
@@ -6519,13 +7186,14 @@ impl App {
     }
 
     fn show_search(&mut self, refresh: Refresh) -> Result<(), Error> {
+        let sources = self.channel_sources();
         let books_records = self.lib.books();
         // The index needs titles and authors only: the thumbnails are read
         // for the few results the screen draws, not for the whole library.
         let mut ui_books = Vec::with_capacity(books_records.len());
         let mut book_ids = Vec::with_capacity(books_records.len());
         for rec in books_records {
-            ui_books.push(crate::shelf::screen_book_plain(rec));
+            ui_books.push(crate::shelf::screen_book_plain_with_sources(rec, &sources));
             book_ids.push(rec.id.clone());
         }
         let facts = Facts::status(&self.battery);
@@ -6676,7 +7344,16 @@ impl App {
                 return Ok(());
             }
         };
-        src.jump = jump;
+        self.weread_notes_enter_book(&rec.id);
+        // The cached cloud highlights are placed before the first page is
+        // laid out, so opening a book needs no second render for them.
+        for (index, start, end) in self.weread_notes_positions(&rec.id) {
+            src.marks.push((index, start, end));
+            src.mark_versions.push(None);
+        }
+        src.jump = jump.or_else(|| self.weread.take_open_jump(&rec.id));
+        self.weread_web_book_open(&rec.id);
+        self.jianguoyun_auto_pull_on_open(&rec.id);
         let jumping = src.jump.is_some();
         if !jumping {
             if let Some(snap) = open::find_snapshot(&src, &style) {
@@ -6769,6 +7446,22 @@ impl App {
         self.set_loading(LoadingSource::Opening, None);
     }
 
+    /// Give a book that just opened the reader's guide and its width.
+    ///
+    /// The open worker draws its pages with the source's guide but has no
+    /// width for it (TYPE-102), so the width comes from the preferences
+    /// here. The pages it rendered came out before this, and they go when
+    /// the guide spans the whole line; at the default width they stay.
+    fn apply_guide(&self, session: &mut Session) {
+        let scope = self.prefs.underline_scope();
+        let book = session.book();
+        book.set_underline(self.prefs.underline());
+        book.set_underline_scope(scope);
+        if scope != UnderlineScope::TextOnly {
+            session.clear_pages();
+        }
+    }
+
     /// Show a book opened without a snapshot: one mode-8 flash to its page.
     fn finish_pending(&mut self, result: Result<Prepared, Error>) -> Result<(), Error> {
         let Some(p) = self.pending.take() else {
@@ -6788,11 +7481,18 @@ impl App {
         self.set_loading(LoadingSource::Opening, None);
         let mut session = Session::from_prepared(prepared)?;
         session.set_speed(self.speed.secs_per_page());
+        self.apply_guide(&mut session);
         let page = session.page(session.current)?;
         let light = self.light_level();
         let settings = self.prefs.menu_settings(light);
-        let (tree, menu, page_node, nav, progress) =
-            reader_tree(&self.styles, &session.title, &settings, page);
+        let sync_channels = self.reader_sync_channels_all(&session.id);
+        let (tree, menu, page_node, nav, progress) = reader_tree_for_sync_channels(
+            &self.styles,
+            &session.title,
+            &settings,
+            page,
+            sync_channels,
+        );
         // A screen switch: the stock UI's flashing full refresh (mode 8).
         self.ui.set_tree_with(tree, Refresh::Full);
         self.ui.gesture_config_mut().long_press_us = 500_000;
@@ -6816,9 +7516,11 @@ impl App {
         self.lib
             .mark_opened(&p.id, aristotle_library::library::now());
         self.debounce.changed(Instant::now());
-        let gestures = TurnGestures::with_density(self.ui.bounds(), self.ui.profile().density);
+        let gestures = self.turn_gestures(session.is_vertical());
         let old = std::mem::replace(&mut self.screen, Screen::Opening);
-        self.enter_reader(session, menu, page_node, nav, progress, settings, gestures);
+        self.enter_reader(
+            session, menu, page_node, nav, progress, settings, gestures, false,
+        );
         drop(old);
         if let Screen::Reader(r) = &mut self.screen {
             let (pn, pp) = r.session.prerender();
@@ -6829,6 +7531,18 @@ impl App {
             );
         }
         Ok(())
+    }
+
+    /// The page-turn gestures for the writing direction of the book: a
+    /// vertically set book turns the other way (VERT-101).
+    ///
+    /// The direction follows the engine the book really has, not the
+    /// preference: a PDF or FB2 book, and an EPUB or TXT that fell back to
+    /// the horizontal engine, must turn the horizontal way (VERT-101 M1).
+    fn turn_gestures(&self, vertical: bool) -> TurnGestures {
+        let mut gestures = TurnGestures::with_density(self.ui.bounds(), self.ui.profile().density);
+        gestures.set_vertical(vertical);
+        gestures
     }
 
     /// Show the page the book was left at from its snapshot, and open the
@@ -6843,8 +7557,14 @@ impl App {
         let light = self.light_level();
         let settings = self.prefs.menu_settings(light);
         let page = snap.page.clone();
-        let (tree, menu, page_node, nav, progress) =
-            reader_tree(&self.styles, &src.title, &settings, page.clone());
+        let sync_channels = self.reader_sync_channels_all(&src.id);
+        let (tree, menu, page_node, nav, progress) = reader_tree_for_sync_channels(
+            &self.styles,
+            &src.title,
+            &settings,
+            page.clone(),
+            sync_channels,
+        );
         // A screen switch: the stock UI's flashing full refresh (mode 8).
         self.ui.set_tree_with(tree, Refresh::Full);
         self.ui.gesture_config_mut().long_press_us = 500_000;
@@ -6890,7 +7610,11 @@ impl App {
             nav,
             progress,
             settings,
-            gestures: TurnGestures::with_density(self.ui.bounds(), self.ui.profile().density),
+            // The book is still opening, so its engine is not known yet.
+            // Horizontal is the safe guess: mirroring on the preference
+            // would turn a PDF, FB2 or fallen-back book the wrong way until
+            // the book arrives (VERT-101 M1). Adopting it sets these right.
+            gestures: self.turn_gestures(false),
             txt_version,
         }));
         Ok(())
@@ -7146,6 +7870,7 @@ impl App {
         );
         let mut session = Session::from_prepared(prepared)?;
         session.set_speed(self.speed.secs_per_page());
+        self.apply_guide(&mut session);
         session.current = at;
         let mut page = session.page(at)?;
         let verdict = if right {
@@ -7192,7 +7917,13 @@ impl App {
         // opens and snapshots use the current pointer without translating.
         if o.turned || !right || session.txt_migrated() > 0 {
             let now = aristotle_library::library::now();
-            self.lib.set_progress(&session.id, session.progress(now));
+            let mut progress = session.progress(now);
+            if !o.turned {
+                if let Some(prev) = self.lib.book(&session.id).and_then(|b| b.progress.as_ref()) {
+                    progress.updated = prev.updated;
+                }
+            }
+            self.lib.set_progress(&session.id, progress);
             self.debounce.changed(Instant::now());
         }
         let o = *o;
@@ -7203,7 +7934,7 @@ impl App {
         }
         self.formatting_progress.reset();
         self.enter_reader(
-            session, o.menu, page_node, o.nav, o.progress, o.settings, o.gestures,
+            session, o.menu, page_node, o.nav, o.progress, o.settings, o.gestures, o.turned,
         );
         if let Screen::Reader(r) = &mut self.screen {
             if menu_open {
@@ -7250,6 +7981,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn enter_reader(
         &mut self,
         session: Session,
@@ -7258,8 +7990,19 @@ impl App {
         nav: NodeId,
         progress: ProgressNodes,
         settings: Settings,
-        gestures: TurnGestures,
+        mut gestures: TurnGestures,
+        turned: bool,
     ) {
+        // The book is here now: the turns follow the engine it really runs
+        // on, whatever the snapshot's opening gestures guessed (VERT-101
+        // M1).
+        gestures.set_vertical(session.is_vertical());
+        let opened_locator = session.progress(0).locator;
+        let (opened_annotations, opened_tombstones) = self
+            .lib
+            .book(&session.id)
+            .map(|b| (b.annotations.clone(), b.annotation_tombstones.clone()))
+            .unwrap_or_default();
         self.screen = Screen::Reader(Box::new(Reading {
             session,
             menu,
@@ -7272,6 +8015,10 @@ impl App {
             overlay: Overlay::None,
             nodes: OverlayNodes::default(),
             turns_since_flash: 0,
+            turned,
+            opened_locator,
+            opened_annotations,
+            opened_tombstones,
         }));
         // A new book: no layout of the old one is wanted any more.
         self.restyler.reset(settings);
@@ -7285,8 +8032,12 @@ impl App {
         self.stats.finish_page(Instant::now());
         self.stats_page_shown();
         self.page_changed();
+        self.readest.manual_message = None;
         self.sync_book_opened();
         self.readest_book_opened();
+        // A book opening is a moment the network is known to work: the
+        // Nutstore pushes that failed earlier get their second chance.
+        self.retry_pending_jianguoyun();
     }
 
     /// The open book's hash and the page on the panel, for the statistics.
@@ -7300,6 +8051,7 @@ impl App {
 
     /// Start timing the page on the panel, if its number is known.
     fn stats_page_shown(&mut self) {
+        self.weread_readtime_page_shown();
         let Some((hash, page, total)) = self.stats_page() else {
             return;
         };
@@ -7334,11 +8086,16 @@ impl App {
         let Screen::Reader(r) = &mut self.screen else {
             return None;
         };
+        let turned = r.turned;
+        let opened_locator = r.opened_locator.clone();
         let s = &mut r.session;
         let progress = s.progress(aristotle_library::library::now());
         // The snapshot is only shown if the index stores this locator.
         let stored = self.lib.book(&s.id).and_then(|b| b.progress.as_ref());
         if stored.map(|p| &p.locator) != Some(&progress.locator) {
+            if !should_save_progress(turned, &opened_locator, &progress.locator) {
+                return None;
+            }
             self.lib.set_progress(&s.id, progress.clone());
         }
         let key = snapshot::Key::new(
@@ -7439,6 +8196,7 @@ impl App {
         let waited = self.panel.show_page(&page, flash, "turn")?;
         let tap_to_submit = monotonic_us().saturating_sub(at_us) as f64 / 1000.0;
         s.current = target;
+        r.turned = true;
         if dir == Turn::Forward {
             self.speed.turned_forward(Instant::now());
         } else {
@@ -7456,6 +8214,9 @@ impl App {
                 Instant::now(),
                 aristotle_library::library::now(),
             );
+            self.weread
+                .readtime
+                .page_turned(Instant::now(), aristotle_library::library::now());
         }
         let (pn, pp) = s.prerender();
         let t = Instant::now();
@@ -7491,8 +8252,9 @@ impl App {
 
     /// Show the last manual sync result in the reader menu, if it is open.
     ///
-    /// The line is one of the menu's own texts (localized in `readest.rs`); it
-    /// repaints only the menu bars, like every other change to them.
+    /// The line is one of the menu's own texts (localized by Readest or WeRead
+    /// manual sync handlers); it repaints only the menu bars, like every other
+    /// change to them.
     pub(crate) fn refresh_reader_sync_status(&mut self) -> Result<(), Error> {
         if self.asleep.is_some() {
             return Ok(());
@@ -7630,6 +8392,10 @@ impl App {
                     // pulled position is offered once the menu closes.
                     menu_action::PULL_SYNC => self.readest_pull_book_now(),
                     menu_action::PUSH_SYNC => self.readest_push_book_now(),
+                    menu_action::WEREAD_PULL_SYNC => self.weread_pull_progress_now(),
+                    menu_action::WEREAD_PUSH_SYNC => self.weread_push_progress_now(),
+                    menu_action::JIANGUOYUN_PULL_SYNC => self.jianguoyun_pull_book_now(),
+                    menu_action::JIANGUOYUN_PUSH_SYNC => self.jianguoyun_push_book_now(),
                     menu_action::SEARCH => {
                         self.close_menu()?;
                         self.show_coming_soon(
@@ -7747,6 +8513,7 @@ impl App {
         }
         r.session.current = location;
         let page = r.session.page(location)?;
+        r.turned = true;
         if let Some((hash, page, total)) = r
             .session
             .page_number()
@@ -7759,6 +8526,9 @@ impl App {
                 Instant::now(),
                 aristotle_library::library::now(),
             );
+            self.weread
+                .readtime
+                .page_turned(Instant::now(), aristotle_library::library::now());
         }
         if let Some(w) = self.ui.tree.widget_mut::<PageView>(r.page_node) {
             w.page = page.clone();
@@ -7787,23 +8557,60 @@ impl App {
         Ok(())
     }
 
+    /// Persist the open reader's progress to the library index only if the
+    /// reader actually turned a page or moved from the opened locator.
+    ///
+    /// Returns `(push_progress, push_readest)`:
+    /// - `push_progress`: whether reading progress changed (or no reader is open).
+    /// - `push_readest`: whether reading progress or local annotations/tombstones
+    ///   changed while this book was open (or no reader is open).
+    fn save_reader_progress_on_exit(&mut self) -> (bool, bool) {
+        let Screen::Reader(r) = &self.screen else {
+            return (true, true);
+        };
+        let now = aristotle_library::library::now();
+        let progress = r.session.progress(now);
+        let progress_changed = should_save_progress(r.turned, &r.opened_locator, &progress.locator);
+        if progress_changed {
+            self.lib.set_progress(&r.session.id, progress);
+        }
+        let notes_changed = self.lib.book(&r.session.id).is_some_and(|b| {
+            b.annotations != r.opened_annotations || b.annotation_tombstones != r.opened_tombstones
+        });
+        (progress_changed, progress_changed || notes_changed)
+    }
+
     /// Leaves the reader and brings back the screen the book was opened
     /// from: the home page, the library, or a shelf of it.
     fn back_to_library(&mut self) -> Result<(), Error> {
         self.stats.finish_page(Instant::now());
-        if let Screen::Reader(r) = &self.screen {
-            let now = aristotle_library::library::now();
-            self.lib
-                .set_progress(&r.session.id, r.session.progress(now));
+        let (push_progress, push_readest) = self.save_reader_progress_on_exit();
+        let closed_book_id = if let Screen::Reader(r) = &self.screen {
             // Leaving the book makes its manual sync results stale: they must
             // not appear over the next book (SYNC-111).
             self.readest.jobs.forget_book(&r.session.id);
+            Some(r.session.id.clone())
+        } else {
+            None
+        };
+        self.weread_web_book_close();
+        if let Some(book_id) = closed_book_id {
+            self.jianguoyun_auto_push_on_leave(&book_id);
         }
+        self.weread_readtime_book_close();
         self.readest.manual_message = None;
         // The book is closed: a layout of it is not wanted any more.
         self.restyler.reset(self.restyler.panel_typography());
-        self.sync_push(true, false);
-        self.readest_push(true, false);
+        if push_progress {
+            self.sync_push(true, false);
+        } else {
+            self.sync.opened = None;
+        }
+        if push_readest {
+            self.readest_push(true, false);
+        } else {
+            self.readest.opened_book = None;
+        }
         let snapshot = self.snapshot_parts();
         // The screen the book was opened from goes out first; copying the
         // pages and serialising the index wait until it is submitted.
@@ -7825,17 +8632,36 @@ impl App {
     }
 
     /// Save progress, give back the light and the stock screensaver, and
-    /// leave a white day-mode screen for the stock UI.
+    /// show the day-mode transition until the stock UI takes over.
     fn leave(self) -> Result<(), Error> {
         let mut app = self;
         // A forward turn made while the book was opening counts.
         app.finish_opening(true)?;
-        if let Screen::Reader(r) = &app.screen {
-            let now = aristotle_library::library::now();
-            app.lib.set_progress(&r.session.id, r.session.progress(now));
+        if app.usb_mode != UsbMode::DriveMode {
+            app.panel.set_night(None);
+            app.ui.set_night(false);
+            if let Err(error) = transition::show(
+                &mut app.panel,
+                &mut app.ui,
+                aristotle_ui::screens::transition::Stage::Saving,
+                Refresh::Full,
+            ) {
+                eprintln!("aristotle: saving transition: {error:#}");
+            }
         }
-        app.sync_push(true, true);
-        app.readest_push(true, true);
+        let (push_progress, push_readest) = app.save_reader_progress_on_exit();
+        app.weread_web_book_close_blocking();
+        app.weread_readtime_book_close();
+        if push_progress {
+            app.sync_push(true, true);
+        } else {
+            app.sync.opened = None;
+        }
+        if push_readest {
+            app.readest_push(true, true);
+        } else {
+            app.readest.opened_book = None;
+        }
         if let Some(step) = app.asleep.take() {
             if std::mem::take(&mut app.light_off_by_app) {
                 app.apply_light_step(step);
@@ -7857,9 +8683,16 @@ impl App {
             app.snapshots.flush();
         }
         if app.usb_mode != UsbMode::DriveMode {
-            app.panel.clear()?;
+            if let Err(error) = transition::show(
+                &mut app.panel,
+                &mut app.ui,
+                aristotle_ui::screens::transition::Stage::Restoring,
+                Refresh::Auto,
+            ) {
+                eprintln!("aristotle: restoring transition: {error:#}");
+            }
         }
-        perf!("quit: progress saved, screen cleared");
+        perf!("quit: progress saved, returning to stock UI");
         Ok(())
     }
 }
@@ -7876,6 +8709,36 @@ fn reader_tree(
     reader_tree_with(styles, title, settings, page, (0, 0), &mut |_| Vec::new())
 }
 
+fn reader_tree_for_sync_channels(
+    styles: &Styles,
+    title: &str,
+    settings: &Settings,
+    page: Rc<Page>,
+    channels: ui_reader::ReaderSyncChannels,
+) -> (Tree, Menu, NodeId, NodeId, ProgressNodes) {
+    reader_tree_with_sync_channels(styles, title, settings, page, (0, 0), channels, &mut |_| {
+        Vec::new()
+    })
+}
+
+#[allow(dead_code)]
+fn reader_tree_for_channels(
+    styles: &Styles,
+    title: &str,
+    settings: &Settings,
+    page: Rc<Page>,
+    sync_readest: bool,
+    sync_weread: bool,
+) -> (Tree, Menu, NodeId, NodeId, ProgressNodes) {
+    reader_tree_for_sync_channels(
+        styles,
+        title,
+        settings,
+        page,
+        ui_reader::ReaderSyncChannels::readest_and_weread(sync_readest, sync_weread),
+    )
+}
+
 /// [`reader_tree`] with the menu's edges moved by `extents` (see
 /// [`fit_menu`]) and the layers `extra` adds between the page and the menu
 /// (the selection, a popup; see reading.rs).
@@ -7885,6 +8748,31 @@ fn reader_tree_with(
     settings: &Settings,
     page: Rc<Page>,
     extents: (i32, i32),
+    extra: &mut dyn FnMut(&mut Tree) -> Vec<NodeId>,
+) -> (Tree, Menu, NodeId, NodeId, ProgressNodes) {
+    reader_tree_with_sync_channels(
+        styles,
+        title,
+        settings,
+        page,
+        extents,
+        ui_reader::ReaderSyncChannels {
+            readest: true,
+            weread: true,
+            jianguoyun: true,
+        },
+        extra,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reader_tree_with_sync_channels(
+    styles: &Styles,
+    title: &str,
+    settings: &Settings,
+    page: Rc<Page>,
+    extents: (i32, i32),
+    channels: ui_reader::ReaderSyncChannels,
     extra: &mut dyn FnMut(&mut Tree) -> Vec<NodeId>,
 ) -> (Tree, Menu, NodeId, NodeId, ProgressNodes) {
     let mut t = Tree::new();
@@ -7906,7 +8794,9 @@ fn reader_tree_with(
         top_extra: extents.0,
         bottom_extra: extents.1,
     };
-    let menu = build_menu(&mut t, styles, &spec, settings);
+    let menu = aristotle_ui::screens::reader::build_menu_for_sync_channels(
+        &mut t, styles, &spec, settings, channels,
+    );
     // The prototype has no second row of reading actions: 目录, 标注 and
     // 跳转 live in the bottom sheet. Keep an empty node for the reading
     // state that still hides it with the menu.
@@ -8531,9 +9421,10 @@ mod tests {
 
     fn memory_app_profile(library: &Path, root: &Path, profile: ScreenProfile) -> App {
         let args = Args {
-            data: PathBuf::new(),
+            transition: None,
             library: library.to_path_buf(),
             root: root.to_path_buf(),
+            data: root.join(".aristotle"),
             turn_mode: None,
             night_method: None,
             scan: true,
@@ -8557,6 +9448,7 @@ mod tests {
             Prefs::default(),
             start_dictionaries(&args),
             powerd::Sleep::none(),
+            profile.density.dpi(),
         )
         .unwrap()
     }
@@ -9664,10 +10556,12 @@ mod tests {
             Overlay::Dragging { .. } => "dragging",
             Overlay::Actions { .. } => "actions",
             Overlay::Gloss { .. } => "gloss",
+            Overlay::Translate { .. } => "translate",
             Overlay::Note { .. } => "note",
             Overlay::Toc { .. } => "toc",
             Overlay::Marks { .. } => "marks",
             Overlay::Annotation { .. } => "annotation",
+            Overlay::WereadThought { .. } => "weread thought",
             Overlay::Fonts { .. } => "fonts",
             Overlay::GoTo { .. } => "go to",
             Overlay::Sync { .. } => "sync",
@@ -10382,6 +11276,546 @@ mod tests {
         ));
         std::fs::remove_file(&library).unwrap();
         std::fs::rename(&backup, &library).unwrap();
+        app.leave().unwrap();
+    }
+
+    #[test]
+    fn should_save_progress_requires_turn_or_moved_locator() {
+        let p0 = aristotle_library::Locator::XPointer {
+            xpointer: "/body/DocFragment[1]/p[1].0".into(),
+        };
+        let p1 = aristotle_library::Locator::XPointer {
+            xpointer: "/body/DocFragment[1]/p[2].0".into(),
+        };
+        assert!(!should_save_progress(false, &p0, &p0));
+        assert!(should_save_progress(true, &p0, &p0));
+        assert!(should_save_progress(false, &p0, &p1));
+        assert!(should_save_progress(true, &p0, &p1));
+    }
+
+    #[test]
+    fn fall_asleep_without_turning_preserves_existing_progress_timestamp() {
+        let Some((library, root, id)) = reopen_fixture(true) else {
+            return;
+        };
+        let mut app = memory_app(&library, &root);
+        let original_updated = 1_600_000_000;
+        let mut seeded = app.lib.book(&id).unwrap().progress.clone().unwrap();
+        seeded.updated = original_updated;
+        app.lib.set_progress(&id, seeded);
+        reopen(&mut app, "Reopened");
+        app.fall_asleep(true).unwrap();
+        assert_eq!(
+            app.lib
+                .book(&id)
+                .unwrap()
+                .progress
+                .as_ref()
+                .unwrap()
+                .updated,
+            original_updated,
+            "sleeping without turning a page must not stamp a fresh progress timestamp"
+        );
+        app.wake(true).unwrap();
+        app.back_to_library().unwrap();
+        assert_eq!(
+            app.lib
+                .book(&id)
+                .unwrap()
+                .progress
+                .as_ref()
+                .unwrap()
+                .updated,
+            original_updated,
+            "closing without turning a page must not stamp a fresh progress timestamp"
+        );
+        app.leave().unwrap();
+    }
+
+    #[test]
+    fn reader_sync_channels_match_book_source_and_toggles() {
+        use inkread_core::weread::{BookMapping, BookMappingStore};
+
+        let dir = testdir("reader-sync-channels");
+        let root = dir.join("books");
+        let library = dir.join("library");
+        std::fs::create_dir_all(root.join("documents/WeRead")).unwrap();
+        std::fs::create_dir_all(root.join("documents/readest")).unwrap();
+        std::fs::create_dir_all(root.join("imports")).unwrap();
+
+        std::fs::write(
+            root.join("documents/WeRead/folder-weread.txt"),
+            b"WeRead book identified by folder path.",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("imports/mapped-weread.txt"),
+            b"WeRead book identified by cold-boot books.json mapping.",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("documents/readest/folder-readest.txt"),
+            b"Readest book identified by folder path.",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("imports/hash-readest.txt"),
+            b"Readest book identified by cloud channel hashes.",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("local.txt"),
+            b"Plain local book with no cloud folder or hash.",
+        )
+        .unwrap();
+
+        let mut lib = Library::open(&library).unwrap();
+        lib.scan(&root, &ScanOptions::default()).unwrap();
+        lib.save().unwrap();
+        let id_of = |suffix: &str| {
+            lib.books()
+                .iter()
+                .find(|b| b.file.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing book ending with {suffix}"))
+                .id
+                .clone()
+        };
+        let weread_path_id = id_of("folder-weread.txt");
+        let weread_mapped_id = id_of("mapped-weread.txt");
+        let readest_path_id = id_of("folder-readest.txt");
+        let readest_hash_id = id_of("hash-readest.txt");
+        let local_id = id_of("local.txt");
+
+        // Persist WeRead download mapping before cold boot so build_app loads it.
+        let weread_state = library.join("accounts/weread");
+        std::fs::create_dir_all(&weread_state).unwrap();
+        let mut mapping = BookMappingStore::load(&weread_state.join("books.json")).unwrap();
+        mapping.insert(
+            "wr-9001",
+            BookMapping {
+                hash: weread_mapped_id.clone(),
+                title: "Mapped WeRead".into(),
+                format: "txt".into(),
+                synckey: None,
+            },
+        );
+        mapping.save().unwrap();
+
+        let mut app = memory_app(&library, &root);
+        app.cloud
+            .channel_hashes
+            .insert(readest_hash_id.to_ascii_lowercase());
+
+        // Both channels enabled: strict source separation.
+        app.prefs.enable_readest = true;
+        app.prefs.enable_weread = true;
+        assert_eq!(app.reader_sync_channels(&weread_path_id), (false, true));
+        assert_eq!(app.reader_sync_channels(&weread_mapped_id), (false, true));
+        assert_eq!(app.reader_sync_channels(&readest_path_id), (true, false));
+        assert_eq!(app.reader_sync_channels(&readest_hash_id), (true, false));
+        assert_eq!(app.reader_sync_channels(&local_id), (true, false));
+
+        // WeRead disabled: WeRead books hide sync buttons, Readest/Local keep Readest.
+        app.prefs.enable_readest = true;
+        app.prefs.enable_weread = false;
+        assert_eq!(app.reader_sync_channels(&weread_path_id), (false, false));
+        assert_eq!(app.reader_sync_channels(&weread_mapped_id), (false, false));
+        assert_eq!(app.reader_sync_channels(&readest_path_id), (true, false));
+        assert_eq!(app.reader_sync_channels(&readest_hash_id), (true, false));
+        assert_eq!(app.reader_sync_channels(&local_id), (true, false));
+
+        // Readest disabled: Readest/Local books hide sync buttons, WeRead keeps WeRead.
+        app.prefs.enable_readest = false;
+        app.prefs.enable_weread = true;
+        assert_eq!(app.reader_sync_channels(&weread_path_id), (false, true));
+        assert_eq!(app.reader_sync_channels(&weread_mapped_id), (false, true));
+        assert_eq!(app.reader_sync_channels(&readest_path_id), (false, false));
+        assert_eq!(app.reader_sync_channels(&readest_hash_id), (false, false));
+        assert_eq!(app.reader_sync_channels(&local_id), (false, false));
+
+        // Both disabled: no sync buttons for any book.
+        app.prefs.enable_readest = false;
+        app.prefs.enable_weread = false;
+        assert_eq!(app.reader_sync_channels(&weread_path_id), (false, false));
+        assert_eq!(app.reader_sync_channels(&weread_mapped_id), (false, false));
+        assert_eq!(app.reader_sync_channels(&readest_path_id), (false, false));
+        assert_eq!(app.reader_sync_channels(&readest_hash_id), (false, false));
+        assert_eq!(app.reader_sync_channels(&local_id), (false, false));
+
+        // Verify the constructed reader menu trees match each channel strictly.
+        let settings = app.prefs.menu_settings(0.0);
+        let style = app.page_style();
+        let blank = Rc::new(Page::white(&style));
+
+        app.prefs.enable_readest = true;
+        app.prefs.enable_weread = true;
+        let (sr, sw) = app.reader_sync_channels(&weread_mapped_id);
+        let (_, weread_menu, _, _, _) =
+            reader_tree_for_channels(&app.styles, "WeRead", &settings, blank.clone(), sr, sw);
+        assert!(weread_menu.btn_pull.is_none());
+        assert!(weread_menu.btn_push.is_none());
+        assert!(weread_menu.btn_weread_pull.is_some());
+        assert!(weread_menu.btn_weread_push.is_some());
+        assert!(weread_menu.sync_status.is_some());
+
+        let (sr, sw) = app.reader_sync_channels(&readest_hash_id);
+        let (_, readest_menu, _, _, _) =
+            reader_tree_for_channels(&app.styles, "Readest", &settings, blank.clone(), sr, sw);
+        assert!(readest_menu.btn_pull.is_some());
+        assert!(readest_menu.btn_push.is_some());
+        assert!(readest_menu.btn_weread_pull.is_none());
+        assert!(readest_menu.btn_weread_push.is_none());
+        assert!(readest_menu.sync_status.is_some());
+
+        let (sr, sw) = app.reader_sync_channels(&local_id);
+        let (_, local_menu, _, _, _) =
+            reader_tree_for_channels(&app.styles, "Local", &settings, blank.clone(), sr, sw);
+        assert!(local_menu.btn_pull.is_some());
+        assert!(local_menu.btn_push.is_some());
+        assert!(local_menu.btn_weread_pull.is_none());
+        assert!(local_menu.btn_weread_push.is_none());
+        assert!(local_menu.sync_status.is_some());
+
+        app.prefs.enable_weread = false;
+        let (sr, sw) = app.reader_sync_channels(&weread_mapped_id);
+        let (_, disabled_menu, _, _, _) =
+            reader_tree_for_channels(&app.styles, "WeRead Off", &settings, blank, sr, sw);
+        assert!(disabled_menu.btn_pull.is_none());
+        assert!(disabled_menu.btn_push.is_none());
+        assert!(disabled_menu.btn_weread_pull.is_none());
+        assert!(disabled_menu.btn_weread_push.is_none());
+        assert!(disabled_menu.sync_status.is_none());
+
+        app.leave().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Nutstore channel is a source of its own: its books show only the
+    /// Nutstore row, the other channels keep theirs, and the switch in
+    /// Settings decides whether the row is there at all.
+    #[test]
+    fn jianguoyun_channels_are_isolated_from_the_other_cloud_channels() {
+        let dir = testdir("jianguoyun-channels");
+        let root = dir.join("books");
+        let library = dir.join("library");
+        std::fs::create_dir_all(root.join("documents/jianguoyun")).unwrap();
+        std::fs::create_dir_all(root.join("documents/readest")).unwrap();
+        std::fs::create_dir_all(root.join("documents/WeRead")).unwrap();
+        std::fs::write(
+            root.join("documents/jianguoyun/nutstore.txt"),
+            b"A book downloaded from Nutstore.",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("documents/readest/cloud.txt"),
+            b"A book downloaded from Readest.",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("documents/WeRead/weread.txt"),
+            b"A book downloaded from WeRead.",
+        )
+        .unwrap();
+        std::fs::write(root.join("local.txt"), b"A plain local book.").unwrap();
+        std::fs::write(root.join("moved.txt"), b"A Nutstore book moved away.").unwrap();
+
+        let mut lib = Library::open(&library).unwrap();
+        lib.scan(&root, &ScanOptions::default()).unwrap();
+        lib.save().unwrap();
+        let id_of = |suffix: &str| {
+            lib.books()
+                .iter()
+                .find(|b| b.file.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing book ending with {suffix}"))
+                .id
+                .clone()
+        };
+        let jianguoyun_path_id = id_of("nutstore.txt");
+        let readest_id = id_of("cloud.txt");
+        let weread_id = id_of("weread.txt");
+        let local_id = id_of("local.txt");
+        let moved_id = id_of("moved.txt");
+
+        let mut app = memory_app(&library, &root);
+        app.jianguoyun
+            .channel_hashes
+            .insert(moved_id.to_ascii_lowercase());
+
+        // The badge comes from the folder or from the channel record.
+        assert_eq!(
+            app.book_source(&jianguoyun_path_id),
+            ui_lib::BookSource::Jianguoyun
+        );
+        assert_eq!(
+            app.book_source(&moved_id),
+            ui_lib::BookSource::Jianguoyun,
+            "a book moved out of the folder keeps its channel"
+        );
+        assert_eq!(app.book_source(&readest_id), ui_lib::BookSource::Readest);
+        assert_eq!(app.book_source(&weread_id), ui_lib::BookSource::WeRead);
+        assert_eq!(app.book_source(&local_id), ui_lib::BookSource::Local);
+
+        // Everything on, with a Nutstore account configured: each book shows
+        // its own channel only.
+        app.prefs.enable_readest = true;
+        app.prefs.enable_weread = true;
+        app.prefs.enable_jianguoyun = true;
+        app.net.accounts.jianguoyun = Some(aristotle_net::store::JianguoyunSettings::official(
+            "anna@example.com",
+            "app-password",
+        ));
+
+        let jianguoyun = app.reader_sync_channels_all(&jianguoyun_path_id);
+        assert!(!jianguoyun.readest);
+        assert!(!jianguoyun.weread);
+        assert!(jianguoyun.jianguoyun);
+        let moved = app.reader_sync_channels_all(&moved_id);
+        assert!(!moved.readest);
+        assert!(moved.jianguoyun);
+        let readest = app.reader_sync_channels_all(&readest_id);
+        assert!(readest.readest);
+        assert!(!readest.weread);
+        assert!(!readest.jianguoyun);
+        let weread = app.reader_sync_channels_all(&weread_id);
+        assert!(!weread.readest);
+        assert!(weread.weread);
+        assert!(!weread.jianguoyun);
+        // A local book may go to Nutstore as well as to Readest.
+        let local = app.reader_sync_channels_all(&local_id);
+        assert!(local.readest);
+        assert!(!local.weread);
+        assert!(local.jianguoyun);
+
+        // Without an account the local book has no Nutstore row, and a
+        // Nutstore book keeps none either: the row would fail every time.
+        app.net.accounts.jianguoyun = None;
+        assert!(!app.reader_sync_channels_all(&local_id).jianguoyun);
+        assert!(!app.reader_sync_channels_all(&jianguoyun_path_id).jianguoyun);
+        app.net.accounts.jianguoyun = Some(aristotle_net::store::JianguoyunSettings::official(
+            "anna@example.com",
+            "app-password",
+        ));
+
+        // The switch in Settings hides the channel everywhere.
+        app.prefs.enable_jianguoyun = false;
+        assert!(!app.reader_sync_channels_all(&jianguoyun_path_id).jianguoyun);
+        assert!(!app.reader_sync_channels_all(&local_id).jianguoyun);
+        app.prefs.enable_jianguoyun = true;
+
+        // The reader menu draws the pairs of the channels that are on.
+        let settings = app.prefs.menu_settings(0.0);
+        let style = app.page_style();
+        let blank = Rc::new(Page::white(&style));
+
+        let (_, nutstore_menu, _, _, _) = reader_tree_for_sync_channels(
+            &app.styles,
+            "Nutstore",
+            &settings,
+            blank.clone(),
+            app.reader_sync_channels_all(&jianguoyun_path_id),
+        );
+        assert!(nutstore_menu.btn_pull.is_none());
+        assert!(nutstore_menu.btn_weread_pull.is_none());
+        assert!(nutstore_menu.btn_jianguoyun_pull.is_some());
+        assert!(nutstore_menu.btn_jianguoyun_push.is_some());
+        assert!(nutstore_menu.sync_status.is_some());
+
+        let (_, local_menu, _, _, _) = reader_tree_for_sync_channels(
+            &app.styles,
+            "Local",
+            &settings,
+            blank.clone(),
+            app.reader_sync_channels_all(&local_id),
+        );
+        assert!(local_menu.btn_pull.is_some());
+        assert!(local_menu.btn_jianguoyun_pull.is_some());
+        assert!(local_menu.btn_weread_pull.is_none());
+
+        let (_, weread_menu, _, _, _) = reader_tree_for_sync_channels(
+            &app.styles,
+            "WeRead",
+            &settings,
+            blank,
+            app.reader_sync_channels_all(&weread_id),
+        );
+        assert!(weread_menu.btn_pull.is_none());
+        assert!(weread_menu.btn_jianguoyun_pull.is_none());
+        assert!(weread_menu.btn_weread_pull.is_some());
+
+        app.leave().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jianguoyun_download_marks_downloaded_and_deduplicates_existing_hash() {
+        let dir = testdir("jianguoyun-dl-dedup");
+        let root = dir.join("books");
+        let library = dir.join("library");
+        let jgy_dir = root.join("jianguoyun");
+        std::fs::create_dir_all(&jgy_dir).unwrap();
+        let first_file = jgy_dir.join("Dune.txt");
+        std::fs::write(
+            &first_file,
+            b"He who controls the spice controls the universe.",
+        )
+        .unwrap();
+        let hash = aristotle_library::id::partial_md5(&first_file).unwrap();
+
+        let mut app = memory_app(&library, &root);
+        app.net.accounts.jianguoyun = Some(aristotle_net::store::JianguoyunSettings::official(
+            "anna@example.com",
+            "app-password",
+        ));
+        let rel = "Books/Dune.txt";
+        app.jianguoyun.downloading = Some(rel.into());
+        app.jianguoyun.download_token = 1;
+        app.on_jianguoyun_downloaded(
+            1,
+            rel.into(),
+            Ok(aristotle_net::jianguoyun::DownloadedBook {
+                path: first_file.clone(),
+                book_hash: hash.clone(),
+                bytes: 48,
+            }),
+        )
+        .unwrap();
+
+        // Immediately after download finishes (before background scan finishes),
+        // the shelf must report Downloaded so a second download cannot start.
+        assert_eq!(
+            app.jianguoyun.download_state(rel, &app.lib),
+            aristotle_ui::screens::jianguoyun_shelf::JianguoyunDownloadState::Downloaded
+        );
+        wait_for_scan(&mut app);
+        assert_eq!(app.lib.books().len(), 1);
+        assert_eq!(app.lib.books()[0].id, hash);
+        assert!(app.jianguoyun.indexing.is_empty());
+        assert_eq!(
+            app.jianguoyun.download_state(rel, &app.lib),
+            aristotle_ui::screens::jianguoyun_shelf::JianguoyunDownloadState::Downloaded
+        );
+
+        // If a second copy with the exact same hash somehow arrives, it is
+        // removed instead of creating a duplicate book entry in the library.
+        let dup_file = jgy_dir.join("Dune (2).txt");
+        std::fs::write(
+            &dup_file,
+            b"He who controls the spice controls the universe.",
+        )
+        .unwrap();
+        app.jianguoyun.downloading = Some(rel.into());
+        app.jianguoyun.download_token = 2;
+        app.on_jianguoyun_downloaded(
+            2,
+            rel.into(),
+            Ok(aristotle_net::jianguoyun::DownloadedBook {
+                path: dup_file.clone(),
+                book_hash: hash,
+                bytes: 48,
+            }),
+        )
+        .unwrap();
+        assert!(
+            !dup_file.exists(),
+            "duplicate downloaded file must be removed"
+        );
+        assert!(first_file.exists(), "original indexed file must remain");
+        assert_eq!(app.lib.books().len(), 1);
+
+        app.leave().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jianguoyun_manual_pull_jumps_forward_and_backward_in_reader() {
+        let Some(data) = render_data() else {
+            return;
+        };
+        aristotle_render::use_data_dir(&data).unwrap();
+        let dir = testdir("jianguoyun-manual-pull");
+        let (root, library) = (dir.join("books"), dir.join("library"));
+        std::fs::create_dir_all(&root).unwrap();
+        write_book(&root.join("reopened.epub"));
+        let mut lib = Library::open(&library).unwrap();
+        lib.scan(&root, &ScanOptions::default()).unwrap();
+        let id = lib.books()[0].id.clone();
+        lib.save().unwrap();
+        let mut app = memory_app(&library, &root);
+        app.net.accounts.jianguoyun = Some(aristotle_net::store::JianguoyunSettings::official(
+            "anna@example.com",
+            "app-password",
+        ));
+        app.open_by_title("Reopened").unwrap();
+        wait(&mut app, |a| matches!(a.screen, Screen::Reader(_)));
+        let start_loc = match &app.screen {
+            Screen::Reader(r) => r.session.current,
+            _ => panic!("reader must be open"),
+        };
+
+        // 1. Manual pull to a farther fraction (without XPointer) jumps forward.
+        let mut farther = inkread_core::jianguoyun::JianguoyunBookSync::new(id.clone(), "Reopened");
+        farther.progress = Some(inkread_core::jianguoyun::JianguoyunProgress {
+            xpointer: None,
+            cfi: None,
+            fraction: 0.85,
+            page: None,
+            total_pages: None,
+            chapter_title: None,
+            updated_at_ms: 1_700_000_000_000,
+            device_id: "phone".into(),
+        });
+        app.jianguoyun.sync_token = 10;
+        app.jianguoyun.book_sync_tokens.insert(id.clone(), 10);
+        app.on_jianguoyun_book_synced(id.clone(), 10, true, false, Ok(Some(farther)))
+            .unwrap();
+        let after_forward = match &app.screen {
+            Screen::Reader(r) => r.session.current,
+            _ => panic!("reader must stay open"),
+        };
+        assert!(
+            after_forward > start_loc,
+            "manual pull should jump forward: start={start_loc}, after={after_forward}"
+        );
+
+        // 2. Manual pull to an earlier fraction jumps backward as well.
+        let mut earlier = inkread_core::jianguoyun::JianguoyunBookSync::new(id.clone(), "Reopened");
+        earlier.progress = Some(inkread_core::jianguoyun::JianguoyunProgress {
+            xpointer: None,
+            cfi: None,
+            fraction: 0.1,
+            page: None,
+            total_pages: None,
+            chapter_title: None,
+            updated_at_ms: 1_700_000_005_000,
+            device_id: "phone".into(),
+        });
+        app.jianguoyun.sync_token = 11;
+        app.jianguoyun.book_sync_tokens.insert(id.clone(), 11);
+        app.on_jianguoyun_book_synced(id.clone(), 11, true, false, Ok(Some(earlier.clone())))
+            .unwrap();
+        let after_backward = match &app.screen {
+            Screen::Reader(r) => r.session.current,
+            _ => panic!("reader must stay open"),
+        };
+        assert!(
+            after_backward < after_forward,
+            "manual pull should jump backward: forward={after_forward}, backward={after_backward}"
+        );
+
+        // 3. Automatic pull (manual=false) never pulls the reader backward.
+        app.jianguoyun.sync_token = 12;
+        app.jianguoyun.book_sync_tokens.insert(id.clone(), 12);
+        let mut even_earlier = earlier;
+        even_earlier.progress.as_mut().unwrap().fraction = 0.0;
+        even_earlier.progress.as_mut().unwrap().updated_at_ms = 1_700_000_010_000;
+        app.on_jianguoyun_book_synced(id.clone(), 12, false, false, Ok(Some(even_earlier)))
+            .unwrap();
+        let after_auto = match &app.screen {
+            Screen::Reader(r) => r.session.current,
+            _ => panic!("reader must stay open"),
+        };
+        assert_eq!(after_auto, after_backward);
+
         app.leave().unwrap();
     }
 }

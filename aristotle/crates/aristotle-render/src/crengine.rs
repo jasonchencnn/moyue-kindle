@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use inkread_engine::crengine::CrengineEngine;
 use inkread_engine::{
-    Document as CrengineDocument, Engine as _, LayoutSettings, Margins, TocEntry, MAX_FONT_SIZE_PX,
-    MAX_LINE_SPACING_PERCENT, MAX_MARGIN_PX, MAX_PAGE_DIMENSION_PX, MIN_FONT_SIZE_PX,
-    MIN_LINE_SPACING_PERCENT,
+    Document as CrengineDocument, Engine as _, LayoutSettings, Margins, TocEntry, MAX_DPI,
+    MAX_FONT_SIZE_PX, MAX_LINE_SPACING_PERCENT, MAX_MARGIN_PX, MAX_PAGE_DIMENSION_PX, MIN_DPI,
+    MIN_FONT_SIZE_PX, MIN_LINE_SPACING_PERCENT,
 };
 use inkread_platform::GrayBuffer;
 use plato_core::anyhow::{format_err, Error};
@@ -442,17 +442,13 @@ fn faces_for(engine: &CrengineEngine, style: &Style) -> (String, Vec<String>) {
     (main.unwrap_or_default(), fallback.into_iter().collect())
 }
 
-/// Generate CSS rules for CJK first-line indent and paragraph gap.
+/// Generate CSS rules for CJK first-line indent and paragraph gap in uniform
+/// (non-fine) override mode.
 ///
-/// The declarations are `!important`: a book's own `text-indent` rules load
-/// after the base sheet and would otherwise win (READER-001 C.2). Leading
-/// full-width spaces are content, not style; crengine drops them at load
-/// (see `strip_leading_ideographic_spaces` in `engine/shim.cpp`), so this
-/// sheet alone controls the first line.
-///
-/// Chapter starts come from the book's table of contents (see
-/// [`ChapterAnchor`]), not from the tag or position of a heading: an `h2`
-/// used for a subsection inside a chapter must not start a page.
+/// The declarations are `!important` so uniform mode takes full control over
+/// poorly formatted books (READER-001 C.2). For publisher fine typesetting,
+/// use [`build_typeset_css`] with `fine_typesetting = true` so book-defined
+/// captions, headings, poetry, and Duokan/WeRead layouts are never overwritten.
 pub fn build_cjk_css(indent_chars: usize, gap_em: f32) -> String {
     build_cjk_css_with_anchors(indent_chars, gap_em, &[])
 }
@@ -463,14 +459,38 @@ pub fn build_cjk_css_with_anchors(
     gap_em: f32,
     chapter_anchors: &[ChapterAnchor],
 ) -> String {
+    build_typeset_css(indent_chars, gap_em, false, chapter_anchors)
+}
+
+/// Generate the user stylesheet for crengine according to `fine_typesetting`.
+///
+/// - When `fine_typesetting` is `true`, body/paragraph indent and paragraph gap
+///   are emitted WITHOUT `!important` and without zeroing `margin-top`, so
+///   publisher styles (centered titles, captions, epigraphs, poetry, scene
+///   breaks, Duokan/WeRead/EPUB3 rules) always win while plain unstyled
+///   paragraphs still follow the user's indent and gap.
+/// - When `fine_typesetting` is `false`, `!important` rules enforce uniform
+///   typography across the whole book.
+pub fn build_typeset_css(
+    indent_chars: usize,
+    gap_em: f32,
+    fine_typesetting: bool,
+    chapter_anchors: &[ChapterAnchor],
+) -> String {
     let gap_str = if gap_em <= 0.001 {
         "0em".to_string()
     } else {
         format!("{gap_em:.1}em")
     };
-    let mut css = format!(
-        "body {{\n    text-indent: {indent_chars}em !important;\n    page-break-before: always !important;\n}}\np {{\n    text-indent: {indent_chars}em !important;\n    margin-top: 0em !important;\n    margin-bottom: {gap_str} !important;\n}}"
-    );
+    let mut css = if fine_typesetting {
+        format!(
+            "body {{\n    text-indent: {indent_chars}em;\n    page-break-before: always;\n}}\np {{\n    text-indent: {indent_chars}em;\n    margin-bottom: {gap_str};\n}}"
+        )
+    } else {
+        format!(
+            "body {{\n    text-indent: {indent_chars}em !important;\n    page-break-before: always !important;\n}}\np {{\n    text-indent: {indent_chars}em !important;\n    margin-top: 0em !important;\n    margin-bottom: {gap_str} !important;\n}}"
+        )
+    };
     for anchor in chapter_anchors {
         let id = format!("_doc_fragment_{}_ {}", anchor.spine, anchor.id);
         let Some(quoted) = css_quoted(&id) else {
@@ -560,11 +580,13 @@ fn layout_for(
     let line_spacing_percent = ((style.line_height * 100.0).round() as u32)
         .clamp(MIN_LINE_SPACING_PERCENT, MAX_LINE_SPACING_PERCENT);
     let margin = style.margin_px().clamp(0, MAX_MARGIN_PX as i32) as u32;
-    let user_css = Some(build_cjk_css_with_anchors(
+    let user_css = Some(build_typeset_css(
         style.cjk_indent,
         style.cjk_gap,
+        style.fine_typesetting,
         chapter_anchors,
     ));
+    let dpi = u32::from(style.dpi).clamp(MIN_DPI, MAX_DPI);
     LayoutSettings {
         font_size_px,
         line_spacing_percent,
@@ -577,8 +599,15 @@ fn layout_for(
         font_face: face.to_string(),
         // The glyphs the main face does not have: the Chinese ones.
         fallback_font_faces: fallback_faces.to_vec(),
-        // The book's own stylesheets stay in charge, as with Plato.
-        embedded_styles: true,
+        // Fine typesetting preserves the book's own CSS stylesheets; turning
+        // it off strips publisher styles so the reader's uniform typography
+        // takes full control.
+        embedded_styles: style.fine_typesetting,
+        fine_typesetting: style.fine_typesetting,
+        // The engine treats this as a base weight and shifts the book's own
+        // weights relative to it (see `LayoutSettings::font_weight`).
+        font_weight: style.font_weight,
+        dpi,
         user_css,
     }
 }
@@ -616,6 +645,8 @@ pub fn chapter_of_page(entries: &[TocEntry], page: u32) -> Option<usize> {
 mod tests {
     use super::*;
 
+    use crate::style::{FONT_WEIGHT_BOLD, FONT_WEIGHT_LIGHT};
+
     /// A table of contents entry.
     fn entry(title: &str, level: u32, page: u32) -> TocEntry {
         TocEntry {
@@ -651,12 +682,12 @@ mod tests {
         assert_eq!(layout.margins.bottom, margin);
         assert_eq!(layout.font_face, "Literata");
         assert!(layout.embedded_styles);
+        assert!(layout.fine_typesetting);
+        assert_eq!(layout.dpi, 300);
         let css = layout.user_css.as_deref().expect("the CJK sheet is set");
-        assert!(css.contains("text-indent: 2em !important;"), "{css}");
-        assert!(
-            css.contains("page-break-before: always !important;"),
-            "{css}"
-        );
+        assert!(css.contains("text-indent: 2em;"), "{css}");
+        assert!(!css.contains("text-indent: 2em !important;"), "{css}");
+        assert!(css.contains("page-break-before: always;"), "{css}");
     }
 
     #[test]
@@ -710,12 +741,26 @@ mod tests {
         let mut style = Style::pw4();
         style.cjk_indent = 0;
         style.cjk_gap = 0.0;
+        // Fine typesetting (default) emits non-!important defaults so publisher
+        // CSS (captions, centered titles, Duokan layouts) can override them.
         let layout = layout_for(&style, LATIN_FACE, &[CJK_FACE.to_string()], &[]);
         let css = layout.user_css.as_deref().expect("the CJK sheet is set");
-        assert!(css.contains("text-indent: 0em !important;"), "{css}");
+        assert!(css.contains("text-indent: 0em;"), "{css}");
+        assert!(!css.contains("text-indent: 0em !important;"), "{css}");
+        assert!(!css.contains("margin-top: 0em !important;"), "{css}");
+        assert!(css.contains("page-break-before: always;"), "{css}");
+
+        // Turning fine typesetting off switches to uniform !important overrides.
+        style.fine_typesetting = false;
+        let uniform = layout_for(&style, LATIN_FACE, &[CJK_FACE.to_string()], &[]);
+        let uniform_css = uniform.user_css.as_deref().expect("the CJK sheet is set");
         assert!(
-            css.contains("page-break-before: always !important;"),
-            "{css}"
+            uniform_css.contains("text-indent: 0em !important;"),
+            "{uniform_css}"
+        );
+        assert!(
+            uniform_css.contains("page-break-before: always !important;"),
+            "{uniform_css}"
         );
     }
 
@@ -817,5 +862,27 @@ mod tests {
         assert_eq!(chapter_of_page(&toc, 0), None);
         assert_eq!(chapter_of_page(&toc, 2), None);
         assert_eq!(chapter_of_page(&toc, 3), Some(0));
+    }
+
+    #[test]
+    fn layout_for_passes_fine_typesetting_and_weight_to_the_engine() {
+        let mut style = Style::pw4();
+        style.fine_typesetting = false;
+        style.font_weight = FONT_WEIGHT_LIGHT;
+        style.dpi = 167;
+        let layout = layout_for(&style, "Literata", &[], &[]);
+        assert!(!layout.fine_typesetting);
+        assert!(!layout.embedded_styles);
+        assert_eq!(layout.font_weight, FONT_WEIGHT_LIGHT);
+        assert_eq!(layout.dpi, 167);
+
+        style.fine_typesetting = true;
+        style.font_weight = FONT_WEIGHT_BOLD;
+        style.dpi = 300;
+        let layout = layout_for(&style, "Literata", &[], &[]);
+        assert!(layout.fine_typesetting);
+        assert!(layout.embedded_styles);
+        assert_eq!(layout.font_weight, FONT_WEIGHT_BOLD);
+        assert_eq!(layout.dpi, 300);
     }
 }

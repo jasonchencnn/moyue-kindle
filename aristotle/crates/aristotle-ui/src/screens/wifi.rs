@@ -108,23 +108,43 @@ pub struct WifiUi {
 
 impl WifiUi {
     /// Builds the page.
-    pub fn build(_text: &mut TextEngine, s: &Styles, wifi: &Wifi) -> (Tree, Self) {
+    pub fn build(text: &mut TextEngine, s: &Styles, wifi: &Wifi) -> (Tree, Self) {
+        Self::build_for_size(
+            text,
+            s,
+            wifi,
+            Size::new(s.density.px(1264), s.density.px(1680)),
+        )
+    }
+
+    /// Builds the page for a panel of `size` native pixels. Six-inch panels
+    /// tighten vertical spacing and cap the received list at two cards so the
+    /// supported-formats strip and stop button stay visible without collapsing.
+    pub fn build_for_size(
+        _text: &mut TextEngine,
+        s: &Styles,
+        wifi: &Wifi,
+        size: Size,
+    ) -> (Tree, Self) {
+        let compact = crate::theme::PanelLayout::for_size(size, s.density)
+            == crate::theme::PanelLayout::Compact;
         let mut t = Tree::new();
         let bar = status_line(&mut t, s, &wifi.status);
         let status = t.pad(Insets::new(0, home_margin(), 0, home_margin()), bar.root);
 
-        let header = header(&mut t, s, wifi);
-        let card = address_card(&mut t, s, wifi);
-        let gap = t.gap(0, 28);
-        let steps = steps(&mut t, s);
-        let gap2 = t.gap(0, 28);
-        let (state, file_name, percent, progress_bar, status_line) = state_card(&mut t, s, wifi);
-        let gap3 = t.gap(0, 28);
-        let received = received(&mut t, s, wifi);
-        let gap4 = t.gap(0, 16);
-        let formats = formats(&mut t, s);
-        let gap5 = t.gap(0, 28);
-        let (stop, toggle) = stop_button(&mut t, s, wifi);
+        let header = header(&mut t, s, wifi, compact);
+        let card = address_card(&mut t, s, wifi, compact);
+        let gap = t.gap(0, if compact { 12 } else { 28 });
+        let steps = steps(&mut t, s, compact);
+        let gap2 = t.gap(0, if compact { 12 } else { 28 });
+        let (state, file_name, percent, progress_bar, status_line) =
+            state_card(&mut t, s, wifi, compact);
+        let gap3 = t.gap(0, if compact { 12 } else { 28 });
+        let received = received(&mut t, s, wifi, compact);
+        let gap4 = t.gap(0, if compact { 10 } else { 16 });
+        let formats = formats(&mut t, s, compact);
+        let gap5 = t.gap(0, if compact { 12 } else { 28 });
+        let (stop, toggle) = stop_button(&mut t, s, wifi, compact);
 
         let col = t.add(
             Node::column(0),
@@ -152,7 +172,7 @@ impl WifiUi {
 
 /// The header: the way back, the name of the page and the state of the
 /// connection.
-fn header(t: &mut Tree, s: &Styles, wifi: &Wifi) -> NodeId {
+fn header(t: &mut Tree, s: &Styles, wifi: &Wifi, compact: bool) -> NodeId {
     let glyph = t.icon(Icon::ChevronLeft, 44, INK);
     let back = t.add(
         Node::new(Kind::MinSize(Size::new(BACK_H, BACK_H)))
@@ -185,11 +205,11 @@ fn header(t: &mut Tree, s: &Styles, wifi: &Wifi) -> NodeId {
 
     let spacer = t.spacer(1);
     let row = t.add(Node::row(0).cross(Cross::Center), [left, spacer, right]);
-    t.fixed(None, Some(HEADER_H), Some(row))
+    t.fixed(None, Some(if compact { 88 } else { HEADER_H }), Some(row))
 }
 
 /// The card with the address the browser has to go to.
-fn address_card(t: &mut Tree, s: &Styles, wifi: &Wifi) -> NodeId {
+fn address_card(t: &mut Tree, s: &Styles, wifi: &Wifi, compact: bool) -> NodeId {
     let hint = t.label(
         if !wifi.connected {
             tr(Msg::WifiOffline)
@@ -208,18 +228,24 @@ fn address_card(t: &mut Tree, s: &Styles, wifi: &Wifi) -> NodeId {
         s.font_md().bold().line_height(1.2).tracking(1.0),
         Align::Center,
     ));
-    let gap = t.gap(0, 14);
+    let gap = t.gap(0, if compact { 8 } else { 14 });
     let inner = t.add(Node::column(0), [top, gap, address]);
+    let pad = if compact {
+        Insets::new(14, 24, 14, 24)
+    } else {
+        Insets::new(24, 32, 24, 32)
+    };
     t.add(
-        Node::new(Kind::Padding(Insets::new(24, 32, 24, 32)))
+        Node::new(Kind::Padding(pad))
             .bg(CARD)
-            .border(0, CARD, 32),
+            .border(0, CARD, if compact { 24 } else { 32 }),
         [inner],
     )
 }
 
 /// The three steps that tell the reader what to do.
-fn steps(t: &mut Tree, s: &Styles) -> NodeId {
+fn steps(t: &mut Tree, s: &Styles, compact: bool) -> NodeId {
+    let badge_side = if compact { 44 } else { BADGE };
     let mut rows = Vec::new();
     for (i, msg) in [Msg::WifiStep1, Msg::WifiStep2, Msg::WifiStep3]
         .into_iter()
@@ -230,20 +256,36 @@ fn steps(t: &mut Tree, s: &Styles) -> NodeId {
             s.font_xs().bold().line_height(1.0).gray(PAPER),
         );
         let badge = t.add(
-            Node::new(Kind::MinSize(Size::new(BADGE, BADGE)))
+            Node::new(Kind::MinSize(Size::new(badge_side, badge_side)))
                 .bg(INK)
-                .border(0, INK, BADGE / 2),
+                .border(0, INK, badge_side / 2),
             [number],
         );
-        let text = t.label(tr(msg), s.font_sm().line_height(1.4));
-        let row = t.add(Node::row(20).cross(Cross::Center), [badge, text]);
+        let text = t.label(
+            tr(msg),
+            if compact {
+                s.font_xs().line_height(1.3)
+            } else {
+                s.font_sm().line_height(1.4)
+            },
+        );
+        let row = t.add(
+            Node::row(if compact { 14 } else { 20 }).cross(Cross::Center),
+            [badge, text],
+        );
         rows.push(row);
     }
-    t.add(Node::column(16), rows)
+    t.add(Node::column(if compact { 8 } else { 16 }), rows)
 }
 
 /// The card that says what the transfer is doing.
-fn state_card(t: &mut Tree, s: &Styles, wifi: &Wifi) -> (NodeId, NodeId, NodeId, NodeId, NodeId) {
+fn state_card(
+    t: &mut Tree,
+    s: &Styles,
+    wifi: &Wifi,
+    compact: bool,
+) -> (NodeId, NodeId, NodeId, NodeId, NodeId) {
+    let phase_h = if compact { 52 } else { PHASE_H };
     let mut chips = Vec::new();
     for (phase, msg) in [
         (Phase::Waiting, Msg::WifiPhaseWaiting),
@@ -259,7 +301,7 @@ fn state_card(t: &mut Tree, s: &Styles, wifi: &Wifi) -> (NodeId, NodeId, NodeId,
         let chip = t.add(
             Node::new(Kind::Fixed {
                 w: None,
-                h: Some(PHASE_H),
+                h: Some(phase_h),
             })
             .flex(1)
             .bg(PAPER)
@@ -292,9 +334,9 @@ fn state_card(t: &mut Tree, s: &Styles, wifi: &Wifi) -> (NodeId, NodeId, NodeId,
         s.font_xs().gray(INK_MID).line_height(1.3),
     );
 
-    let gap1 = t.gap(0, 26);
-    let gap2 = t.gap(0, 16);
-    let gap3 = t.gap(0, 16);
+    let gap1 = t.gap(0, if compact { 14 } else { 26 });
+    let gap2 = t.gap(0, if compact { 10 } else { 16 });
+    let gap3 = t.gap(0, if compact { 10 } else { 16 });
     let inner = t.add(
         Node::column(0),
         [
@@ -307,17 +349,20 @@ fn state_card(t: &mut Tree, s: &Styles, wifi: &Wifi) -> (NodeId, NodeId, NodeId,
             status_line,
         ],
     );
+    let pad = if compact {
+        Insets::new(16, 24, 16, 24)
+    } else {
+        Insets::new(24, 32, 24, 32)
+    };
     let card = t.add(
-        Node::new(Kind::Padding(Insets::new(24, 32, 24, 32)))
-            .bg(CARD)
-            .border(0, CARD, 24),
+        Node::new(Kind::Padding(pad)).bg(CARD).border(0, CARD, 24),
         [inner],
     );
     (card, file_name, percent, progress_bar, status_line)
 }
 
 /// The files that have arrived.
-fn received(t: &mut Tree, s: &Styles, wifi: &Wifi) -> NodeId {
+fn received(t: &mut Tree, s: &Styles, wifi: &Wifi, compact: bool) -> NodeId {
     let count = wifi.received.len();
     let head = t.label(
         &tf!(Msg::WifiReceivedTitle, count = count),
@@ -330,9 +375,10 @@ fn received(t: &mut Tree, s: &Styles, wifi: &Wifi) -> NodeId {
     let spacer = t.spacer(1);
     let head_row = t.add(Node::row(0).cross(Cross::Center), [head, spacer, total]);
 
+    let limit = if compact { 2 } else { MAX_RECEIVED };
     let mut rows = Vec::new();
-    for book in wifi.received.iter().take(MAX_RECEIVED) {
-        let icon = t.custom(FileGlyph::new(FILE_ICON));
+    for book in wifi.received.iter().take(limit) {
+        let icon = t.custom(FileGlyph::new(if compact { 56 } else { FILE_ICON }));
         let name = t.label(&book.name, s.font_sm().bold().line_height(1.2));
         let meta = t.label(
             &format!("{} · {}", book.format, size_label(book.size)),
@@ -340,36 +386,41 @@ fn received(t: &mut Tree, s: &Styles, wifi: &Wifi) -> NodeId {
         );
         let texts = t.add(Node::column(4).cross(Cross::Start), [name, meta]);
         let spacer = t.spacer(1);
-        let tick = t.custom(Tick::new(TICK));
+        let tick = t.custom(Tick::new(if compact { 44 } else { TICK }));
         let row = t.add(
-            Node::row(20).cross(Cross::Center),
+            Node::row(if compact { 14 } else { 20 }).cross(Cross::Center),
             [icon, texts, spacer, tick],
         );
+        let pad = if compact {
+            Insets::new(10, 20, 10, 20)
+        } else {
+            Insets::new(18, 24, 18, 24)
+        };
         let card = t.add(
-            Node::new(Kind::Padding(Insets::new(18, 24, 18, 24)))
-                .bg(CARD)
-                .border(0, CARD, 24),
+            Node::new(Kind::Padding(pad)).bg(CARD).border(0, CARD, 20),
             [row],
         );
         rows.push(card);
     }
-    let list = t.add(Node::column(14), rows);
-    let gap = t.gap(0, 20);
+    let list = t.add(Node::column(if compact { 8 } else { 14 }), rows);
+    let gap = t.gap(0, if compact { 10 } else { 20 });
     t.add(Node::column(0), [head_row, gap, list])
 }
 
 /// The formats the device takes.
-fn formats(t: &mut Tree, s: &Styles) -> NodeId {
+fn formats(t: &mut Tree, s: &Styles, compact: bool) -> NodeId {
     let label = t.label(tr(Msg::WifiSupportedFormats), s.font_xs().gray(INK_MID));
-    // SLEEPIMG-001: the same transfer page takes the screensaver's own
-    // pictures. The line on the right of the heading says which ones, the
-    // size limit and the folder, without taking another row of height.
-    let pictures = t.label(tr(Msg::WifiPictureHint), s.font_xs().gray(INK_MID));
-    let spacer = t.spacer(1);
-    let head = t.add(
-        Node::row(12).cross(Cross::Center),
-        [label, spacer, pictures],
+    let mut pic_para = Paragraph::plain(
+        tr(Msg::WifiPictureHint),
+        s.font_xs().gray(INK_MID),
+        Align::Right,
     );
+    if compact {
+        pic_para.style.max_lines = Some(1);
+    }
+    let pictures = t.text(pic_para);
+    let pictures = t.add(Node::column(0).flex(1), [pictures]);
+    let head = t.add(Node::row(12).cross(Cross::Center), [label, pictures]);
     let mut chips = Vec::new();
     for msg in [
         Msg::WifiFormatEpub,
@@ -378,24 +429,25 @@ fn formats(t: &mut Tree, s: &Styles) -> NodeId {
         Msg::WifiFormatPdf,
         Msg::WifiFormatFont,
     ] {
-        // The chip is as wide as its text and 64 pixels tall, the way the
-        // prototype has it.
         let text = t.label(tr(msg), s.font_xs());
+        let pad = if compact {
+            Insets::new(6, 12, 6, 12)
+        } else {
+            Insets::new(11, 22, 11, 22)
+        };
         let chip = t.add(
-            Node::new(Kind::Padding(Insets::new(11, 22, 11, 22)))
-                .bg(PAPER)
-                .border(2, INK, 16),
+            Node::new(Kind::Padding(pad)).bg(PAPER).border(2, INK, 16),
             [text],
         );
         chips.push(chip);
     }
-    let row = t.add(Node::row(14), chips);
-    let gap = t.gap(0, 16);
+    let row = t.add(Node::row(if compact { 8 } else { 14 }), chips);
+    let gap = t.gap(0, if compact { 8 } else { 16 });
     t.add(Node::column(0), [head, gap, row])
 }
 
 /// The button that stops the transfer, or starts it again.
-fn stop_button(t: &mut Tree, s: &Styles, wifi: &Wifi) -> (NodeId, NodeId) {
+fn stop_button(t: &mut Tree, s: &Styles, wifi: &Wifi, compact: bool) -> (NodeId, NodeId) {
     let label = t.label(
         if wifi.running {
             tr(Msg::WifiStop)
@@ -408,7 +460,7 @@ fn stop_button(t: &mut Tree, s: &Styles, wifi: &Wifi) -> (NodeId, NodeId) {
     let button = t.add(
         Node::new(Kind::Fixed {
             w: None,
-            h: Some(96),
+            h: Some(if compact { 80 } else { 96 }),
         })
         .bg(PAPER)
         .border(2, INK, 20)

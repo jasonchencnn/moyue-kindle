@@ -361,6 +361,18 @@ fn cell(t: &mut Tree, s: &Styles, picture: NodeId, name: &str, picked: bool) -> 
 /// three columns take the same room as the prototype's, and the rest
 /// of the width is left between them.
 pub fn build(s: &Styles, view: &View<'_>, width: i32) -> (Tree, SleepImages) {
+    let est_h = (width as i64 * 4 / 3) as i32;
+    build_for_size(s, view, Size::new(width, est_h))
+}
+
+/// Builds the sleep-image picker for a panel of `size` native pixels.
+/// Six-inch panels scale thumbnail height down so all three rows of
+/// thumbnails and their file names stay visible above the pager.
+pub fn build_for_size(s: &Styles, view: &View<'_>, size: Size) -> (Tree, SleepImages) {
+    let compact =
+        crate::theme::PanelLayout::for_size(size, s.density) == crate::theme::PanelLayout::Compact;
+    let cell_h = if compact { 256 } else { CELL_H };
+    let row_gap = if compact { 14 } else { 24 };
     let mut t = Tree::new();
 
     let status = status_line(&mut t, s, &view.status).root;
@@ -420,9 +432,10 @@ pub fn build(s: &Styles, view: &View<'_>, width: i32) -> (Tree, SleepImages) {
     hint_para.style.max_lines = Some(1);
     let hint = t.text(hint_para);
 
-    // The columns are spread over the width of the page, like the
+    // The columns are spread over the reference width of the page, like the
     // prototype's `justify-content: space-between`.
-    let available = (width - 2 * home_margin()).max(1);
+    let ref_width = (size.w as f32 * 300.0 / s.density.dpi() as f32).round() as i32;
+    let available = (ref_width - 2 * home_margin()).max(1);
     let col_gap = ((available - 3 * CELL_W) / 2).max(1);
 
     let mut cells = Vec::new();
@@ -433,7 +446,7 @@ pub fn build(s: &Styles, view: &View<'_>, width: i32) -> (Tree, SleepImages) {
     if view.rotate_all {
         let picked = view.rotation_picked;
         let picture = t.custom(RotateAll { picked });
-        let picture = t.fixed(Some(CELL_W), Some(CELL_H), Some(picture));
+        let picture = t.fixed(Some(CELL_W), Some(cell_h), Some(picture));
         let cell = cell(&mut t, s, picture, tr(Msg::SleepImagesRotateAll), picked);
         let cell = t.add(
             Node::new(Kind::Fixed {
@@ -453,7 +466,7 @@ pub fn build(s: &Styles, view: &View<'_>, width: i32) -> (Tree, SleepImages) {
             image: picture.thumb.clone(),
             picked: picture.picked,
         });
-        let thumb = t.fixed(Some(CELL_W), Some(CELL_H), Some(thumb));
+        let thumb = t.fixed(Some(CELL_W), Some(cell_h), Some(thumb));
         let cell = cell(&mut t, s, thumb, &picture.name, picture.picked);
         let cell = t.add(
             Node::new(Kind::Fixed {
@@ -484,7 +497,7 @@ pub fn build(s: &Styles, view: &View<'_>, width: i32) -> (Tree, SleepImages) {
     for (i, r) in row_nodes.iter().enumerate() {
         grid_children.push(*r);
         if i + 1 < row_nodes.len() {
-            grid_children.push(t.gap(0, 24));
+            grid_children.push(t.gap(0, row_gap));
         }
     }
     let grid = t.add(Node::column(0), grid_children);

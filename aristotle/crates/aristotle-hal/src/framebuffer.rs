@@ -20,21 +20,25 @@
 //!
 //! Coordinates are framebuffer pixels in portrait orientation: (0, 0) is the
 //! top-left corner. The visible area is the driver's own: 1072 × 1448 on the
-//! PW4, 1264 × 1680 on the Oasis 2. Gray levels are 8-bit, with 0 black and
-//! 255 white.
+//! PW4, 1264 × 1680 on the Oasis 2 and 1860 × 2480 on the Scribe. Drivers that
+//! report their native landscape `xres`/`yres` are normalized to portrait at
+//! open with `aristotle_screen::model::Geometry::normalize`. Gray levels are
+//! 8-bit, with 0 black and 255 white.
 //!
 //! # ABI
 //!
-//! The update struct layout comes from FBInk's `eink/mxcfb-kindle.h`:
-//! `mxcfb_update_data_rex` (80 bytes) on the PW4 and
-//! `mxcfb_update_data_zelda` (88 bytes) on the Oasis 2, both checked at
-//! compile time below. Plato's Kobo struct has a different field order and
+//! The update struct layouts come from FBInk's `eink/mxcfb-kindle.h`:
+//! `mxcfb_update_data` (72 bytes) on the older Kindles,
+//! `mxcfb_update_data_rex` (80 bytes) on the PW4,
+//! `mxcfb_update_data_zelda` (88 bytes) on the Oasis 2/3 and
+//! `mxcfb_update_data_mtk` (96 bytes) on the PW5 and Scribe. All are checked
+//! at compile time below. Plato's Kobo struct has a different field order and
 //! size and must not be reused.
 //!
-//! Which of the two a device speaks is read from the device itself, from the
+//! Which layout a device speaks is read from the device itself, from the
 //! serial number in `/proc/usid`; see [`crate::platform`]. The driver answers
-//! a request in the other layout with EINVAL, so guessing would leave the
-//! panel blank.
+//! a request in another layout with EINVAL, so guessing would leave the panel
+//! blank.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -43,16 +47,32 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use aristotle_screen::model::KoboModel;
+
 use crate::platform::Platform;
 
-const FBIOGET_VSCREENINFO: libc::c_ulong = 0x4600;
-const FBIOGET_FSCREENINFO: libc::c_ulong = 0x4602;
+pub(crate) const FBIOGET_VSCREENINFO: libc::c_ulong = 0x4600;
+const FBIOPUT_VSCREENINFO: libc::c_ulong = 0x4601;
+pub(crate) const FBIOGET_FSCREENINFO: libc::c_ulong = 0x4602;
+/// `_IOW('F', 0x2E, struct mxcfb_update_data)`, 72-byte payload.
+const MXCFB_SEND_UPDATE_K51: libc::c_ulong = 0x4048_462E;
 /// `_IOW('F', 0x2E, struct mxcfb_update_data_rex)`, 80-byte payload.
 const MXCFB_SEND_UPDATE_REX: libc::c_ulong = 0x4050_462E;
 /// `_IOW('F', 0x2E, struct mxcfb_update_data_zelda)`, 88-byte payload.
 const MXCFB_SEND_UPDATE_ZELDA: libc::c_ulong = 0x4058_462E;
+/// `_IOW('F', 0x2E, struct mxcfb_update_data_mtk)`, 96-byte payload.
+const MXCFB_SEND_UPDATE_MTK: libc::c_ulong = 0x4060_462E;
 /// `_IOWR('F', 0x2F, struct mxcfb_update_marker_data)`.
 const MXCFB_WAIT_FOR_UPDATE_COMPLETE: libc::c_ulong = 0xC008_462F;
+
+/// Which panel backend this framebuffer drives. Kindle models use their EPDC
+/// layout; Kobo models use [`crate::kobo`]'s i.MX EPDC layout. The two are
+/// dispatched here so the rest of the HAL keeps one `Framebuffer` API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    Kindle(Platform),
+    Kobo(KoboModel),
+}
 
 /// The size an `_IOW` request carries: bits 16 to 29 of its number.
 const fn iow_size(request: libc::c_ulong) -> usize {
@@ -62,6 +82,12 @@ const fn iow_size(request: libc::c_ulong) -> usize {
 const UPDATE_MODE_PARTIAL: u32 = 0;
 const UPDATE_MODE_FULL: u32 = 1;
 const TEMP_USE_AMBIENT: i32 = 0x1000;
+/// `TEMP_USE_AUTO` (the same value as `TEMP_USE_PAPYRUS`): the temperature
+/// the older K51 driver expects from user space.
+const TEMP_USE_AUTO: i32 = 0x1001;
+/// `EPDC_FLAG_FORCE_MONOCHROME`: an any-to-2-bit update, used for DU on the
+/// K51 and MTK drivers when the pixels are not dithered.
+const EPDC_FLAG_FORCE_MONOCHROME: u32 = 0x02;
 /// `EPDC_FLAG_ENABLE_INVERSION` from FBInk's `mxcfb-kindle.h`: the PXP
 /// inverts the update region on its way from the framebuffer to the panel.
 /// FBInk and KOReader report it as working on mxcfb Kindles (`canHWInvert`).
@@ -239,6 +265,32 @@ struct UpdateDataRex {
     hist_gray_waveform_mode: u32,
 }
 
+/// `mxcfb_update_data`: the update request of the older Kindle driver, used
+/// by the K51 models (Voyage, PW3, Oasis 1 and the KT3). The history modes
+/// come before `temp`, unlike in the Rex/Zelda layout.
+#[repr(C)]
+#[derive(Default)]
+struct UpdateDataK51 {
+    update_region: Rect,
+    waveform_mode: u32,
+    update_mode: u32,
+    update_marker: u32,
+    hist_bw_waveform_mode: u32,
+    hist_gray_waveform_mode: u32,
+    temp: i32,
+    flags: u32,
+    alt_buffer_data: AltBufferData,
+}
+
+/// The swipe-animation fields of the MTK update request. They are ignored
+/// unless `MTK_EPDC_FLAG_ENABLE_SWIPE` is set, which this code never does.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SwipeData {
+    direction: u32,
+    steps: u32,
+}
+
 /// `mxcfb_update_data_zelda`: the update request of the Oasis 2's driver.
 /// The same fields as the Rex one, plus the two timestamps the driver fills
 /// in on its way to the panel.
@@ -282,15 +334,43 @@ impl UpdateDataZelda {
     }
 }
 
+/// `mxcfb_update_data_mtk`: the update request of the PW5/Scribe driver.
+/// The same fields as the Zelda one, with the swipe fields before the
+/// history modes.
+#[repr(C)]
+#[derive(Default)]
+struct UpdateDataMtk {
+    update_region: Rect,
+    waveform_mode: u32,
+    update_mode: u32,
+    update_marker: u32,
+    temp: i32,
+    flags: u32,
+    dither_mode: i32,
+    quant_bit: i32,
+    alt_buffer_data: AltBufferData,
+    swipe_data: SwipeData,
+    hist_bw_waveform_mode: u32,
+    hist_gray_waveform_mode: u32,
+    ts_pxp: u32,
+    ts_epdc: u32,
+}
+
 // The struct layouts are the driver's ABI: their sizes are fixed, and an
 // `_IOW` request number carries the size of its payload, so the two must
 // agree.
+const _: () = assert!(std::mem::size_of::<UpdateDataK51>() == 72);
 const _: () = assert!(std::mem::size_of::<UpdateDataRex>() == 80);
 const _: () = assert!(std::mem::size_of::<UpdateDataZelda>() == 88);
+const _: () = assert!(std::mem::size_of::<UpdateDataMtk>() == 96);
+const _: () = assert!(iow_size(MXCFB_SEND_UPDATE_K51) == std::mem::size_of::<UpdateDataK51>());
 const _: () = assert!(iow_size(MXCFB_SEND_UPDATE_REX) == std::mem::size_of::<UpdateDataRex>());
 const _: () = assert!(iow_size(MXCFB_SEND_UPDATE_ZELDA) == std::mem::size_of::<UpdateDataZelda>());
+const _: () = assert!(iow_size(MXCFB_SEND_UPDATE_MTK) == std::mem::size_of::<UpdateDataMtk>());
+const _: () = assert!(MXCFB_SEND_UPDATE_K51 == 0x4048_462E);
 const _: () = assert!(MXCFB_SEND_UPDATE_REX == 0x4050_462E);
 const _: () = assert!(MXCFB_SEND_UPDATE_ZELDA == 0x4058_462E);
+const _: () = assert!(MXCFB_SEND_UPDATE_MTK == 0x4060_462E);
 
 #[repr(C)]
 struct UpdateMarkerData {
@@ -308,7 +388,7 @@ struct FbBitfield {
 
 #[repr(C)]
 #[derive(Default)]
-struct VarScreenInfo {
+pub(crate) struct VarScreenInfo {
     xres: u32,
     yres: u32,
     xres_virtual: u32,
@@ -341,7 +421,7 @@ struct VarScreenInfo {
 }
 
 #[repr(C)]
-struct FixScreenInfo {
+pub(crate) struct FixScreenInfo {
     id: [u8; 16],
     smem_start: libc::c_ulong,
     smem_len: u32,
@@ -369,7 +449,7 @@ pub struct Updater {
     height: u32,
     next_marker: u32,
     invert: Arc<AtomicBool>,
-    platform: Platform,
+    backend: Backend,
 }
 
 impl Updater {
@@ -411,7 +491,7 @@ impl Updater {
         let flags = update_flags(&self.invert);
         send_update(
             &self.file,
-            self.platform,
+            self.backend,
             rect,
             waveform,
             full,
@@ -426,15 +506,21 @@ impl Updater {
 /// live on a measurement thread.
 pub struct UpdateWaiter {
     file: File,
+    backend: Backend,
 }
 
 impl UpdateWaiter {
     pub fn wait(&self, marker: u32) -> io::Result<()> {
-        let mut data = UpdateMarkerData {
-            update_marker: marker,
-            collision_test: 0,
-        };
-        ioctl(&self.file, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &mut data)
+        match self.backend {
+            Backend::Kobo(_) => crate::kobo::wait_for_update(&self.file, marker),
+            Backend::Kindle(_) => {
+                let mut data = UpdateMarkerData {
+                    update_marker: marker,
+                    collision_test: 0,
+                };
+                ioctl(&self.file, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &mut data)
+            }
+        }
     }
 }
 
@@ -464,7 +550,29 @@ pub struct Framebuffer {
     /// Hardware inversion for every update, shared with [`Updater`]s.
     invert: Arc<AtomicBool>,
     /// The update ABI this device speaks.
+    backend: Backend,
+    restore_grayscale: Option<u32>,
+}
+
+/// Preserve valid driver coordinates, including a real landscape layout.
+fn runtime_geometry(
     platform: Platform,
+    xres: u32,
+    yres: u32,
+    stride: u32,
+) -> io::Result<(u32, u32)> {
+    let (width, height) = if platform == Platform::Mtk && xres > stride && yres <= stride {
+        (yres, xres)
+    } else {
+        (xres, yres)
+    };
+    if width == 0 || height == 0 || width > stride {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "framebuffer dimensions exceed its row stride",
+        ));
+    }
+    Ok((width, height))
 }
 
 /// The waveform to send on `platform` for a requested one.
@@ -475,15 +583,94 @@ pub struct Framebuffer {
 /// FBInk full flashing refreshes, the backlight sampled every 20 ms: GCK16
 /// 1114 → 4 → 1114, GC16 and GLKW16 a steady 1114 (H-010). The PW4 keeps
 /// `GCK16`, its stock UI's flash.
+///
+/// The MTK driver has the same split as KOReader's `refresh_mtk`: `GCK16`
+/// and `GLKW16` are its night waveforms, while day mode uses `GC16`/`GL16`.
+/// Sending the night values in day mode can leave a full-screen update
+/// undisplayed, which looks like a blank layer with only small repaints
+/// working. The K51 driver uses the older numbering: A2 is 4, GL16 is 5,
+/// GLR16 is 8 and GLD16 is 9.
 fn device_waveform(platform: Platform, waveform: Waveform) -> Waveform {
     match (platform, waveform) {
         (Platform::Zelda, Waveform::GCK16) => Waveform::GC16,
+        (Platform::Mtk, Waveform::GCK16) => Waveform::GC16,
+        (Platform::Mtk, Waveform::GLKW16) => Waveform::GL16,
+        (Platform::K51, Waveform::A2) => Waveform(4),
+        (Platform::K51, Waveform::GL16) => Waveform(5),
+        (Platform::K51, Waveform::GLR16) => Waveform(8),
+        (Platform::K51, Waveform::GLD16) => Waveform(9),
+        (Platform::K51, Waveform::GCK16) => Waveform::GC16,
+        (Platform::K51, Waveform::GLKW16) => Waveform(5),
         _ => waveform,
     }
 }
 
-/// Ask the EPDC to drive `rect`, in the layout `platform` expects.
+/// The history modes the older driver expects alongside `waveform`; REAGL
+/// updates ask for the same mode in both, as KOReader's `refresh_k51` does.
+fn k51_history(waveform: Waveform) -> (u32, u32) {
+    match waveform.0 {
+        8 | 9 => (waveform.0, waveform.0),
+        2 => (Waveform::DU.0, Waveform::GC16.0),
+        // `WAVEFORM_MODE_GC16_FAST` in the older numbering.
+        _ => (Waveform::DU.0, 3),
+    }
+}
+
+/// The history modes the MTK driver expects. As in KOReader's
+/// `refresh_mtk`, only GLR16/GLD16 request their own mode in both slots.
+fn mtk_history(waveform: Waveform) -> (u32, u32) {
+    match waveform.0 {
+        4 | 5 => (waveform.0, waveform.0),
+        _ => (Waveform::DU.0, Waveform::GC16.0),
+    }
+}
+
+/// Whether the request must drive every pixel for this platform/waveform.
+fn full_update(platform: Platform, waveform: Waveform, full: bool) -> bool {
+    // REAGL updates drive every pixel on the K51/MTK drivers.
+    full || (platform == Platform::K51 && matches!(waveform.0, 8 | 9))
+        || (platform == Platform::Mtk && matches!(waveform.0, 4 | 5))
+}
+
+/// The flags for this platform/waveform, on top of the caller's.
+fn platform_flags(platform: Platform, waveform: Waveform, flags: u32) -> u32 {
+    // An any-to-2-bit DU update needs the monochrome flag when it is not
+    // dithered. A2 is left alone: forcing it would crush antialiased glyphs.
+    if matches!(platform, Platform::K51 | Platform::Mtk) && waveform == Waveform::DU {
+        flags | EPDC_FLAG_FORCE_MONOCHROME
+    } else {
+        flags
+    }
+}
+
+/// Ask the EPDC to drive `rect`, in the layout this backend expects.
 fn send_update(
+    file: &File,
+    backend: Backend,
+    rect: Rect,
+    waveform: Waveform,
+    full: bool,
+    marker: u32,
+    flags: u32,
+) -> io::Result<()> {
+    match backend {
+        Backend::Kobo(model) => crate::kobo::send_update(
+            file,
+            model,
+            rect,
+            waveform,
+            full,
+            marker,
+            flags & EPDC_FLAG_ENABLE_INVERSION != 0,
+        ),
+        Backend::Kindle(platform) => {
+            send_update_kindle(file, platform, rect, waveform, full, marker, flags)
+        }
+    }
+}
+
+/// The Kindle EPDC layout.
+fn send_update_kindle(
     file: &File,
     platform: Platform,
     rect: Rect,
@@ -492,9 +679,12 @@ fn send_update(
     marker: u32,
     flags: u32,
 ) -> io::Result<()> {
+    let waveform = device_waveform(platform, waveform);
+    let full = full_update(platform, waveform, full);
+    let flags = platform_flags(platform, waveform, flags);
     let mut rex = UpdateDataRex {
         update_region: rect,
-        waveform_mode: device_waveform(platform, waveform).0,
+        waveform_mode: waveform.0,
         update_mode: if full {
             UPDATE_MODE_FULL
         } else {
@@ -506,15 +696,50 @@ fn send_update(
         ..Default::default()
     };
     match platform {
+        Platform::K51 => {
+            let (hist_bw, hist_gray) = k51_history(waveform);
+            let mut k51 = UpdateDataK51 {
+                update_region: rect,
+                waveform_mode: waveform.0,
+                update_mode: rex.update_mode,
+                update_marker: marker,
+                hist_bw_waveform_mode: hist_bw,
+                hist_gray_waveform_mode: hist_gray,
+                temp: TEMP_USE_AUTO,
+                flags,
+                alt_buffer_data: AltBufferData::default(),
+            };
+            ioctl(file, MXCFB_SEND_UPDATE_K51, &mut k51)
+        }
         Platform::Rex => ioctl(file, MXCFB_SEND_UPDATE_REX, &mut rex),
         Platform::Zelda => {
             let mut zelda = UpdateDataZelda::from_rex(&rex);
             ioctl(file, MXCFB_SEND_UPDATE_ZELDA, &mut zelda)
         }
+        Platform::Mtk => {
+            let (hist_bw, hist_gray) = mtk_history(waveform);
+            let mut mtk = UpdateDataMtk {
+                update_region: rect,
+                waveform_mode: waveform.0,
+                update_mode: rex.update_mode,
+                update_marker: marker,
+                temp: TEMP_USE_AMBIENT,
+                flags,
+                hist_bw_waveform_mode: hist_bw,
+                hist_gray_waveform_mode: hist_gray,
+                swipe_data: SwipeData::default(),
+                ..Default::default()
+            };
+            ioctl(file, MXCFB_SEND_UPDATE_MTK, &mut mtk)
+        }
+        Platform::KoboImx => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Platform::KoboImx is a label; Kobo updates go through crate::kobo",
+        )),
     }
 }
 
-fn ioctl<T>(file: &File, request: libc::c_ulong, arg: *mut T) -> io::Result<()> {
+pub(crate) fn ioctl<T>(file: &File, request: libc::c_ulong, arg: *mut T) -> io::Result<()> {
     // SAFETY: `arg` points to a properly sized, initialised #[repr(C)] value
     // matching `request`, and the fd stays open for the call.
     let rc = unsafe { libc::ioctl(file.as_raw_fd(), request as _, arg) };
@@ -526,17 +751,39 @@ fn ioctl<T>(file: &File, request: libc::c_ulong, arg: *mut T) -> io::Result<()> 
 }
 
 impl Framebuffer {
-    /// Open and map the framebuffer (normally `/dev/fb0`). Fails unless the
-    /// driver reports 8 bits per pixel, the only format this code draws.
+    /// Open and map the framebuffer (normally `/dev/fb0`).
     ///
-    /// The update ABI is the one this device speaks, read from its serial
-    /// number; see [`crate::platform`].
+    /// A Kobo is detected from its firmware tag and product name
+    /// ([`crate::platform::detect_kobo`]); everything else keeps the Kindle
+    /// serial-number detection. Fails unless the driver reports 8 bits per
+    /// pixel, the only format this code draws.
     pub fn open(path: &str) -> io::Result<Self> {
-        Self::open_with(path, Platform::detect()?)
+        match crate::platform::detect_kobo()? {
+            Some(kobo) => Self::open_kobo(path, kobo.model),
+            None => Self::open_with(path, Platform::detect()?),
+        }
     }
 
-    /// Open the framebuffer for a known platform.
+    /// Open the framebuffer for a known Kobo model.
+    pub fn open_kobo(path: &str, model: KoboModel) -> io::Result<Self> {
+        Self::open_backend(path, Backend::Kobo(model))
+    }
+
+    /// Open the framebuffer for a known Kindle platform.
+    ///
+    /// `Platform::KoboImx` is only a label; Kobo requests are built by
+    /// [`crate::kobo`], so it is refused here.
     pub fn open_with(path: &str, platform: Platform) -> io::Result<Self> {
+        if platform == Platform::KoboImx {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Platform::KoboImx is a label; use Framebuffer::open_kobo",
+            ));
+        }
+        Self::open_backend(path, Backend::Kindle(platform))
+    }
+
+    fn open_backend(path: &str, backend: Backend) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let mut var = VarScreenInfo::default();
         ioctl(&file, FBIOGET_VSCREENINFO, &mut var)?;
@@ -544,12 +791,55 @@ impl Framebuffer {
         let mut fix: FixScreenInfo = unsafe { std::mem::zeroed() };
         ioctl(&file, FBIOGET_FSCREENINFO, &mut fix)?;
         if var.bits_per_pixel != 8 {
+            let detail = match backend {
+                Backend::Kobo(model) => format!(
+                    "Kobo {} framebuffer reports {} bpp; this build draws 8 bpp only",
+                    model.name(),
+                    var.bits_per_pixel
+                ),
+                Backend::Kindle(_) => {
+                    format!("expected 8 bpp, driver reports {}", var.bits_per_pixel)
+                }
+            };
+            return Err(io::Error::new(io::ErrorKind::Unsupported, detail));
+        }
+        let (width, height) = match backend {
+            Backend::Kindle(platform) => {
+                runtime_geometry(platform, var.xres, var.yres, fix.line_length)?
+            }
+            Backend::Kobo(model) => {
+                let g = crate::kobo::KoboGeometry::validate(
+                    model,
+                    var.xres,
+                    var.yres,
+                    fix.line_length,
+                    var.bits_per_pixel,
+                    var.rotate,
+                )?;
+                (g.width, g.height)
+            }
+        };
+        eprintln!(
+            "aristotle: framebuffer {:?} {}x{} stride={} bpp={} rotate={} grayscale={}",
+            backend,
+            var.xres,
+            var.yres,
+            fix.line_length,
+            var.bits_per_pixel,
+            var.rotate,
+            var.grayscale
+        );
+        let map_len = fix.smem_len as usize;
+        let visible_len = u64::from(fix.line_length) * u64::from(height);
+        if u64::from(fix.smem_len) < visible_len {
             return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("expected 8 bpp, driver reports {}", var.bits_per_pixel),
+                io::ErrorKind::InvalidData,
+                format!(
+                    "framebuffer maps {} bytes, needs {visible_len} for {width}x{height}",
+                    fix.smem_len
+                ),
             ));
         }
-        let map_len = fix.smem_len as usize;
         // SAFETY: mapping the device's own framebuffer memory with its reported length.
         let ptr = unsafe {
             libc::mmap(
@@ -565,13 +855,13 @@ impl Framebuffer {
             return Err(io::Error::last_os_error());
         }
         let id_len = fix.id.iter().position(|&b| b == 0).unwrap_or(fix.id.len());
-        Ok(Self {
+        let mut framebuffer = Self {
             file,
             map: NonNull::new(ptr.cast()).expect("mmap returned null"),
             map_len,
             geometry: Geometry {
-                width: var.xres,
-                height: var.yres,
+                width,
+                height,
                 stride: fix.line_length,
                 bits_per_pixel: var.bits_per_pixel,
                 x_offset: var.xoffset,
@@ -581,8 +871,36 @@ impl Framebuffer {
             id: String::from_utf8_lossy(&fix.id[..id_len]).into_owned(),
             next_marker: 1,
             invert: Arc::new(AtomicBool::new(false)),
-            platform,
-        })
+            backend,
+            restore_grayscale: None,
+        };
+        if backend == Backend::Kindle(Platform::Mtk) {
+            if var.grayscale > 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "unsupported MTK framebuffer grayscale mode {}",
+                        var.grayscale
+                    ),
+                ));
+            }
+            if var.grayscale == 2 {
+                // The app renders night mode itself; MTK's driver night mode omits GL16/DU.
+                framebuffer.restore_grayscale = Some(var.grayscale);
+                var.grayscale = 1;
+                ioctl(&framebuffer.file, FBIOPUT_VSCREENINFO, &mut var)?;
+                let mut current = VarScreenInfo::default();
+                ioctl(&framebuffer.file, FBIOGET_VSCREENINFO, &mut current)?;
+                if current.grayscale != 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "MTK driver did not enable grayscale day waveforms",
+                    ));
+                }
+                eprintln!("aristotle: MTK driver grayscale 2 -> 1; restoring on exit");
+            }
+        }
+        Ok(framebuffer)
     }
 
     /// A handle that can wait for update markers on another thread, to measure
@@ -590,6 +908,7 @@ impl Framebuffer {
     pub fn waiter(&self) -> io::Result<UpdateWaiter> {
         Ok(UpdateWaiter {
             file: self.file.try_clone()?,
+            backend: self.backend,
         })
     }
 
@@ -601,13 +920,18 @@ impl Framebuffer {
             height: self.geometry.height,
             next_marker: 0x8000_0000,
             invert: self.invert.clone(),
-            platform: self.platform,
+            backend: self.backend,
         })
     }
 
-    /// The update ABI this device speaks.
+    /// The update ABI this device speaks. Kobo panels report
+    /// [`Platform::KoboImx`], which is a label: their request layout is built
+    /// by [`crate::kobo`].
     pub fn platform(&self) -> Platform {
-        self.platform
+        match self.backend {
+            Backend::Kindle(platform) => platform,
+            Backend::Kobo(_) => Platform::KoboImx,
+        }
     }
 
     /// Hardware night mode: from now on every update, from this handle and
@@ -756,7 +1080,7 @@ impl Framebuffer {
         let flags = update_flags(&self.invert);
         send_update(
             &self.file,
-            self.platform,
+            self.backend,
             rect,
             waveform,
             full,
@@ -769,11 +1093,16 @@ impl Framebuffer {
     /// Block until the update with `marker` has been displayed.
     pub fn wait(&self, marker: Option<u32>) -> io::Result<()> {
         let Some(marker) = marker else { return Ok(()) };
-        let mut data = UpdateMarkerData {
-            update_marker: marker,
-            collision_test: 0,
-        };
-        ioctl(&self.file, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &mut data)
+        match self.backend {
+            Backend::Kobo(_) => crate::kobo::wait_for_update(&self.file, marker),
+            Backend::Kindle(_) => {
+                let mut data = UpdateMarkerData {
+                    update_marker: marker,
+                    collision_test: 0,
+                };
+                ioctl(&self.file, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &mut data)
+            }
+        }
     }
 
     /// Draw a thick line by stamping squares of half-width `r` along it, spaced
@@ -829,11 +1158,49 @@ impl Drop for Framebuffer {
     fn drop(&mut self) {
         // SAFETY: unmapping exactly the region mapped in `open`.
         unsafe { libc::munmap(self.map.as_ptr().cast(), self.map_len) };
+        if let Some(grayscale) = self.restore_grayscale {
+            let mut current = VarScreenInfo::default();
+            let restored = ioctl(&self.file, FBIOGET_VSCREENINFO, &mut current).and_then(|()| {
+                current.grayscale = grayscale;
+                ioctl(&self.file, FBIOPUT_VSCREENINFO, &mut current)
+            });
+            if let Err(error) = restored {
+                eprintln!("aristotle: could not restore MTK grayscale mode: {error}");
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_kobo_label_is_not_a_kindle_opener() {
+        let result = Framebuffer::open_with("/dev/null", Platform::KoboImx);
+        assert!(matches!(
+            result,
+            Err(ref error) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn runtime_geometry_preserves_landscape_and_limits_the_mtk_workaround() {
+        use super::*;
+        assert_eq!(
+            runtime_geometry(Platform::Mtk, 1860, 2480, 1872).unwrap(),
+            (1860, 2480)
+        );
+        assert_eq!(
+            runtime_geometry(Platform::Mtk, 2480, 1860, 2496).unwrap(),
+            (2480, 1860)
+        );
+        assert_eq!(
+            runtime_geometry(Platform::Mtk, 2480, 1860, 1872).unwrap(),
+            (1860, 2480)
+        );
+        assert!(runtime_geometry(Platform::Rex, 2480, 1860, 1872).is_err());
+        assert!(runtime_geometry(Platform::Mtk, 0, 1860, 1872).is_err());
+    }
+
     #[test]
     fn the_oasis_flashes_with_gc16_to_leave_the_light_alone() {
         use super::*;
@@ -867,5 +1234,87 @@ mod tests {
         let mut dst = vec![0; 256];
         invert_into(&mut dst, &src);
         assert!(dst.iter().enumerate().all(|(i, &v)| v as usize == 255 - i));
+    }
+
+    #[test]
+    fn the_mtk_day_waveforms_do_not_use_the_night_modes() {
+        assert_eq!(
+            device_waveform(Platform::Mtk, Waveform::GCK16),
+            Waveform::GC16
+        );
+        assert_eq!(
+            device_waveform(Platform::Mtk, Waveform::GLKW16),
+            Waveform::GL16
+        );
+        assert_eq!(
+            device_waveform(Platform::Mtk, Waveform::GL16),
+            Waveform::GL16
+        );
+        assert_eq!(device_waveform(Platform::Mtk, Waveform::DU), Waveform::DU);
+        assert_eq!(device_waveform(Platform::Mtk, Waveform::A2), Waveform::A2);
+    }
+
+    #[test]
+    fn the_k51_waveforms_use_the_older_numbering() {
+        assert_eq!(device_waveform(Platform::K51, Waveform::A2), Waveform(4));
+        assert_eq!(device_waveform(Platform::K51, Waveform::GL16), Waveform(5));
+        assert_eq!(device_waveform(Platform::K51, Waveform::GLR16), Waveform(8));
+        assert_eq!(device_waveform(Platform::K51, Waveform::GLD16), Waveform(9));
+        assert_eq!(
+            device_waveform(Platform::K51, Waveform::GCK16),
+            Waveform::GC16
+        );
+        assert_eq!(
+            device_waveform(Platform::K51, Waveform::GLKW16),
+            Waveform(5)
+        );
+    }
+
+    #[test]
+    fn the_reagl_updates_are_full_and_du_is_monochrome() {
+        assert!(full_update(Platform::Mtk, Waveform(4), false));
+        assert!(full_update(Platform::Mtk, Waveform(5), false));
+        assert!(full_update(Platform::K51, Waveform(8), false));
+        assert!(full_update(Platform::K51, Waveform(9), false));
+        assert!(!full_update(Platform::Mtk, Waveform::GL16, false));
+        assert!(full_update(Platform::Rex, Waveform::GC16, true));
+
+        assert_eq!(
+            platform_flags(Platform::Mtk, Waveform::DU, 0),
+            EPDC_FLAG_FORCE_MONOCHROME
+        );
+        assert_eq!(
+            platform_flags(Platform::K51, Waveform::DU, 0),
+            EPDC_FLAG_FORCE_MONOCHROME
+        );
+        assert_eq!(platform_flags(Platform::Rex, Waveform::DU, 0), 0);
+        assert_eq!(platform_flags(Platform::Mtk, Waveform::A2, 0), 0);
+    }
+
+    #[test]
+    fn the_k51_and_mtk_history_modes_match_koreader() {
+        assert_eq!(k51_history(Waveform(8)), (8, 8));
+        assert_eq!(k51_history(Waveform(9)), (9, 9));
+        assert_eq!(k51_history(Waveform::GC16), (Waveform::DU.0, 2));
+        assert_eq!(k51_history(Waveform(5)), (Waveform::DU.0, 3));
+
+        assert_eq!(mtk_history(Waveform(4)), (4, 4));
+        assert_eq!(mtk_history(Waveform(5)), (5, 5));
+        assert_eq!(mtk_history(Waveform(3)), (Waveform::DU.0, 2));
+    }
+
+    #[test]
+    fn the_update_layouts_have_the_driver_sizes() {
+        assert_eq!(std::mem::size_of::<UpdateDataK51>(), 72);
+        assert_eq!(std::mem::size_of::<UpdateDataRex>(), 80);
+        assert_eq!(std::mem::size_of::<UpdateDataZelda>(), 88);
+        assert_eq!(std::mem::size_of::<UpdateDataMtk>(), 96);
+        assert_eq!(iow_size(MXCFB_SEND_UPDATE_K51), 72);
+        assert_eq!(iow_size(MXCFB_SEND_UPDATE_REX), 80);
+        assert_eq!(iow_size(MXCFB_SEND_UPDATE_ZELDA), 88);
+        assert_eq!(iow_size(MXCFB_SEND_UPDATE_MTK), 96);
+        // The Kindle Carta wait, used by the K51/Rex/Zelda/MTK branches.
+        assert_eq!(MXCFB_WAIT_FOR_UPDATE_COMPLETE, 0xC008_462F);
+        assert_eq!(std::mem::size_of::<UpdateMarkerData>(), 8);
     }
 }

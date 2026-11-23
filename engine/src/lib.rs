@@ -27,10 +27,12 @@ pub mod crengine;
 pub use error::{Error, Result};
 pub use interaction::{Link, LinkTarget, Word};
 pub use layout::{
-    validate_page_size, LayoutSettings, Margins, DEFAULT_FONT_SIZE_PX,
-    DEFAULT_LINE_SPACING_PERCENT, DEFAULT_MARGIN_HORIZONTAL_PX, DEFAULT_MARGIN_VERTICAL_PX,
-    MAX_FONT_SIZE_PX, MAX_LINE_SPACING_PERCENT, MAX_MARGIN_PX, MAX_PAGE_DIMENSION_PX,
-    MIN_FONT_SIZE_PX, MIN_LINE_SPACING_PERCENT, MIN_PAGE_DIMENSION_PX,
+    validate_page_size, LayoutSettings, Margins, DEFAULT_DPI, DEFAULT_FONT_SIZE_PX,
+    DEFAULT_FONT_WEIGHT, DEFAULT_LINE_SPACING_PERCENT, DEFAULT_MARGIN_HORIZONTAL_PX,
+    DEFAULT_MARGIN_VERTICAL_PX, FONT_WEIGHT_BOLD, FONT_WEIGHT_LIGHT, FONT_WEIGHT_NORMAL, MAX_DPI,
+    MAX_FONT_SIZE_PX, MAX_FONT_WEIGHT, MAX_LINE_SPACING_PERCENT, MAX_MARGIN_PX,
+    MAX_PAGE_DIMENSION_PX, MIN_DPI, MIN_FONT_SIZE_PX, MIN_FONT_WEIGHT, MIN_LINE_SPACING_PERCENT,
+    MIN_PAGE_DIMENSION_PX,
 };
 pub use toc::TocEntry;
 
@@ -104,6 +106,50 @@ impl Underline {
             _ => Underline::Off,
         }
     }
+
+    /// 这个样式在 UI 选择器里的下标。
+    pub fn index(self) -> usize {
+        match self {
+            Underline::Off => 0,
+            Underline::Solid => 1,
+            Underline::Dotted => 2,
+        }
+    }
+}
+
+/// 引导线的横向范围。
+///
+/// 只影响画面，不影响排版：换范围不用重排，重新渲染当前页即可。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum UnderlineScope {
+    /// 文字划线：只在有文字的位置画，宽度跟着这一行的文字走（默认）。
+    #[default]
+    TextOnly = 0,
+    /// 整行划线：横跨 `margin_left..width-margin_right`，页面上没有文字的
+    /// 行槽也按行高网格补满，像读本上的横格纸。
+    FullLine = 1,
+}
+
+impl UnderlineScope {
+    /// 全部范围，顺序与 UI 里的选择器一致。
+    pub const ALL: [UnderlineScope; 2] = [UnderlineScope::TextOnly, UnderlineScope::FullLine];
+
+    /// 把 UI 的下标（0/1）变成范围，越界的一律按「文字划线」处理。
+    pub fn from_index(index: usize) -> UnderlineScope {
+        match index {
+            1 => UnderlineScope::FullLine,
+            _ => UnderlineScope::TextOnly,
+        }
+    }
+
+    /// 这个范围在 UI 选择器里的下标。
+    pub fn index(self) -> usize {
+        match self {
+            UnderlineScope::TextOnly => 0,
+            UnderlineScope::FullLine => 1,
+        }
+    }
 }
 
 /// 页面渲染选项。
@@ -115,6 +161,8 @@ pub struct RenderOptions {
     pub underline: Underline,
     /// 引导线的灰度（0 黑、255 白）。
     pub underline_gray: u8,
+    /// 引导线的横向范围：文字宽度或整行宽度。
+    pub underline_scope: UnderlineScope,
 }
 
 /// 文档可以换线程用（`Send`）：阅读器在工作线程里开书，再把文档交给主线程。

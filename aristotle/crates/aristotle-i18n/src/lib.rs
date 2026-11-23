@@ -633,6 +633,96 @@ mod tests {
     }
 
     #[test]
+    fn every_locale_has_the_same_keys_as_english() {
+        let en = locale_file("en.json");
+        for code in ["zh.json", "pl.json"] {
+            let other = locale_file(code);
+            assert_eq!(
+                en.keys().collect::<Vec<_>>(),
+                other.keys().collect::<Vec<_>>(),
+                "{code} must have exactly en.json's keys"
+            );
+        }
+    }
+
+    #[test]
+    fn typeset_controls_are_named_in_every_language() {
+        // The typeset panel's fine-typesetting switch, its weight steps and
+        // the guide's width (TYPE-102): every locale names all of them.
+        let keys = [
+            (Msg::TypesetFine, "typeset.fine"),
+            (Msg::TypesetWeight, "typeset.weight"),
+            (Msg::TypesetWeightLight, "typeset.weight_light"),
+            (Msg::TypesetWeightNormal, "typeset.weight_normal"),
+            (Msg::TypesetWeightBold, "typeset.weight_bold"),
+            (Msg::TypesetUnderlineScope, "typeset.underline_scope"),
+            (Msg::TypesetScopeText, "typeset.scope_text"),
+            (Msg::TypesetScopeFull, "typeset.scope_full"),
+            (Msg::TypesetOn, "typeset.on"),
+            (Msg::TypesetOff, "typeset.off"),
+            (Msg::TypesetWritingMode, "typeset.writing_mode"),
+            (Msg::TypesetHorizontal, "typeset.horizontal"),
+            (Msg::TypesetVertical, "typeset.vertical"),
+        ];
+        for locale in locales() {
+            assert!(locale.complete, "{} falls back to English", locale.code);
+            for (message, key) in keys {
+                let text = locale.get(message);
+                assert!(!text.is_empty(), "{}: {key} is empty", locale.code);
+                assert!(
+                    !text.contains('{'),
+                    "{}: {key} keeps a placeholder: {text}",
+                    locale.code
+                );
+            }
+        }
+        // The words the panel shows, in the three languages.
+        with_language("zh", || {
+            assert_eq!(tr(Msg::TypesetFine), "精排");
+            assert_eq!(tr(Msg::TypesetOn), "开");
+            assert_eq!(tr(Msg::TypesetOff), "关");
+            assert_eq!(tr(Msg::TypesetWeight), "字重");
+            assert_eq!(tr(Msg::TypesetWeightLight), "细");
+            assert_eq!(tr(Msg::TypesetWeightNormal), "正常");
+            assert_eq!(tr(Msg::TypesetWeightBold), "粗");
+            assert_eq!(tr(Msg::TypesetUnderlineScope), "划线范围");
+            assert_eq!(tr(Msg::TypesetScopeText), "文字划线");
+            assert_eq!(tr(Msg::TypesetScopeFull), "整行划线");
+            assert_eq!(tr(Msg::TypesetWritingMode), "方向");
+            assert_eq!(tr(Msg::TypesetHorizontal), "横排");
+            assert_eq!(tr(Msg::TypesetVertical), "竖排");
+        });
+        with_language("en", || {
+            assert_eq!(tr(Msg::TypesetFine), "Fine");
+            assert_eq!(tr(Msg::TypesetWeight), "Weight");
+            assert_eq!(tr(Msg::TypesetWeightLight), "Light");
+            assert_eq!(tr(Msg::TypesetWeightNormal), "Normal");
+            assert_eq!(tr(Msg::TypesetWeightBold), "Bold");
+            assert_eq!(tr(Msg::TypesetUnderlineScope), "Underline span");
+            assert_eq!(tr(Msg::TypesetScopeText), "Text only");
+            assert_eq!(tr(Msg::TypesetScopeFull), "Full line");
+            assert_eq!(tr(Msg::TypesetWritingMode), "Direction");
+            assert_eq!(tr(Msg::TypesetHorizontal), "Horizontal");
+            assert_eq!(tr(Msg::TypesetVertical), "Vertical");
+        });
+        with_language("pl", || {
+            assert_eq!(tr(Msg::TypesetFine), "Precyzja");
+            assert_eq!(tr(Msg::TypesetOn), "Wł.");
+            assert_eq!(tr(Msg::TypesetOff), "Wył.");
+            assert_eq!(tr(Msg::TypesetWeight), "Grubość");
+            assert_eq!(tr(Msg::TypesetWeightLight), "Cienki");
+            assert_eq!(tr(Msg::TypesetWeightNormal), "Normalny");
+            assert_eq!(tr(Msg::TypesetWeightBold), "Gruby");
+            assert_eq!(tr(Msg::TypesetUnderlineScope), "Zakres linii");
+            assert_eq!(tr(Msg::TypesetScopeText), "Tylko tekst");
+            assert_eq!(tr(Msg::TypesetScopeFull), "Cała linia");
+            assert_eq!(tr(Msg::TypesetWritingMode), "Kierunek");
+            assert_eq!(tr(Msg::TypesetHorizontal), "Poziomo");
+            assert_eq!(tr(Msg::TypesetVertical), "Pionowo");
+        });
+    }
+
+    #[test]
     fn every_language_names_itself() {
         let codes: Vec<&str> = locales().iter().map(|l| l.code).collect();
         assert!(codes.contains(&"zh"));

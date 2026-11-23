@@ -43,6 +43,7 @@ pub mod richtext;
 pub mod screen;
 pub mod style;
 pub mod txt;
+pub mod vertical;
 
 /// Plato's core, for callers that need its types (errors, locations)
 /// without depending on the Plato submodule themselves.

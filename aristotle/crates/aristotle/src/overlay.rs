@@ -12,6 +12,7 @@ use aristotle_render::book::Bounds;
 use aristotle_render::richtext::{Block, RichText};
 use aristotle_ui::geom::{pt, Density, Insets, Point, Rect, Size, MIN_TARGET};
 use aristotle_ui::icons::Icon;
+use aristotle_ui::screens::sheet::{self, Button};
 use aristotle_ui::screens::{icon_button, text_button};
 use aristotle_ui::text::TextEngine;
 use aristotle_ui::text::{Align, Paragraph, ParagraphStyle, Span, TextStyle};
@@ -34,6 +35,10 @@ pub mod act {
     pub const GLOSS: ActionId = 1006;
     pub const GO_NOTE: ActionId = 1007;
     pub const GO_ANNOTATION: ActionId = 1011;
+    /// Translate the selected text.
+    pub const TRANSLATE: ActionId = 1012;
+    /// Translate the sentence the selection stands in.
+    pub const TRANSLATE_SENTENCE: ActionId = 1013;
     pub const MORE: ActionId = 1010;
     pub const CANCEL: ActionId = 1008;
     pub const BACK: ActionId = 1009;
@@ -121,6 +126,15 @@ impl Place {
     }
 }
 
+impl From<Place> for sheet::Place {
+    fn from(place: Place) -> sheet::Place {
+        match place {
+            Place::Top => sheet::Place::Top,
+            Place::Bottom => sheet::Place::Bottom,
+        }
+    }
+}
+
 /// A popup's parts.
 pub struct PopupSpec<'a> {
     pub title: String,
@@ -131,8 +145,11 @@ pub struct PopupSpec<'a> {
     pub body: &'a RichText,
     /// Tappable words under the body ("Did you mean: …").
     pub suggestions: Vec<String>,
-    /// Buttons: (label, action).
-    pub actions: Vec<(&'static str, ActionId)>,
+    /// The buttons at the foot, measured (see
+    /// `aristotle_ui::screens::sheet::Button`).
+    pub actions: Vec<Button>,
+    /// The width the buttons have: the panel, less the margins.
+    pub available: i32,
     pub place: Place,
     /// Sheet height with a body (see `reading::popup_height`).
     pub height: i32,
@@ -408,17 +425,18 @@ pub fn popup(t: &mut Tree, st: &Styles, spec: &PopupSpec) -> Popup {
         rows.push(body);
     }
 
-    // Actions, and the pager at the right.
-    let mut foot = vec![button_row(t, st, &spec.actions)];
-    let fill = t.spacer(1);
-    foot.push(fill);
+    // The buttons, and the pager on a row of its own: the buttons may
+    // need the whole width.
     let prev = icon_button(t, Icon::ChevronLeft, 40, act::PREV);
     let pager = t.label("", st.small());
     let next = icon_button(t, Icon::ChevronRight, 40, act::NEXT);
-    if has_body {
-        foot.extend([prev, pager, next]);
-    }
-    let foot = t.add(Node::row(4), foot);
+    let foot = sheet::foot(
+        t,
+        st,
+        &spec.actions,
+        spec.available,
+        vec![prev, pager, next],
+    );
     rows.push(foot);
 
     let content = t.add(Node::column(14).cross(Cross::Stretch), rows);

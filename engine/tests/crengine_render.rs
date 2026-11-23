@@ -253,63 +253,57 @@ fn image_inversion_inverts_images_and_preserves_text() {
         )
         .expect("打开 interactive.epub 失败");
 
-    let mut buf_normal = GrayBuffer::new(PAGE_WIDTH, PAGE_HEIGHT);
-    let mut buf_inverted = GrayBuffer::new(PAGE_WIDTH, PAGE_HEIGHT);
-
-    doc.render_page_with_options(
-        0,
-        &mut buf_normal,
-        &inkread_engine::RenderOptions {
-            invert_images: false,
-            underline: inkread_engine::Underline::Off,
-            underline_gray: 0,
-        },
-    )
-    .expect("渲染普通页面失败");
-
-    doc.render_page_with_options(
-        0,
-        &mut buf_inverted,
-        &inkread_engine::RenderOptions {
-            invert_images: true,
-            underline: inkread_engine::Underline::Off,
-            underline_gray: 0,
-        },
-    )
-    .expect("渲染图片反色页面失败");
-
-    let mut inverted_pixels_count = 0;
-    let mut identical_pixels_count = 0;
-
-    let normal_px = buf_normal.pixels();
-    let inverted_px = buf_inverted.pixels();
-    assert_eq!(normal_px.len(), inverted_px.len());
-
-    for (p_norm, p_inv) in normal_px.iter().zip(inverted_px.iter()) {
-        if *p_norm == *p_inv {
-            identical_pixels_count += 1;
-        } else {
-            // 反色区域：两个像素值相加接近 255
-            let sum = *p_norm as u16 + *p_inv as u16;
-            assert!(
-                (sum as i32 - 255).abs() <= 8,
-                "图片区域像素应当互为反色：norm={}, inv={}, sum={sum}",
-                p_norm,
-                p_inv
-            );
-            inverted_pixels_count += 1;
+    // 不写死页码：精排开关会影响分页，图片可能落在任意一页。找反色像素
+    // 最多的那一页来验证。
+    let mut best: Option<(u32, usize, GrayBuffer, GrayBuffer)> = None;
+    for page in 0..doc.page_count() {
+        let mut normal = GrayBuffer::new(PAGE_WIDTH, PAGE_HEIGHT);
+        let mut inverted = GrayBuffer::new(PAGE_WIDTH, PAGE_HEIGHT);
+        doc.render_page_with_options(page, &mut normal, &inkread_engine::RenderOptions::default())
+            .expect("渲染普通页面失败");
+        doc.render_page_with_options(
+            page,
+            &mut inverted,
+            &inkread_engine::RenderOptions {
+                invert_images: true,
+                ..inkread_engine::RenderOptions::default()
+            },
+        )
+        .expect("渲染图片反色页面失败");
+        let changed = normal
+            .pixels()
+            .iter()
+            .zip(inverted.pixels())
+            .filter(|(before, after)| before != after)
+            .count();
+        if best.as_ref().is_none_or(|(_, most, _, _)| changed > *most) {
+            best = Some((page, changed, normal, inverted));
         }
     }
 
+    let (page, inverted_pixels_count, normal, inverted) =
+        best.expect("interactive.epub 应当至少有一页");
     assert!(
         inverted_pixels_count > 1000,
-        "应当检测到图片反色区域（实际反色像素 {}）",
-        inverted_pixels_count
+        "第 {page} 页应当检测到图片反色区域（实际反色像素 {inverted_pixels_count}）"
     );
+
+    let mut identical_pixels_count = 0;
+    for (p_norm, p_inv) in normal.pixels().iter().zip(inverted.pixels()) {
+        if p_norm == p_inv {
+            identical_pixels_count += 1;
+        } else {
+            // 反色区域：两个像素值相加接近 255。
+            let sum = *p_norm as u16 + *p_inv as u16;
+            assert!(
+                (sum as i32 - 255).abs() <= 8,
+                "图片区域像素应当互为反色：norm={p_norm}, inv={p_inv}, sum={sum}"
+            );
+        }
+    }
     assert!(
         identical_pixels_count > 1_000_000,
-        "文字与背景区域像素应当保持完全一致（实际相同像素 {}）",
-        identical_pixels_count
+        "文字与背景区域像素应当保持完全一致（实际相同像素 {identical_pixels_count}）"
     );
 }
 

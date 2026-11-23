@@ -36,6 +36,9 @@ libc = "0.2"
 percent-encoding = "2.3.2"
 regex = "1"
 encoding_rs = "0.8"
+# The EPUB container and package documents of the vertical engine (VERT-101).
+# Already in the lock through aristotle-library, which pins the same version.
+roxmltree = "0.21"
 # Our Plato fork (third_party/plato, branch aristotle); docs/reader.md.
 plato-core = { path = "../../third_party/plato/crates/core" }
 # Same version as plato-core uses, to read EPUB metadata it does not expose

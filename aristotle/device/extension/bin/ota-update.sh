@@ -23,8 +23,7 @@ APP=${ARISTOTLE_APP_DIR:-$R/mnt/us/aristotle}
 OTA=${MOYUE_OTA_DIR:-$R/mnt/us/.aristotle/ota}
 LOG=$R/mnt/us/.aristotle/ota.log
 LOCK=$R/var/tmp/moyue-ota.lock
-MANIFEST_URL=${MOYUE_OTA_MANIFEST_URL:-https://me.chen-cn.top/moyue/ota/ko2/manifest.txt}
-ALLOWED_PREFIX=${MOYUE_OTA_ALLOWED_PREFIX:-https://me.chen-cn.top/moyue/ota/ko2/}
+OTA_BASE=${MOYUE_OTA_BASE_URL:-https://me.chen-cn.top/moyue/ota/chan}
 MAX_MANIFEST=4096
 MAX_PACKAGE=67108864
 TEST_HTTP=${MOYUE_OTA_TEST_HTTP:-0}
@@ -295,7 +294,9 @@ parse_manifest() {
     [ -n "${m_source_size:-}" ] || fail "版本清单缺少 source-size"
 
     [ "$m_product" = moyue-preview ] || fail "清单不是墨阅预览版"
-    [ "$m_channel" = ko2-preview ] || fail "清单不是 KO2 预览通道"
+    case "$m_channel" in
+    '' | *[!A-Za-z0-9.-]*) fail "清单通道名无效" ;;
+    esac
     valid_version "$m_version" || fail "清单版本号无效"
     case "$m_sha256" in *[!0-9a-f]* | '') fail "清单 SHA-256 无效" ;; esac
     [ ${#m_sha256} -eq 64 ] || fail "清单 SHA-256 无效"
@@ -452,27 +453,74 @@ fi
 
 say "正在检查更新..."
 command -v curl > /dev/null 2>&1 || fail "缺少 curl，无法联网更新"
+[ -f "$EXT/guard.sh" ] && [ ! -L "$EXT/guard.sh" ] \
+    || fail "缺少设备守卫 guard.sh，请重新安装墨阅"
+. "$EXT/guard.sh"
+_code=$(device_code)
+[ -n "$_code" ] || fail "无法从序列号读取设备型号"
+_fw=$(firmware_version)
+[ -n "$_fw" ] || fail "无法读取固件版本"
 proto='=https'
 [ "$TEST_HTTP" = 1 ] && [ -n "$R" ] && proto='=http,https'
-curl -q --fail --silent --show-error --proto "$proto" --max-redirs 0 \
-    --connect-timeout 10 --max-time 30 --max-filesize "$MAX_MANIFEST" \
-    --output "$TMP/manifest.txt" "$MANIFEST_URL" \
-    || fail "无法下载版本清单，请检查 Wi-Fi"
+
+# fetch_manifest: try the channels this device could have, most specific
+# first.  A manifest for an exact firmware wins; shorter firmware prefixes
+# cover the entries that publish a firmware range (the PW4 5.13 one).  A 404
+# moves to the next candidate, any other failure is a real error.
+# Returns 0 with CHANNEL/ALLOWED_PREFIX set, 2 when no channel exists.
+fetch_manifest() {
+    _cand=$_fw
+    while :; do
+        _ch="$_code-$_cand"
+        _url=${MOYUE_OTA_MANIFEST_URL:-$OTA_BASE/$_ch/manifest.txt}
+        _prefix=${MOYUE_OTA_ALLOWED_PREFIX:-$OTA_BASE/$_ch/}
+        curl -q --fail --silent --show-error --proto "$proto" --max-redirs 0 \
+            --connect-timeout 10 --max-time 30 --max-filesize "$MAX_MANIFEST" \
+            --output "$TMP/manifest.txt" "$_url"
+        _rc=$?
+        if [ "$_rc" = 0 ]; then
+            CHANNEL=$_ch
+            MANIFEST_URL=$_url
+            ALLOWED_PREFIX=$_prefix
+            return 0
+        fi
+        # 22 is curl's --fail HTTP error: this channel does not exist.
+        [ "$_rc" = 22 ] || fail "无法下载版本清单，请检查 Wi-Fi"
+        case "$_cand" in
+        *.*) _cand=${_cand%.*} ;;
+        *) return 2 ;;
+        esac
+    done
+}
+
+if [ -n "${MOYUE_OTA_CHANNEL:-}" ]; then
+    # An explicit channel (tests, operators) pins this device's manifest.
+    CHANNEL=$MOYUE_OTA_CHANNEL
+    MANIFEST_URL=${MOYUE_OTA_MANIFEST_URL:-$OTA_BASE/$CHANNEL/manifest.txt}
+    ALLOWED_PREFIX=${MOYUE_OTA_ALLOWED_PREFIX:-$OTA_BASE/$CHANNEL/}
+    curl -q --fail --silent --show-error --proto "$proto" --max-redirs 0 \
+        --connect-timeout 10 --max-time 30 --max-filesize "$MAX_MANIFEST" \
+        --output "$TMP/manifest.txt" "$MANIFEST_URL" \
+        || fail "无法下载版本清单，请检查 Wi-Fi"
+else
+    fetch_manifest
+fi
+case $? in
+0) ;;
+2)
+    say "此设备暂未提供在线更新（${_code} / ${_fw}）"
+    say2 "未改动任何文件"
+    exit 0
+    ;;
+*) exit 1 ;;
+esac
 [ -f "$TMP/manifest.txt" ] && [ ! -L "$TMP/manifest.txt" ] || fail "版本清单无效"
 parse_manifest "$TMP/manifest.txt"
 
-if [ "$m_device" != oasis2 ]; then
-    fail "此更新不是给 Oasis 2 的（清单设备：${m_device}）"
-fi
-[ -f "$EXT/guard.sh" ] && [ ! -L "$EXT/guard.sh" ] \
-    || fail "缺少设备守卫 guard.sh，请先用 USB 重新安装 0.3.1"
-. "$EXT/guard.sh"
-_code=$(device_code)
-case " $OASIS2_CODES " in
-*" $_code "*) ;;
-*) fail "此更新只支持 Kindle Oasis 2（设备代码 ${_code:-unknown}）" ;;
-esac
-_fw=$(firmware_version)
+[ "$m_device" = "$_code" ] \
+    || fail "此更新不是给设备 ${_code} 的（清单设备：${m_device}）"
+[ "$m_channel" = "$CHANNEL" ] \
+    || fail "清单通道与设备不符（清单：${m_channel}）"
 case "$_fw" in
 "$m_firmware" | "$m_firmware".*) ;;
 *) fail "固件 $_fw 与清单要求的 $m_firmware 不符" ;;

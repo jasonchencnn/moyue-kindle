@@ -423,6 +423,7 @@ impl Document for CrengineDocument {
                     options.invert_images,
                     options.underline as u8,
                     options.underline_gray,
+                    options.underline_scope as u8,
                 )
                 .map_err(Error::Render)
         }

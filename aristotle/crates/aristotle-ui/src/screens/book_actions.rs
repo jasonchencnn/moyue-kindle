@@ -198,9 +198,11 @@ fn header_block(t: &mut Tree, s: &Styles, info: &BookActionInfo, chip: &str) -> 
 
     let g1 = t.gap(1, 16);
     let g2 = t.gap(1, 8);
+    let g3 = t.gap(1, 8);
+    let g4 = t.gap(1, 8);
     let words = t.add(
         Node::column(0).cross(Cross::Start).flex(1),
-        [chip, g1, title, g2, author, g2, summary, g2, path],
+        [chip, g1, title, g2, author, g3, summary, g4, path],
     );
 
     t.add(Node::row(28).cross(Cross::Start), [cover, words])

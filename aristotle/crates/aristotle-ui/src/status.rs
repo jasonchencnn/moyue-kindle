@@ -53,27 +53,79 @@ static SLOGAN_MASK: &[u8] = include_bytes!("../assets/slogan.mask");
 /// The size of the slogan's picture.
 pub const SLOGAN: (i32, i32) = (394, 48);
 
+/// Resamples an 8-bit coverage mask to `dst_w x dst_h` with box averaging so
+/// low-DPI or compact panels draw bitmap masks at the intended size.
+pub(crate) fn scale_mask(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; dst_w * dst_h];
+    for dy in 0..dst_h {
+        let y0 = dy * src_h / dst_h;
+        let y1 = ((dy + 1) * src_h).div_ceil(dst_h).min(src_h).max(y0 + 1);
+        for dx in 0..dst_w {
+            let x0 = dx * src_w / dst_w;
+            let x1 = ((dx + 1) * src_w).div_ceil(dst_w).min(src_w).max(x0 + 1);
+            let mut sum = 0u32;
+            let mut count = 0u32;
+            for sy in y0..y1 {
+                let row = sy * src_w;
+                for sx in x0..x1 {
+                    sum += src[row + sx] as u32;
+                    count += 1;
+                }
+            }
+            out[dy * dst_w + dx] = (sum / count.max(1)) as u8;
+        }
+    }
+    out
+}
+
 /// The slogan of the status bar, drawn from its picture.
 struct SloganMark;
 
 impl Widget for SloganMark {
-    fn measure(&mut self, c: Constraints, _text: &mut crate::text::TextEngine) -> Size {
+    fn measure(&mut self, c: Constraints, text: &mut crate::text::TextEngine) -> Size {
+        let d = text.density();
         c.constrain(Size {
-            w: SLOGAN.0,
-            h: SLOGAN.1,
+            w: d.px(SLOGAN.0),
+            h: d.px(SLOGAN.1),
         })
     }
 
     fn paint(&self, rect: Rect, cx: &mut PaintCx) {
-        cx.painter.blend_mask(
-            rect.x,
-            rect.y,
-            SLOGAN.0 as u32,
-            SLOGAN.1 as u32,
-            SLOGAN_MASK,
-            INK,
-        );
+        if rect.is_empty() {
+            return;
+        }
+        if rect.w == SLOGAN.0 && rect.h == SLOGAN.1 {
+            cx.painter.blend_mask(
+                rect.x,
+                rect.y,
+                SLOGAN.0 as u32,
+                SLOGAN.1 as u32,
+                SLOGAN_MASK,
+                INK,
+            );
+        } else {
+            let scaled = scale_mask(
+                SLOGAN_MASK,
+                SLOGAN.0 as usize,
+                SLOGAN.1 as usize,
+                rect.w as usize,
+                rect.h as usize,
+            );
+            cx.painter
+                .blend_mask(rect.x, rect.y, rect.w as u32, rect.h as u32, &scaled, INK);
+        }
     }
+}
+
+/// The existing Moyue brush-script mark, shared with transition screens.
+pub fn brand_mark(tree: &mut Tree) -> NodeId {
+    tree.custom(SloganMark)
 }
 
 /// The left of the status bar: the slogan, and the time before it when the
@@ -186,7 +238,7 @@ pub fn status_bar(t: &mut Tree, small: &TextStyle, line: &StatusLine<'_>, left: 
         left_nodes.push(clock);
         left_nodes.push(t.gap(LEFT_GAP, 1));
     }
-    let slogan = t.custom(SloganMark);
+    let slogan = brand_mark(t);
     left_nodes.push(slogan);
     let left_row = t.add(Node::row(0).cross(Cross::Center), left_nodes);
 

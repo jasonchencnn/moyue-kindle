@@ -33,7 +33,7 @@ use inkread_core::sync::local::{
 };
 use inkread_core::sync::policy::{plan_progress_update, PositionResolution, ProgressPlan};
 use inkread_core::sync::records::{
-    format_progress_pair, DbBook, DbBookConfig, DbBookNote, SyncPushRequest,
+    format_progress_pair, DbBookConfig, DbBookNote, SyncPushRequest,
 };
 use inkread_core::sync::time::format_iso8601;
 use inkread_core::sync::{
@@ -93,12 +93,18 @@ pub struct ReadestState {
     pub next_token: u64,
     pub opened_book: Option<String>,
     pub opened_token: u64,
+    /// The local progress timestamp (`ms`) before this open touched the book.
+    pub opened_before_ms: i64,
+    /// The local locator when the book opened, to detect whether the reader turned a page.
+    pub opened_locator: Option<aristotle_library::Locator>,
     /// The manual pull / push of the open book in flight, if any (`SYNC-111`).
     pub jobs: BookJobs,
     /// One line about the last manual pull or push, shown in the reader menu.
     pub manual_message: Option<String>,
     /// A current-book response waiting for background layout or wake.
     pub pending_pull: Option<(String, SyncPullResponse)>,
+    /// Whether `pending_pull` came from an explicit manual pull in the reader menu.
+    pub pending_pull_manual: bool,
 }
 
 impl ReadestState {
@@ -146,6 +152,7 @@ pub fn local_note_from_annotation(a: &Annotation) -> LocalNote {
         updated_at: a
             .modified
             .as_deref()
+            .or(a.created.as_deref())
             .and_then(crate::marks::parse_local_time)
             .map_or(0, |secs| secs * 1000),
     }
@@ -335,12 +342,39 @@ impl App {
         self.render_ui()
     }
 
+    /// Silently refresh the Readest access token in the background on startup.
+    ///
+    /// Because `access_token` is intentionally kept out of `accounts.json`,
+    /// a cold launch would otherwise pay an extra auth TLS handshake + token
+    /// refresh round-trip on the user's first tap. Failures are ignored so
+    /// offline startup stays completely silent; any rotated refresh token is
+    /// persisted on arrival via [`Done::ReadestPrewarmed`].
+    pub(crate) fn readest_prewarm(&mut self) {
+        if !self.prefs.enable_readest || self.net.accounts.readest.is_none() {
+            return;
+        }
+        self.net.reconcile_allow_entries();
+        let policy = Net::policy();
+        let config = self.net.accounts.readest_config();
+        let store = self.net.readest_session.clone();
+        let epoch = store.epoch();
+        self.net.spawn("readest-prewarm", move |_| {
+            let client =
+                SyncClient::with_session_store(ReadestTransport::new(policy), config, store);
+            let _ = client.ensure_token();
+            Done::ReadestPrewarmed { store: epoch }
+        });
+    }
+
     /// Triggered when a book session opens: pull remote book configuration.
     pub(crate) fn readest_book_opened(&mut self) {
         let Screen::Reader(r) = &self.screen else {
             return;
         };
         let id = r.session.id.clone();
+        if !self.prefs.enable_readest || self.is_weread_book(&id) {
+            return;
+        }
         if self.readest.opened_book.as_deref() == Some(&id) {
             return;
         }
@@ -349,11 +383,23 @@ impl App {
         }
         self.readest.next_token = self.readest.next_token.wrapping_add(1);
         let token = self.readest.next_token;
+        let current_progress = self.lib.book(&id).and_then(|b| b.progress.as_ref());
+        let before_open_ms = self
+            .sync
+            .before_open
+            .as_ref()
+            .filter(|(b, _)| b == &id)
+            .and_then(|(_, p)| p.as_ref().map(|p| p.updated * 1000))
+            .or_else(|| current_progress.map(|p| p.updated * 1000))
+            .unwrap_or(0);
         self.readest.opened_book = Some(id.clone());
         self.readest.opened_token = token;
+        self.readest.opened_before_ms = before_open_ms;
+        self.readest.opened_locator = current_progress.map(|p| p.locator.clone());
         self.readest.offer = None;
         self.readest.manual_message = None;
         self.readest.pending_pull = None;
+        self.readest.pending_pull_manual = false;
 
         // The hosts the settings name must be allowed before the first request
         // of this session, not only after the login screen was visited.
@@ -371,7 +417,13 @@ impl App {
             let client = SyncClient::with_session_store(transport, config, store);
             let response = client
                 .pull_internal(None, 0, Some(50), Some(&book_hash))
-                .map_err(|e| e.kind());
+                .map_err(|e| {
+                    eprintln!(
+                        "aristotle: readest: open pull failed: {}",
+                        redacted_sync_error(&e)
+                    );
+                    e.kind()
+                });
             Done::ReadestPulled {
                 book: book_hash,
                 token,
@@ -405,7 +457,7 @@ impl App {
                 return Ok(());
             }
         };
-        self.apply_readest_pull(&book, resp)
+        self.apply_readest_pull(&book, resp, false)
     }
 
     /// Merge a pulled delta into the library and offer its position.
@@ -413,11 +465,17 @@ impl App {
     /// Shared by the automatic pull on open and the manual pull of the open
     /// book (`SYNC-111`); a position is only ever *offered*, never applied
     /// without the reader's consent (contract §5.2).
-    fn apply_readest_pull(&mut self, book: &str, resp: SyncPullResponse) -> Result<(), Error> {
+    fn apply_readest_pull(
+        &mut self,
+        book: &str,
+        resp: SyncPullResponse,
+        manual: bool,
+    ) -> Result<(), Error> {
         if self.asleep.is_some()
             || matches!(&self.screen, Screen::Reader(r) if r.session.id == book && !r.session.has_book())
         {
             self.readest.pending_pull = Some((book.to_string(), resp));
+            self.readest.pending_pull_manual = manual;
             return Ok(());
         }
         let book = book.to_string();
@@ -444,6 +502,9 @@ impl App {
 
         // Check remote reading position
         let remote_config = resp.configs.into_iter().find(|c| c.book_hash == book);
+        if (notes_saved || remote_config.is_some()) && !self.is_weread_book(&book) {
+            self.cloud.record_channel_hash(self.lib.data_dir(), &book);
+        }
         let Some(config) = remote_config else {
             if notes_saved {
                 self.saver.save(&self.lib);
@@ -451,19 +512,38 @@ impl App {
             return Ok(());
         };
 
-        let local_ms = self
-            .lib
-            .book(&book)
-            .and_then(|b| b.progress.as_ref())
-            .map(|p| p.updated * 1000)
-            .unwrap_or(0);
+        // Keep the cloud shelf entry aligned with the pulled config's progress.
+        self.update_cloud_book_from_config(&config);
+
+        let local_ms = if manual {
+            // Explicit manual pull in the reader menu always offers a remote
+            // position that differs from the current page.
+            0
+        } else {
+            let cur = self.lib.book(&book).and_then(|b| b.progress.as_ref());
+            if self.readest.opened_book.as_deref() == Some(&book)
+                && cur.map(|p| &p.locator) == self.readest.opened_locator.as_ref()
+            {
+                self.readest.opened_before_ms
+            } else {
+                cur.map(|p| p.updated * 1000).unwrap_or(0)
+            }
+        };
 
         if notes_saved {
             self.saver.save(&self.lib);
         }
 
         // The book is open: offer the remote position, never jump silently.
-        match plan_progress_update(local_ms, &config, true, is_txt) {
+        let plan = if manual && !is_txt {
+            match inkread_core::sync::policy::resolve_reading_position(&config) {
+                PositionResolution::Unresolvable => ProgressPlan::Ignore,
+                res => ProgressPlan::Offer(res),
+            }
+        } else {
+            plan_progress_update(local_ms, &config, true, is_txt)
+        };
+        match plan {
             ProgressPlan::Ignore => return Ok(()),
             ProgressPlan::Offer(PositionResolution::NavigateXPointer(xp)) => {
                 let Screen::Reader(r) = &mut self.screen else {
@@ -473,9 +553,14 @@ impl App {
                 if let Some(page) = page_opt {
                     if page != r.session.current {
                         let chapter = r.session.book().chapter_title(page).unwrap_or_default();
-                        let percent_str = config.progress.as_deref().unwrap_or("0");
-                        let percent_f64: f64 = percent_str.parse().unwrap_or(0.0);
-                        let percent = format!("{}%", (percent_f64 * 100.0).floor());
+                        let percent_ratio = config
+                            .to_model()
+                            .progress
+                            .filter(|(_, total)| *total > 0)
+                            .map(|(cur, total)| cur as f64 / total as f64)
+                            .unwrap_or_else(|| r.session.book().fraction(page) as f64);
+                        let percent =
+                            format!("{}%", (percent_ratio.clamp(0.0, 1.0) * 100.0).floor());
                         let text = if chapter.is_empty() {
                             tf!(Msg::ReadestJumpPrompt, page = page + 1)
                         } else {
@@ -515,13 +600,15 @@ impl App {
         };
         if reader.session.id != *book {
             self.readest.pending_pull = None;
+            self.readest.pending_pull_manual = false;
             return Ok(());
         }
         if !reader.session.has_book() {
             return Ok(());
         }
         if let Some((book, response)) = self.readest.pending_pull.take() {
-            self.apply_readest_pull(&book, response)?;
+            let manual = std::mem::take(&mut self.readest.pending_pull_manual);
+            self.apply_readest_pull(&book, response, manual)?;
         }
         Ok(())
     }
@@ -532,8 +619,21 @@ impl App {
     /// short timeout (sleep, quit), so a dead network cannot hold the device.
     /// This is the automatic path: it does nothing when the reader turned
     /// "push on close" off (`SYNC-111`).
+    /// Whether a book belongs to the WeRead channel and must stay isolated from
+    /// Readest sync (neither pulled from nor pushed to Readest).
+    pub(crate) fn is_weread_book(&self, book_id: &str) -> bool {
+        if self.weread.downloads.book_id_of_hash(book_id).is_some() {
+            return true;
+        }
+        self.lib.book(book_id).is_some_and(|rec| {
+            crate::shelf::source_from_path(&rec.file.path)
+                == aristotle_ui::screens::library::BookSource::WeRead
+        })
+    }
+
+    /// Push the open book if automatic push is enabled.
     pub(crate) fn readest_push(&mut self, closing: bool, wait: bool) {
-        if !self.readest_auto_push_enabled() {
+        if !self.prefs.enable_readest || !self.readest_auto_push_enabled() {
             if closing {
                 self.readest.opened_book = None;
             }
@@ -544,6 +644,9 @@ impl App {
         };
         if closing {
             self.readest.opened_book = None;
+        }
+        if self.is_weread_book(&book_id) {
+            return;
         }
         // Inline sleep/exit pushes must not wait behind a worker's refresh.
         if wait && self.net.busy() {
@@ -590,7 +693,14 @@ impl App {
     /// reported in the menu and a result for a book the reader has left is
     /// dropped.
     fn readest_push_book(&mut self, book_id: String, inline: bool, job: Option<BookJob>) {
-        if self.net.accounts.readest.is_none() {
+        if !self.prefs.enable_readest || self.net.accounts.readest.is_none() {
+            return;
+        }
+        if self.is_weread_book(&book_id) {
+            if let Some(r) = self.net.accounts.readest.as_mut() {
+                r.dequeue_push(&book_id);
+                self.net.save();
+            }
             return;
         }
         let Some(rec) = self.lib.book(&book_id) else {
@@ -604,12 +714,32 @@ impl App {
         let format = rec.format;
         let is_txt = matches!(format, aristotle_library::Format::Txt);
 
-        // Contract §3.2: the page pair is `[current, total]`; with only a
-        // fraction (no page map here) leave it empty rather than send a decimal.
+        // Contract §3.2: the page pair is `[current, total]`; when the book is
+        // not currently open on screen, derive a page pair from its known cloud
+        // total or a 100-page percentage scale so `books.progress` piggyback works.
+        let cloud_total = self
+            .cloud
+            .books
+            .iter()
+            .find(|b| b.book_hash == book_id)
+            .and_then(|b| b.progress.map(|(_, total)| total))
+            .filter(|&total| total > 0);
         let pages = match &self.screen {
             Screen::Reader(r) if r.session.id == book_id => r.session.page_number(),
             _ => None,
-        };
+        }
+        .or_else(|| {
+            rec.progress.as_ref().and_then(|p| {
+                if p.fraction > 0.0 {
+                    let total = cloud_total.unwrap_or(100);
+                    let cur = ((p.fraction.clamp(0.0, 1.0) * total as f32).round() as u32)
+                        .clamp(1, total);
+                    Some((cur, total))
+                } else {
+                    None
+                }
+            })
+        });
         let config_opt = if is_txt {
             None
         } else {
@@ -638,47 +768,19 @@ impl App {
             notes
         };
 
-        let db_book = DbBook {
-            user_id: None,
-            book_hash: book_id.clone(),
-            meta_hash: None,
-            format: format.name().to_string(),
-            title: rec.meta.title.clone(),
-            source_title: None,
-            author: rec
-                .meta
-                .authors
-                .first()
-                .map(|a| a.name.clone())
-                .unwrap_or_default(),
-            group_id: None,
-            group_name: None,
-            group_updated_at: None,
-            tags: None,
-            progress: None,
-            reading_status: None,
-            reading_status_updated_at: None,
-            cover_hash: None,
-            cover_updated_at: None,
-            metadata: None,
-            metadata_updated_at: None,
-            created_at: Some(format_iso8601(rec.added * 1000)),
-            // No timestamp: the row must not win the whole-row LWW and clobber
-            // metadata edited elsewhere, nor resurrect a book deleted there
-            // (contract §4.1; local metadata edits are not tracked yet).
-            updated_at: None,
-            deleted_at: None,
-            uploaded_at: None,
-            synced_at: None,
-        };
-
         let mut configs = Vec::new();
         if let Some(c) = config_opt {
             configs.push(c);
         }
 
+        // Push only `configs` and `notes` (matching readest.koplugin and
+        // useProgressSync.ts): pushing a bare `DbBook` with `uploaded_at: None`
+        // and `updated_at: None` would cause `transformBookToDB` on the Readest
+        // server to stamp `updated_at = Date.now()` and wipe `uploaded_at` and
+        // `progress` on the `books` row. Instead, the server's `configs`
+        // piggyback updates `books.progress` and `books.updated_at` safely.
         let push_req = SyncPushRequest {
-            books: vec![db_book],
+            books: Vec::new(),
             configs,
             notes,
             stat_books: Vec::new(),
@@ -701,12 +803,18 @@ impl App {
 
         let run_push = move || {
             let transport = if inline {
-                ReadestTransport::with_timeout(policy, 2)
+                ReadestTransport::with_timeout(policy, 5)
             } else {
                 ReadestTransport::new(policy)
             };
             let client = SyncClient::with_session_store(transport, sync_config, store);
             let res = client.push(push_req, Some(&txt_hashes)).map(|_| ());
+            if let Err(ref e) = res {
+                eprintln!(
+                    "aristotle: readest: push failed (inline={inline}): {}",
+                    redacted_sync_error(e)
+                );
+            }
             Done::ReadestPushed {
                 book: book_hash,
                 job,
@@ -754,6 +862,7 @@ impl App {
                 return Ok(());
             }
         }
+        let mut queue_changed = false;
         match result {
             Ok(()) => {
                 // Only what the push carried is acknowledged: a deletion made
@@ -764,15 +873,28 @@ impl App {
                     .map(|rec| self.lib.acknowledge_push(&book, rec));
                 let pending = ack.is_some_and(|a| a.pending);
                 if let Some(r) = self.net.accounts.readest.as_mut() {
+                    let before = r.pending_queue.clone();
                     if pending {
                         r.enqueue_push(&book);
                     } else {
                         r.dequeue_push(&book);
                     }
+                    queue_changed = r.pending_queue != before;
                 }
-                self.net.save();
+                if queue_changed {
+                    self.net.save();
+                }
                 if ack.is_some_and(|a| a.acknowledged) {
                     self.saver.save(&self.lib);
+                }
+                if let Some(p) = self
+                    .lib
+                    .book(&book)
+                    .and_then(|rec| rec.progress.as_ref())
+                    .or_else(|| submitted.as_ref().and_then(|rec| rec.progress.as_ref()))
+                    .cloned()
+                {
+                    self.update_cloud_book_from_local_progress(&book, &p);
                 }
                 if job.is_some() {
                     self.readest.manual_message = Some(tr(Msg::ReaderSyncPushDone).to_string());
@@ -785,9 +907,13 @@ impl App {
                 // Failed pushes are retried on the next open, sync or wake,
                 // unless the reader turned the automatic push off.
                 if let Some(r) = self.net.accounts.readest.as_mut() {
+                    let before = r.pending_queue.clone();
                     r.enqueue_push(&book);
+                    queue_changed = r.pending_queue != before;
                 }
-                self.net.save();
+                if queue_changed {
+                    self.net.save();
+                }
                 if job.is_some() {
                     self.readest.manual_message = Some(tf!(Msg::ReaderSyncFailed, error = message));
                 }
@@ -800,11 +926,17 @@ impl App {
             .as_ref()
             .map(|r| r.pending_pushes())
             .unwrap_or(0);
+        if job.is_some() {
+            self.refresh_reader_sync_status()?;
+        }
         Ok(())
     }
 
     /// Trigger full two-way synchronization of all local books, configs, and notes.
     pub(crate) fn readest_sync_all(&mut self) {
+        if !self.prefs.enable_readest {
+            return;
+        }
         if self.net.accounts.readest.is_none() {
             self.readest.message = Some(tr(Msg::ReadestAccountNotLoggedIn).to_string());
             return;
@@ -833,14 +965,20 @@ impl App {
         let since_configs = settings.cursor(aristotle_net::store::CursorKind::Configs);
         let since_notes = settings.cursor(aristotle_net::store::CursorKind::Notes);
 
-        // Snapshot the library; assembling the payload (and serialising the
-        // index afterwards) must not keep the UI thread busy.
-        let records: Vec<BookRecord> = self.lib.index().books.clone();
+        // Snapshot only non-WeRead books so WeRead books stay strictly isolated
+        // from Readest cloud sync.
+        let records: Vec<BookRecord> = self
+            .lib
+            .index()
+            .books
+            .iter()
+            .filter(|rec| !self.is_weread_book(&rec.id))
+            .cloned()
+            .collect();
         // The same snapshot goes back with the answer: it is what the server
         // received, and only it may be acknowledged (SYNC-111).
 
         self.net.spawn("readest-sync-all", move |_| {
-            let mut local_books = Vec::new();
             let mut local_configs = Vec::new();
             let mut local_notes = Vec::new();
             let mut txt_hashes = HashSet::new();
@@ -849,41 +987,16 @@ impl App {
                 if is_txt {
                     txt_hashes.insert(rec.id.clone());
                 }
-                local_books.push(DbBook {
-                    user_id: None,
-                    book_hash: rec.id.clone(),
-                    meta_hash: None,
-                    format: rec.format.name().to_string(),
-                    title: rec.meta.title.clone(),
-                    source_title: None,
-                    author: rec
-                        .meta
-                        .authors
-                        .first()
-                        .map(|a| a.name.clone())
-                        .unwrap_or_default(),
-                    group_id: None,
-                    group_name: None,
-                    group_updated_at: None,
-                    tags: None,
-                    progress: None,
-                    reading_status: None,
-                    reading_status_updated_at: None,
-                    cover_hash: None,
-                    cover_updated_at: None,
-                    metadata: None,
-                    metadata_updated_at: None,
-                    created_at: Some(format_iso8601(rec.added * 1000)),
-                    // See `readest_push_book`: no timestamp, so the server
-                    // keeps metadata edits and deletions made elsewhere.
-                    updated_at: None,
-                    deleted_at: None,
-                    uploaded_at: None,
-                    synced_at: None,
-                });
                 if !is_txt {
                     if let Some(p) = &rec.progress {
-                        local_configs.push(progress_to_db_book_config(&rec.id, p, None));
+                        let pages = if p.fraction > 0.0 {
+                            let cur =
+                                ((p.fraction.clamp(0.0, 1.0) * 100.0).round() as u32).clamp(1, 100);
+                            Some((cur, 100))
+                        } else {
+                            None
+                        };
+                        local_configs.push(progress_to_db_book_config(&rec.id, p, pages));
                     }
                     local_notes.extend(
                         rec.annotations
@@ -903,97 +1016,132 @@ impl App {
             }
 
             let submitted = records;
-            let transport = ReadestTransport::new(policy);
+            let transport = ReadestTransport::with_timeout(policy, 30);
             // The session is the account's, shared with the other requests:
             // the store keeps the live access token, the settings file only
             // the refresh token.
             let client = SyncClient::with_session_store(transport, sync_config, store);
 
-            // Books use cursor pagination (contract §2.1): a single page of
-            // 100 would skip the rest of a large library. Each pull reports
-            // the newest *server* timestamp it saw, which is the cursor the
-            // next round must use.
-            let mut stage = SyncStage::Library;
-            let (pulled_books, books_cursor) =
-                match client.pull_all_books_with_cursor(since_books, 100) {
-                    Ok(res) => res,
+            // Fast path: when all three cursors match (e.g. initial sync), a
+            // single untyped `GET /api/sync?since=<s>` (with no `limit`, so
+            // the server loops internally and returns complete results per
+            // contract §1.1) fetches books, configs and notes concurrently on
+            // the server in 1 RTT over a single warm Keep-Alive socket.
+            // When cursors differ, refresh the token once and fan out the 3
+            // independent typed GETs in parallel.
+            let pull_res: Result<
+                (
+                    Vec<inkread_core::sync::DbBook>,
+                    Vec<DbBookConfig>,
+                    Vec<DbBookNote>,
+                    PulledCursors,
+                ),
+                (SyncStage, inkread_core::sync::SyncError),
+            > = if since_books == since_configs && since_configs == since_notes {
+                match client.pull_internal(None, since_books, None, None) {
+                    Ok(resp) => {
+                        let cursors = PulledCursors {
+                            books: resp.books_cursor(),
+                            configs: resp.configs_cursor(),
+                            notes: resp.notes_cursor(),
+                        };
+                        Ok((resp.books, resp.configs, resp.notes, cursors))
+                    }
+                    Err(e) => Err((SyncStage::Library, e)),
+                }
+            } else if let Err(e) = client.ensure_token() {
+                Err((SyncStage::Library, e))
+            } else {
+                std::thread::scope(|scope| {
+                    let books_h =
+                        scope.spawn(|| client.pull_all_books_with_cursor(since_books, 100));
+                    let configs_h = scope
+                        .spawn(|| client.pull_internal(Some("configs"), since_configs, None, None));
+                    let notes_h = scope
+                        .spawn(|| client.pull_internal(Some("notes"), since_notes, None, None));
+
+                    let books_res = books_h.join().unwrap_or_else(|_| {
+                        Err(inkread_core::sync::SyncError::Transport(
+                            "books worker panicked".into(),
+                        ))
+                    });
+                    let configs_res = configs_h.join().unwrap_or_else(|_| {
+                        Err(inkread_core::sync::SyncError::Transport(
+                            "configs worker panicked".into(),
+                        ))
+                    });
+                    let notes_res = notes_h.join().unwrap_or_else(|_| {
+                        Err(inkread_core::sync::SyncError::Transport(
+                            "notes worker panicked".into(),
+                        ))
+                    });
+
+                    let (pulled_books, books_cursor) =
+                        books_res.map_err(|e| (SyncStage::Library, e))?;
+                    let configs = configs_res.map_err(|e| (SyncStage::Progress, e))?;
+                    let notes = notes_res.map_err(|e| (SyncStage::Notes, e))?;
+                    let cursors = PulledCursors {
+                        books: books_cursor,
+                        configs: configs.configs_cursor(),
+                        notes: notes.notes_cursor(),
+                    };
+                    Ok((pulled_books, configs.configs, notes.notes, cursors))
+                })
+            };
+
+            let (pulled_books, pulled_configs, pulled_notes, cursors) = match pull_res {
+                Ok(tuple) => tuple,
+                Err((stage, e)) => {
+                    eprintln!(
+                        "aristotle: readest: full sync failed at {stage:?}: {}",
+                        redacted_sync_error(&e)
+                    );
+                    return Done::ReadestSyncAll {
+                        store: epoch,
+                        submitted: Vec::new(),
+                        now_ms: client.now_ms(),
+                        pulled_configs: Vec::new(),
+                        pulled_notes: Vec::new(),
+                        stage: Some(stage),
+                        cursors: PulledCursors::default(),
+                        result: Err(e.kind()),
+                    };
+                }
+            };
+            let pull_count = pulled_books.len() + pulled_configs.len() + pulled_notes.len();
+
+            // Skip POST /api/sync when there are no local configs or notes to
+            // upload, saving a full round-trip on pull-only syncs.
+            let push_count = if local_configs.is_empty() && local_notes.is_empty() {
+                0
+            } else {
+                let push_req = SyncPushRequest {
+                    books: Vec::new(),
+                    configs: local_configs,
+                    notes: local_notes,
+                    stat_books: Vec::new(),
+                    stat_pages: Vec::new(),
+                };
+
+                let stage = SyncStage::Push;
+                match client.push(push_req, Some(&txt_hashes)) {
+                    Ok(p) => p.books.len() + p.configs.len() + p.notes.len(),
                     Err(e) => {
+                        eprintln!(
+                            "aristotle: readest: full sync failed at {stage:?}: {}",
+                            redacted_sync_error(&e)
+                        );
                         return Done::ReadestSyncAll {
                             store: epoch,
                             submitted: Vec::new(),
                             now_ms: client.now_ms(),
-                            pulled_configs: Vec::new(),
-                            pulled_notes: Vec::new(),
+                            pulled_configs,
+                            pulled_notes,
                             stage: Some(stage),
                             cursors: PulledCursors::default(),
                             result: Err(e.kind()),
                         };
                     }
-                };
-            stage = SyncStage::Progress;
-            let configs = match client.pull_internal(Some("configs"), since_configs, None, None) {
-                Ok(res) => res,
-                Err(e) => {
-                    return Done::ReadestSyncAll {
-                        store: epoch,
-                        submitted: Vec::new(),
-                        now_ms: client.now_ms(),
-                        pulled_configs: Vec::new(),
-                        pulled_notes: Vec::new(),
-                        stage: Some(stage),
-                        cursors: PulledCursors::default(),
-                        result: Err(e.kind()),
-                    };
-                }
-            };
-            stage = SyncStage::Notes;
-            let notes = match client.pull_internal(Some("notes"), since_notes, None, None) {
-                Ok(res) => res,
-                Err(e) => {
-                    return Done::ReadestSyncAll {
-                        store: epoch,
-                        submitted: Vec::new(),
-                        now_ms: client.now_ms(),
-                        pulled_configs: Vec::new(),
-                        pulled_notes: Vec::new(),
-                        stage: Some(stage),
-                        cursors: PulledCursors::default(),
-                        result: Err(e.kind()),
-                    };
-                }
-            };
-            let cursors = PulledCursors {
-                books: books_cursor,
-                configs: configs.configs_cursor(),
-                notes: notes.notes_cursor(),
-            };
-            let pulled_configs = configs.configs;
-            let pulled_notes = notes.notes;
-            let pull_count = pulled_books.len() + pulled_configs.len() + pulled_notes.len();
-
-            let push_req = SyncPushRequest {
-                books: local_books,
-                configs: local_configs,
-                notes: local_notes,
-                stat_books: Vec::new(),
-                stat_pages: Vec::new(),
-            };
-
-            stage = SyncStage::Push;
-            let push_res = client.push(push_req, Some(&txt_hashes));
-            let push_count = match push_res {
-                Ok(p) => p.books.len() + p.configs.len() + p.notes.len(),
-                Err(e) => {
-                    return Done::ReadestSyncAll {
-                        store: epoch,
-                        submitted: Vec::new(),
-                        now_ms: client.now_ms(),
-                        pulled_configs,
-                        pulled_notes,
-                        stage: Some(stage),
-                        cursors: PulledCursors::default(),
-                        result: Err(e.kind()),
-                    };
                 }
             };
 
@@ -1065,9 +1213,13 @@ impl App {
                 self.readest.last_sync_time = Some(format_iso8601(now_ms));
                 self.readest.message = Some(tr(Msg::ReadestSyncSuccess).to_string());
 
-                // Pulled configs are not applied here: a position may only move
-                // when its book is open and the reader agrees (contract §5.2).
-                let _ = pulled_configs;
+                // Update cloud shelf progress and seed unread local copies from
+                // pulled configs without silently overwriting active local reading
+                // positions (contract §5.2).
+                for cfg in pulled_configs {
+                    self.update_cloud_book_from_config(&cfg);
+                    self.seed_unread_local_book_from_config(&cfg);
+                }
 
                 // Group pulled notes by book_hash and merge
                 let mut notes_by_book: std::collections::HashMap<String, Vec<DbBookNote>> =
@@ -1124,6 +1276,10 @@ impl App {
             return Ok(());
         };
         let book = r.session.id.clone();
+        if self.is_weread_book(&book) {
+            self.readest.manual_message = Some(tr(Msg::ReaderSyncWereadOnly).to_string());
+            return self.refresh_reader_sync_status();
+        }
         if self.net.accounts.readest.is_none() {
             self.readest.manual_message = Some(tr(Msg::ReadestAccountNotLoggedIn).to_string());
             return self.refresh_reader_sync_status();
@@ -1152,16 +1308,22 @@ impl App {
         self.net.spawn("readest-pull-book", move |_| {
             let client =
                 SyncClient::with_session_store(ReadestTransport::new(policy), config, store);
+            // Single untyped GET fetches both `configs` and `notes` for this
+            // book in parallel on the server (contract §1.1), cutting manual
+            // pull latency in half compared to two sequential GETs. `limit=1`
+            // bounds the ignored `books` slice while configs/notes remain full.
             let pulled = client
-                .pull_internal(Some("configs"), 0, None, Some(&book))
-                .and_then(|configs| {
-                    client
-                        .pull_internal(Some("notes"), 0, None, Some(&book))
-                        .map(|notes| (configs.configs, notes.notes))
-                });
+                .pull_internal(None, 0, Some(1), Some(&book))
+                .map(|resp| (resp.configs, resp.notes));
             let (pulled, result) = match pulled {
                 Ok(pair) => (Some(pair), Ok(())),
-                Err(e) => (None, Err(e.kind())),
+                Err(e) => {
+                    eprintln!(
+                        "aristotle: readest: manual pull failed: {}",
+                        redacted_sync_error(&e)
+                    );
+                    (None, Err(e.kind()))
+                }
             };
             Done::ReadestBookSync {
                 job,
@@ -1182,6 +1344,10 @@ impl App {
             return Ok(());
         };
         let book = r.session.id.clone();
+        if self.is_weread_book(&book) {
+            self.readest.manual_message = Some(tr(Msg::ReaderSyncWereadOnly).to_string());
+            return self.refresh_reader_sync_status();
+        }
         if self.net.accounts.readest.is_none() {
             self.readest.manual_message = Some(tr(Msg::ReadestAccountNotLoggedIn).to_string());
             return self.refresh_reader_sync_status();
@@ -1254,9 +1420,12 @@ impl App {
                             notes,
                             ..Default::default()
                         },
+                        true,
                     )?;
                 }
-                self.readest.manual_message = Some(if self.readest.offer.is_some() {
+                let offered = self.readest.offer.is_some()
+                    || matches!(&self.screen, Screen::Reader(r) if matches!(r.overlay, Overlay::Sync { .. }));
+                self.readest.manual_message = Some(if offered {
                     tr(Msg::ReaderSyncPullDone).to_string()
                 } else {
                     tr(Msg::ReaderSyncSame).to_string()
@@ -1623,6 +1792,23 @@ impl App {
             _ => {}
         }
         Ok(Flow::Continue)
+    }
+}
+
+/// Redacted summary of a `SyncError` for stderr diagnostics: includes the
+/// error kind (plus HTTP status code or brief transport/limit class), while
+/// never logging response bodies, tokens, URLs, or emails.
+fn redacted_sync_error(e: &inkread_core::sync::SyncError) -> String {
+    use inkread_core::sync::SyncError as E;
+    match e {
+        E::HttpStatus(code, _) => format!("{:?}(HTTP {code})", e.kind()),
+        E::TooLarge(limit) => format!("{:?}({limit}B)", e.kind()),
+        E::Transport(detail) => {
+            let brief = detail.split('\n').next().unwrap_or("");
+            let brief: String = brief.chars().take(80).collect();
+            format!("{:?}({brief})", e.kind())
+        }
+        _ => format!("{:?}", e.kind()),
     }
 }
 

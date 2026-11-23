@@ -15,7 +15,7 @@ use crate::geom::{Insets, Size};
 use crate::icons::Icon;
 use crate::status::LoadingNodes;
 use crate::text::{Align, Paragraph, TextEngine};
-use crate::theme::{home_margin, Styles, CARD, INK, INK_MID, PAPER};
+use crate::theme::{home_margin, PanelLayout, Styles, CARD, INK, INK_MID, PAPER};
 use crate::tree::{ActionId, Cross, Feedback, Kind, Node, NodeId, Tree};
 use crate::widgets::GoalBar;
 use aristotle_i18n::{tr, trn, Msg, Plural};
@@ -38,6 +38,8 @@ pub mod action {
     /// The two buttons at the foot of the screen.
     pub const RETURN_KINDLE: ActionId = 9;
     pub const OPEN_KUAL: ActionId = 10;
+    /// The software update.
+    pub const ENTRY_OTA: ActionId = 11;
 }
 
 /// The account card: who the reader is.
@@ -137,18 +139,37 @@ const TILE_R: i32 = 24;
 /// The height of the account button.
 const ACCOUNT_BTN_H: i32 = 80;
 /// The height of the buttons at the foot of the screen.
-const FOOT_BTN_H: i32 = 72;
+const FOOT_BTN_H: i32 = crate::geom::MIN_TARGET;
 
 impl MineUi {
     /// Builds the "mine" screen.
-    pub fn build(_text: &mut TextEngine, s: &Styles, mine: &Mine) -> (Tree, Self) {
+    pub fn build(text: &mut TextEngine, s: &Styles, mine: &Mine) -> (Tree, Self) {
+        Self::build_for_size(
+            text,
+            s,
+            mine,
+            Size::new(
+                s.density.px(crate::geom::SCREEN_WIDTH),
+                s.density.px(crate::geom::SCREEN_HEIGHT),
+            ),
+        )
+    }
+
+    /// Builds the Mine page using the panel's native dimensions and density.
+    pub fn build_for_size(
+        _text: &mut TextEngine,
+        s: &Styles,
+        mine: &Mine,
+        size: Size,
+    ) -> (Tree, Self) {
+        let panel = PanelLayout::for_size(size, s.density);
         let mut t = Tree::new();
         let bar = status_line(&mut t, s, &mine.status);
         let status = t.pad(Insets::new(0, home_margin(), 0, home_margin()), bar.root);
         let header = header(&mut t, s);
         let header = t.pad(Insets::new(0, home_margin(), 0, home_margin()), header);
         let mut rows = Vec::new();
-        let body = body(&mut t, s, mine, &mut rows);
+        let body = body(&mut t, s, mine, &mut rows, panel);
         let nav = crate::nav::build(&mut t, s, crate::nav::Tab::Mine);
         let root = t.add(Node::column(0), [status, header, body, nav.root]);
         t.set_root(root);
@@ -185,24 +206,38 @@ fn header(t: &mut Tree, s: &Styles) -> NodeId {
 }
 
 /// Everything between the header and the navigation bar.
-fn body(t: &mut Tree, s: &Styles, mine: &Mine, rows: &mut Vec<NodeId>) -> NodeId {
+fn body(
+    t: &mut Tree,
+    s: &Styles,
+    mine: &Mine,
+    rows: &mut Vec<NodeId>,
+    panel: PanelLayout,
+) -> NodeId {
+    let section_gap = if panel == PanelLayout::Compact { 8 } else { 28 };
     let mut parts = vec![
         account_card(t, s, &mine.account),
-        t.gap(0, 28),
+        t.gap(0, section_gap),
         stats_title(t, s),
         // 6 px: the stats heading is 64 px (8 more than before) so the grid
         // below stays where it was.
         t.gap(0, 6),
-        grid(t, s, &mine.stats),
+        grid(t, s, &mine.stats, panel),
         t.gap(0, 14),
         streak_row(t, s, &mine.streak),
-        t.gap(0, 28),
+        t.gap(0, section_gap),
     ];
-    parts.push(entry_list(t, s, &mine.entries, rows));
+    parts.push(entry_list(t, s, &mine.entries, rows, panel));
+    if panel == PanelLayout::Large {
+        parts.push(t.spacer(1));
+    }
     parts.push(t.gap(0, 24));
     parts.push(foot(t, s));
     let col = t.add(Node::column(0), parts);
-    let col = t.pad(Insets::new(28, home_margin(), 32, home_margin()), col);
+    let padding = if panel == PanelLayout::Compact { 8 } else { 28 };
+    let col = t.pad(
+        Insets::new(padding, home_margin(), padding, home_margin()),
+        col,
+    );
     t.add(Node::column(0).flex(1), [col])
 }
 
@@ -284,8 +319,13 @@ fn stats_title(t: &mut Tree, s: &Styles) -> NodeId {
 }
 
 /// The four figures of the reading, two by two.
-fn grid(t: &mut Tree, s: &Styles, stats: &Stats) -> NodeId {
-    let today = today_tile(t, s, stats, 1);
+fn grid(t: &mut Tree, s: &Styles, stats: &Stats, panel: PanelLayout) -> NodeId {
+    let tile_h = if panel == PanelLayout::Compact {
+        120
+    } else {
+        TILE_H
+    };
+    let today = today_tile(t, s, stats, 1, tile_h);
     let week = tile(
         t,
         s,
@@ -293,6 +333,7 @@ fn grid(t: &mut Tree, s: &Styles, stats: &Stats) -> NodeId {
         &hours(stats.week_hours),
         tr(Msg::MineHours),
         1,
+        tile_h,
     );
     let total = tile(
         t,
@@ -301,6 +342,7 @@ fn grid(t: &mut Tree, s: &Styles, stats: &Stats) -> NodeId {
         &stats.total_hours.to_string(),
         tr(Msg::MineHours),
         1,
+        tile_h,
     );
     let finished = tile(
         t,
@@ -309,15 +351,29 @@ fn grid(t: &mut Tree, s: &Styles, stats: &Stats) -> NodeId {
         &stats.finished.to_string(),
         tr(Msg::MineBooks),
         1,
+        tile_h,
     );
+    if panel == PanelLayout::Large {
+        return t.add(
+            Node::row(20).cross(Cross::Start),
+            [today, week, total, finished],
+        );
+    }
     let first = t.add(Node::row(20).cross(Cross::Start), [today, week]);
     let second = t.add(Node::row(20).cross(Cross::Start), [total, finished]);
-    t.add(Node::column(20), [first, second])
+    t.add(
+        Node::column(if panel == PanelLayout::Compact {
+            12
+        } else {
+            20
+        }),
+        [first, second],
+    )
 }
 
 /// The tile of the minutes read today, with the bar of the goal under the
 /// figure.
-fn today_tile(t: &mut Tree, s: &Styles, stats: &Stats, flex: u16) -> NodeId {
+fn today_tile(t: &mut Tree, s: &Styles, stats: &Stats, flex: u16, tile_h: i32) -> NodeId {
     let label = t.label(
         tr(Msg::MineToday),
         s.font_xs().gray(INK_MID).line_height(1.2),
@@ -332,14 +388,25 @@ fn today_tile(t: &mut Tree, s: &Styles, stats: &Stats, flex: u16) -> NodeId {
     let bar = t.custom(GoalBar {
         value: stats.today_minutes as f32 / stats.goal_minutes.max(1) as f32,
     });
-    let block = t.add(Node::column(12), [figures, bar]);
+    let block = t.add(
+        Node::column(if tile_h < TILE_H { 6 } else { 12 }),
+        [figures, bar],
+    );
     let fill = t.spacer(1);
     let col = t.add(Node::column(0), [label, fill, block]);
-    let col = t.pad(Insets::new(20, 24, 20, 24), col);
+    let col = t.pad(
+        Insets::new(
+            if tile_h < TILE_H { 6 } else { 20 },
+            24,
+            if tile_h < TILE_H { 6 } else { 20 },
+            24,
+        ),
+        col,
+    );
     t.add(
         Node::new(Kind::Fixed {
             w: None,
-            h: Some(TILE_H),
+            h: Some(tile_h),
         })
         .bg(CARD)
         .border(0, CARD, TILE_R)
@@ -349,18 +416,34 @@ fn today_tile(t: &mut Tree, s: &Styles, stats: &Stats, flex: u16) -> NodeId {
 }
 
 /// A tile of the grid: a label on top, a figure at the foot.
-fn tile(t: &mut Tree, s: &Styles, label: &str, value: &str, unit: &str, flex: u16) -> NodeId {
+fn tile(
+    t: &mut Tree,
+    s: &Styles,
+    label: &str,
+    value: &str,
+    unit: &str,
+    flex: u16,
+    tile_h: i32,
+) -> NodeId {
     let label = t.label(label, s.font_xs().gray(INK_MID).line_height(1.2));
     let number = t.label(value, s.font_md().bold().line_height(1.1));
     let unit = t.label(unit, s.font_xs().line_height(1.2));
     let figures = t.add(Node::row(10).cross(Cross::End), [number, unit]);
     let fill = t.spacer(1);
     let col = t.add(Node::column(0), [label, fill, figures]);
-    let col = t.pad(Insets::new(20, 24, 20, 24), col);
+    let col = t.pad(
+        Insets::new(
+            if tile_h < TILE_H { 12 } else { 20 },
+            24,
+            if tile_h < TILE_H { 12 } else { 20 },
+            24,
+        ),
+        col,
+    );
     t.add(
         Node::new(Kind::Fixed {
             w: None,
-            h: Some(TILE_H),
+            h: Some(tile_h),
         })
         .bg(CARD)
         .border(0, CARD, TILE_R)
@@ -422,7 +505,13 @@ fn streak_row(t: &mut Tree, s: &Styles, streak: &Streak) -> NodeId {
 
 /// The list of entries: the calendar, the notes, the quotations, the
 /// settings and the about page.
-fn entry_list(t: &mut Tree, s: &Styles, entries: &Entries, rows: &mut Vec<NodeId>) -> NodeId {
+fn entry_list(
+    t: &mut Tree,
+    s: &Styles,
+    entries: &Entries,
+    rows: &mut Vec<NodeId>,
+    panel: PanelLayout,
+) -> NodeId {
     let marks = format!(
         "{} · {}",
         trn(Plural::MineHighlights, entries.highlights as usize),
@@ -436,26 +525,80 @@ fn entry_list(t: &mut Tree, s: &Styles, entries: &Entries, rows: &mut Vec<NodeId
         (tr(Msg::MineEntryQuotes), Some(quotes), action::ENTRY_QUOTES),
         (tr(Msg::SettingsTitle), None, action::SETTINGS),
         (tr(Msg::MineAbout), Some(version), action::ABOUT),
+        (tr(Msg::OtaEntry), None, action::ENTRY_OTA),
     ];
     let mut list = Vec::new();
     for (label, value, id) in items {
-        let row = entry_row(t, s, label, value.as_deref(), id);
+        let row = entry_row(
+            t,
+            s,
+            label,
+            value.as_deref(),
+            id,
+            panel != PanelLayout::Large,
+        );
         rows.push(row);
         list.push(row);
     }
-    let col = t.add(Node::column(0), list);
+    let col = if panel != PanelLayout::Large {
+        let lines: Vec<_> = list
+            .chunks(2)
+            .map(|cells| {
+                let row = t.add(Node::row(12), cells.iter().copied());
+                t.fixed(None, Some(crate::geom::MIN_TARGET), Some(row))
+            })
+            .collect();
+        t.add(Node::column(12), lines)
+    } else {
+        let list: Vec<_> = list
+            .into_iter()
+            .map(|row| t.fixed(None, Some(128), Some(row)))
+            .collect();
+        t.add(Node::column(0), list)
+    };
     t.add(
         Node::new(Kind::Padding(Insets::new(8, 28, 8, 28)))
             .bg(CARD)
             .border(0, CARD, 24)
-            .flex(1),
+            .flex(u16::from(panel != PanelLayout::Large)),
         [col],
     )
 }
 
 /// A row of the list: the name on the left, the value and a chevron on the
 /// right.
-fn entry_row(t: &mut Tree, s: &Styles, label: &str, value: Option<&str>, id: ActionId) -> NodeId {
+fn entry_row(
+    t: &mut Tree,
+    s: &Styles,
+    label: &str,
+    value: Option<&str>,
+    id: ActionId,
+    compact: bool,
+) -> NodeId {
+    if compact {
+        let name = one_line(t, label, s.font_sm().line_height(1.3));
+        let name = t.add(Node::column(0).flex(1), [name]);
+        let arrow = t.icon(Icon::ChevronRight, 28, INK);
+        let header = t.add(Node::row(8).cross(Cross::Center).flex(1), [name, arrow]);
+        let mut parts = vec![header];
+        if let Some(value) = value {
+            parts.push(one_line(
+                t,
+                value,
+                s.font_xs().gray(INK_MID).line_height(1.2),
+            ));
+        }
+        let content = t.add(Node::column(0), parts);
+        return t.add(
+            Node::new(Kind::Padding(Insets::all(8)))
+                .bg(PAPER)
+                .border(1, CARD, 12)
+                .flex(1)
+                .action(id)
+                .feedback(Feedback::Invert),
+            [content],
+        );
+    }
     let name = one_line(t, label, s.font_sm().line_height(1.3));
     let name = t.add(Node::column(0).flex(1), [name]);
     let mut parts = Vec::new();
@@ -464,12 +607,9 @@ fn entry_row(t: &mut Tree, s: &Styles, label: &str, value: Option<&str>, id: Act
     }
     parts.push(t.icon(Icon::ChevronRight, 28, INK));
     let value = t.add(Node::row(10).cross(Cross::Center), parts);
+    let row = Node::row(20).cross(Cross::Center);
     t.add(
-        Node::row(20)
-            .cross(Cross::Center)
-            .flex(1)
-            .action(id)
-            .feedback(Feedback::Invert),
+        row.flex(1).action(id).feedback(Feedback::Invert),
         [name, value],
     )
 }
@@ -599,10 +739,10 @@ mod tests {
     }
 
     #[test]
-    fn the_list_has_five_entries() {
+    fn the_list_has_six_entries() {
         let mut text = TextEngine::new(Fonts::embedded());
         let s = Styles::new(crate::text::FamilyId(0));
         let (_tree, view) = MineUi::build(&mut text, &s, &mine());
-        assert_eq!(view.rows.len(), 5);
+        assert_eq!(view.rows.len(), 6);
     }
 }

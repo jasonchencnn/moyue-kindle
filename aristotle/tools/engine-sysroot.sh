@@ -201,6 +201,7 @@ fribidi fribidi-1.0.16.tar.xz https://github.com/fribidi/fribidi/releases/downlo
 unibreak libunibreak-6.1.tar.gz https://github.com/adah1972/libunibreak/releases/download/libunibreak_6_1/libunibreak-6.1.tar.gz cc4de0099cf7ff05005ceabff4afed4c582a736abc38033e70fdac86335ce93f
 utf8proc utf8proc-2.11.3.tar.gz https://github.com/JuliaStrings/utf8proc/releases/download/v2.11.3/utf8proc-2.11.3.tar.gz 415189fd2c85cd6ee5ff26af500fa387de9ada1e3e316e93f7338551481d557d
 zstd zstd-1.5.7.tar.gz https://github.com/meta/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+libwebp libwebp-1.6.0.tar.gz https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
 EOF
 
     # FriBiDi: bidi (RTL) support for crengine-ng.
@@ -242,6 +243,37 @@ EOF
             HAVE_THREAD=0 ZSTD_LEGACY_SUPPORT=0 HAVE_ZLIB=0 CFLAGS="-O2 -fPIC")
         cp "$engine_src/zstd/lib/libzstd.a" "$engine_libs/"
         touch "$ENGINE_BUILD/stamps/zstd"
+    fi
+
+    # libwebp: WebP image decoding (including animated WebP first-frame via demux).
+    if [ ! -f "$ENGINE_BUILD/stamps/libwebp" ]; then
+        echo "=== libwebp"
+        rm -rf "$engine_obj/libwebp"
+        mkdir -p "$engine_obj/libwebp"
+        cmake -S "$engine_src/libwebp" -B "$engine_obj/libwebp" \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=arm \
+            -DCMAKE_C_COMPILER="$engine_xcc" \
+            -DCMAKE_AR="$engine_xar" \
+            -DCMAKE_RANLIB="$engine_xranlib" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-O2 -fPIC" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWEBP_BUILD_ANIM_UTILS=OFF \
+            -DWEBP_BUILD_CWEBP=OFF \
+            -DWEBP_BUILD_DWEBP=OFF \
+            -DWEBP_BUILD_EXTRAS=OFF \
+            -DWEBP_BUILD_GIF2WEBP=OFF \
+            -DWEBP_BUILD_IMG2WEBP=OFF \
+            -DWEBP_BUILD_LIBWEBPMUX=OFF \
+            -DWEBP_BUILD_VWEBP=OFF \
+            -DWEBP_BUILD_WEBPINFO=OFF \
+            -DWEBP_BUILD_WEBPMUX=OFF \
+            -DWEBP_ENABLE_SIMD=OFF
+        cmake --build "$engine_obj/libwebp" --target webp webpdemux sharpyuv -j"$engine_jobs"
+        cp "$engine_obj/libwebp/libwebp.a" "$engine_obj/libwebp/libwebpdemux.a" \
+           "$engine_obj/libwebp/libsharpyuv.a" "$engine_libs/"
+        touch "$ENGINE_BUILD/stamps/libwebp"
     fi
 
     # The C++ runtime: Zig builds libc++/libc++abi for the target on the first
@@ -306,6 +338,9 @@ EOF
     cp -f "$engine_libs/libutf8proc.a" "$engine_lib/"
     cp -f "$engine_src/zstd/lib/zstd.h" "$engine_src/zstd/lib/zstd_errors.h" "$engine_inc/"
     cp -f "$engine_libs/libzstd.a" "$engine_lib/"
+    mkdir -p "$engine_inc/webp"
+    cp -f "$engine_src/libwebp/src/webp/"*.h "$engine_inc/webp/"
+    cp -f "$engine_libs/libwebp.a" "$engine_libs/libwebpdemux.a" "$engine_libs/libsharpyuv.a" "$engine_lib/"
 
     # The C++ runtime.
     cp -f "$engine_libs/libc++.a" "$engine_libs/libc++abi.a" "$engine_lib/"

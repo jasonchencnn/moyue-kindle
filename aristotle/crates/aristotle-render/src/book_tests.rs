@@ -1398,7 +1398,7 @@ fn test_cjk_typesetting_variations_and_generate_shots() {
     let (encoded, _, _) = encoding_rs::GBK.encode(novel_content);
     std::fs::write(&txt_path, encoded).unwrap();
 
-    // 1. 测试首行缩进 2 字 vs 无缩进
+    // 1. 测试首行缩进 2 字 vs 无缩进（纯文本在默认精排模式下也应响应缩进设置）
     let mut style_indent_2 = Style::pw4();
     style_indent_2.cjk_indent = 2;
     style_indent_2.cjk_gap = 0.0;
@@ -1490,13 +1490,17 @@ fn test_cjk_typesetting_variations_and_generate_shots() {
         &shots_dir.join("compare-gap.png"),
     );
 
-    // 3. EPUB 测试：验证 EPUB 也能生效并产生不同排版
+    // 3. EPUB 测试：关闭精排（统一模式）时强制接管书内缩进并产生不同排版
     let epub_path = cache_path.join(BOOK);
     if epub_path.is_file() {
+        let mut epub_style_i2 = style_indent_2.clone();
+        epub_style_i2.fine_typesetting = false;
+        let mut epub_style_i0 = style_indent_none.clone();
+        epub_style_i0.fine_typesetting = false;
         let mut book_epub_i2 =
-            Book::open(&epub_path, &style_indent_2, None).expect("open epub indent 2");
+            Book::open(&epub_path, &epub_style_i2, None).expect("open epub indent 2");
         let mut book_epub_i0 =
-            Book::open(&epub_path, &style_indent_none, None).expect("open epub indent 0");
+            Book::open(&epub_path, &epub_style_i0, None).expect("open epub indent 0");
         let page_epub_i2 = book_epub_i2
             .render_page(5, &mut chrome1)
             .expect("render epub page 5 indent 2");
@@ -1505,7 +1509,7 @@ fn test_cjk_typesetting_variations_and_generate_shots() {
             .expect("render epub page 5 indent 0");
         assert_ne!(
             page_epub_i2.data, page_epub_i0.data,
-            "EPUB rendering must also vary with cjk_indent"
+            "EPUB rendering must vary with cjk_indent in uniform (non-fine) mode"
         );
         save_page_png(&page_epub_i2, &shots_dir.join("epub-indent-2chars.png"));
         save_page_png(&page_epub_i0, &shots_dir.join("epub-indent-none.png"));
@@ -1577,11 +1581,15 @@ fn test_cjk_indent_class_style_and_u3000_spaces() {
 <p>　　这是第二段测试正文。同样在段首包含两个全角空格。</p>"#;
     create_test_epub(&epub_u3000_path, "U3000 Indent Test", u3000_html);
 
+    // 强制覆盖书内 class 缩进与全角空格属于统一排版模式（关闭精排）；
+    // 开启精排时保留书内 class 样式与全角空格排版意图。
     let mut style_indent_2 = Style::pw4();
+    style_indent_2.fine_typesetting = false;
     style_indent_2.cjk_indent = 2;
     style_indent_2.cjk_gap = 0.0;
 
     let mut style_indent_none = Style::pw4();
+    style_indent_none.fine_typesetting = false;
     style_indent_none.cjk_indent = 0;
     style_indent_none.cjk_gap = 0.0;
 

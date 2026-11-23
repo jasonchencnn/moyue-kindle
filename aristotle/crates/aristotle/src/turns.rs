@@ -26,7 +26,7 @@
 
 use aristotle_ui::geom::{Point, Rect};
 use aristotle_ui::input::{Direction, Gesture, GestureRecognizer, Phase, TouchEvent};
-use aristotle_ui::screens::reader::{zone_at, Zone};
+use aristotle_ui::screens::reader::{vertical_zone_at, zone_at, Zone};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Turn {
@@ -65,6 +65,10 @@ pub struct TurnGestures {
     quiet: Vec<Rect>,
     /// A hold is in progress: moves are drags until the lift.
     holding: bool,
+    /// The book is set vertically (top to bottom, right to left): the left
+    /// half turns forward, the right half back, and the swipes mirror the
+    /// horizontal ones (VERT-101).
+    vertical: bool,
 }
 
 /// The bookmark corner: the top right 10 mm square.
@@ -93,6 +97,21 @@ impl TurnGestures {
             )),
             quiet: vec![bookmark_corner_at(screen, density)],
             holding: false,
+            vertical: false,
+        }
+    }
+
+    /// Set whether the book is set vertically: the turns mirror.
+    pub fn set_vertical(&mut self, vertical: bool) {
+        self.vertical = vertical;
+    }
+
+    /// The zone a point falls in, for the writing direction of the book.
+    fn zone(&self, p: Point) -> Zone {
+        if self.vertical {
+            vertical_zone_at(self.screen, p)
+        } else {
+            zone_at(self.screen, p)
         }
     }
 
@@ -168,7 +187,7 @@ impl TurnGestures {
                 if self.is_quiet(p) {
                     out.push(Intent::Tap(p));
                 } else {
-                    match zone_at(self.screen, p) {
+                    match self.zone(p) {
                         Zone::Menu => out.push(Intent::OpenMenu),
                         Zone::Prev => out.push(Intent::Turn {
                             dir: Turn::Back,
@@ -186,7 +205,17 @@ impl TurnGestures {
                 out.push(Intent::Hold { at: p });
             }
             Gesture::Swipe { dir, from, .. } => match dir {
+                // A horizontal book moves its text leftwards for the next
+                // page; a vertical one, right to left, moves it rightwards.
+                Direction::Left if self.vertical => out.push(Intent::Turn {
+                    dir: Turn::Back,
+                    at_us,
+                }),
                 Direction::Left => out.push(Intent::Turn {
+                    dir: Turn::Forward,
+                    at_us,
+                }),
+                Direction::Right if self.vertical => out.push(Intent::Turn {
                     dir: Turn::Forward,
                     at_us,
                 }),
@@ -194,9 +223,7 @@ impl TurnGestures {
                     dir: Turn::Back,
                     at_us,
                 }),
-                Direction::Down if zone_at(self.screen, from) == Zone::Menu => {
-                    out.push(Intent::OpenMenu)
-                }
+                Direction::Down if self.zone(from) == Zone::Menu => out.push(Intent::OpenMenu),
                 _ => {}
             },
         }
@@ -365,6 +392,44 @@ mod tests {
                 Intent::Release(Point { x: 150, y: 700 })
             ]
         );
+    }
+
+    #[test]
+    fn a_vertical_book_turns_the_other_way() {
+        let mut g = TurnGestures::new(Rect::screen());
+        g.set_vertical(true);
+        // The left half goes forward, the right half back.
+        let tap = |g: &mut TurnGestures, x: i32| {
+            g.feed(ev(Phase::Down, x, 700, 0));
+            net_pages(&g.feed(ev(Phase::Up, x, 700, 60)))
+        };
+        assert_eq!(tap(&mut g, 150), 1);
+        assert_eq!(tap(&mut g, 900), -1);
+        // The middle of the screen is a turn, not the menu.
+        assert_eq!(tap(&mut g, 536), 1);
+        // Swipes mirror: a swipe right goes forward, a swipe left back.
+        let travel = mm(20.0);
+        let swipe = |g: &mut TurnGestures, x0: i32, x1: i32| {
+            g.feed(ev(Phase::Down, x0, 700, 0));
+            g.feed(ev(Phase::Move, x1, 700, 60));
+            net_pages(&g.feed(ev(Phase::Up, x1, 700, 90)))
+        };
+        assert_eq!(swipe(&mut g, 400, 400 + travel), 1);
+        assert_eq!(swipe(&mut g, 700, 700 - travel), -1);
+        // The menu bands and the bookmark corner keep their meaning.
+        g.feed(ev(Phase::Down, 500, 60, 1000));
+        assert_eq!(g.feed(ev(Phase::Up, 500, 60, 1080)), vec![Intent::OpenMenu]);
+        let corner = bookmark_corner(Rect::screen());
+        let (x, y) = (corner.x + 50, corner.y + 50);
+        g.feed(ev(Phase::Down, x, y, 2000));
+        assert_eq!(
+            g.feed(ev(Phase::Up, x, y, 2080)),
+            vec![Intent::Tap(Point { x, y })]
+        );
+        // Back to horizontal, the old direction returns.
+        g.set_vertical(false);
+        assert_eq!(tap(&mut g, 150), -1);
+        assert_eq!(tap(&mut g, 900), 1);
     }
 
     #[test]

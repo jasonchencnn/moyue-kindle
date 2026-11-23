@@ -1,0 +1,424 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# KUAL control for the standalone, key-only SSH service on port 22.
+#
+# The service itself lives in /var/local/moyue-ssh (root:root, mode 000) and
+# is started by the single upstart job /etc/upstart/moyue-ssh.conf. This
+# script only stages files, writes that one job during a short mntroot window,
+# and toggles the boot marker. It never touches KOReader's 2222 listener,
+# /etc/upstart/sshd.conf, the USB/OTA/Wi-Fi policy, or the firewall's default
+# policy.
+set -u
+PATH=/usr/sbin:/sbin:$PATH
+export PATH
+umask 077
+
+HERE=$(cd "$(dirname "$0")" 2>/dev/null && pwd -P) || exit 1
+R=${AGENT_TEST_ROOT:-}
+S=$R/var/local/moyue-ssh
+KO=$R/mnt/us/koreader
+JOB=moyue-ssh
+CONF=$R/etc/upstart/$JOB.conf
+CONF_SRC=$HERE/$JOB.conf
+SERVICE_SRC=$HERE/service.sh
+KEYS_SRC=$HERE/authorized_keys
+OWNER=${AGENT_TEST_OWNER:-0}
+DIR_MODE=${AGENT_TEST_DIR_MODE:-000}
+# The exact rule service.sh adds and removes. No default policy, no other
+# interface, no port other than 22.
+RULE='INPUT -i wlan0 -p tcp --dport 22 -m state --state NEW,ESTABLISHED -j ACCEPT'
+RO=0
+
+say() {
+    printf '%s\n' "$*"
+    screen_state=stopped
+    running && screen_state=running
+    screen_boot=off
+    [ ! -f "$S/enabled" ] || screen_boot=on
+    eips 0 58 "SSH port 22: $screen_state / boot $screen_boot                  " > /dev/null 2>&1 || :
+}
+
+note() {
+    printf '%s\n' "$*" >&2
+}
+
+die() {
+    note "moyue-ssh: $*"
+    eips 0 58 "SSH operation failed. Check connection/configuration.       " > /dev/null 2>&1 || :
+    exit 1
+}
+
+restore_ro() {
+    [ "$RO" = 1 ] || return 0
+    RO=0
+    sync
+    if mntroot ro; then
+        note "moyue-ssh: root filesystem is read-only again"
+        return 0
+    fi
+    note "moyue-ssh: WARNING: mntroot ro failed; run it by hand"
+    return 1
+}
+
+on_signal() {
+    restore_ro || :
+    exit 1
+}
+
+trap 'restore_ro || :' EXIT
+trap 'on_signal' HUP INT TERM
+
+running() {
+    initctl status "$JOB" 2> /dev/null | grep -q 'start/running'
+}
+
+owner_mode() {
+    stat -c '%u %a' "$1" 2> /dev/null
+}
+
+# The state directory must be a real directory owned by root with no group or
+# other permission bits. 000 is the installed mode; 700 is accepted only for
+# the host-side test, which has to enter it as its own user.
+state_trusted() {
+    [ -L "$S" ] && return 1
+    [ -d "$S" ] || return 1
+    set -- $(owner_mode "$S")
+    [ $# -eq 2 ] || return 1
+    [ "$1" = "$OWNER" ] || return 1
+    [ $((0$2 & 077)) -eq 0 ] || return 1
+    return 0
+}
+
+port_state() {
+    seen=0
+    busy=0
+    for f in "$R/proc/net/tcp" "$R/proc/net/tcp6"; do
+        [ -r "$f" ] || continue
+        seen=1
+        if awk '$2 ~ /:0016$/ && $4 == "0A" { found = 1 } END { exit !found }' "$f"; then
+            busy=1
+        fi
+    done
+    if [ "$seen" = 0 ]; then
+        echo unknown
+    elif [ "$busy" = 1 ]; then
+        echo busy
+    else
+        echo free
+    fi
+}
+
+fw_present() {
+    # Word splitting is intentional: RULE is the exact iptables argument list.
+    iptables -C $RULE 2> /dev/null
+}
+
+device_code() {
+    sn=$(head -n 1 "$R/proc/usid" 2> /dev/null)
+    case "$sn" in
+    '') ;;
+    B* | 9*) printf '%s\n' "$sn" | cut -c3-4 ;;
+    *) printf '%s\n' "$sn" | cut -c4-6 ;;
+    esac
+}
+
+firmware_version() {
+    sed -n '1s/^Kindle \([0-9][0-9.]*\).*/\1/p' "$R/etc/prettyversion.txt" 2> /dev/null
+}
+
+guard() {
+    code=$(device_code)
+    fw=$(firmware_version)
+    # Only the exact model/firmware pair this extension was written for.
+    [ "$code" = 0PP ] || die "只支持 PW4（设备代码 0PP），当前为 ${code:-未知}；未做任何修改"
+    [ "$fw" = 5.18.1.1.1 ] || die "只支持固件 5.18.1.1.1，当前为 ${fw:-未知}；未做任何修改"
+}
+
+check_sources() {
+    [ -f "$CONF_SRC" ] || die "扩展缺少 $JOB.conf"
+    [ -f "$SERVICE_SRC" ] || die "扩展缺少 service.sh"
+    [ -f "$KO/dropbear" ] && [ ! -L "$KO/dropbear" ] && [ -x "$KO/dropbear" ] ||
+        die "找不到可执行的 $KO/dropbear；请先安装 KOReader"
+    [ -f "$KEYS_SRC" ] && [ ! -L "$KEYS_SRC" ] && [ -s "$KEYS_SRC" ] ||
+        die "扩展中没有 authorized_keys；请把公钥写入 kual/ssh/authorized_keys"
+    grep -q -e '^ssh-' -e '^ecdsa-' -e '^sk-ssh-' "$KEYS_SRC" ||
+        die "authorized_keys 中没有可识别的公钥行"
+}
+
+stage_files() {
+    stage=$1
+    mkdir "$stage" || return 1
+    chmod 700 "$stage" || return 1
+    mkdir -p "$stage/settings/SSH" || return 1
+    cp "$SERVICE_SRC" "$stage/service.sh" || return 1
+    cp "$KO/dropbear" "$stage/dropbear" || return 1
+    cp "$KEYS_SRC" "$stage/settings/SSH/authorized_keys" || return 1
+    for k in "$KO"/settings/SSH/dropbear_*_host_key; do
+        [ -f "$k" ] || continue
+        [ -L "$k" ] && return 1
+        cp "$k" "$stage/settings/SSH/${k##*/}" || return 1
+    done
+    chmod 700 "$stage/service.sh" "$stage/dropbear" || return 1
+    chmod 700 "$stage/settings" "$stage/settings/SSH" || return 1
+    chmod 600 "$stage/settings/SSH/authorized_keys" || return 1
+    for k in "$stage"/settings/SSH/dropbear_*_host_key; do
+        [ -f "$k" ] || continue
+        chmod 600 "$k" || return 1
+    done
+    return 0
+}
+
+# Write the one root-filesystem file, in a short read-write window. Any
+# failure leaves the previous file (or no file) and always tries mntroot ro.
+write_job() {
+    if cmp -s "$CONF_SRC" "$CONF" 2> /dev/null; then
+        return 0
+    fi
+    [ -d "$R/etc/upstart" ] || { note "moyue-ssh: $R/etc/upstart is missing"; return 1; }
+    mntroot rw || { note "moyue-ssh: mntroot rw failed"; return 1; }
+    RO=1
+    if [ -L "$CONF" ] || [ -L "$CONF.new" ]; then
+        restore_ro || :
+        return 1
+    fi
+    if ! cp "$CONF_SRC" "$CONF.new" || ! chmod 644 "$CONF.new" || ! mv -f "$CONF.new" "$CONF"; then
+        rm -f "$CONF.new" 2> /dev/null
+        restore_ro || :
+        return 1
+    fi
+    sync
+    restore_ro || return 1
+    return 0
+}
+
+cleanup_failed_install() {
+    [ -n "${STAGE:-}" ] && rm -rf "$STAGE" 2> /dev/null
+    if [ "${CREATED:-0}" = 1 ]; then
+        rm -rf "$S" 2> /dev/null
+    elif [ -d "$S" ]; then
+        chown 0:0 "$S" 2> /dev/null || :
+        chmod "$DIR_MODE" "$S" 2> /dev/null || :
+    fi
+}
+
+do_install() {
+    guard
+    check_sources
+    if running; then
+        stop "$JOB" > /dev/null 2>&1 || die "无法停止旧的 $JOB 服务；未做任何修改"
+        sleep 1
+    fi
+    case $(port_state) in
+    busy) die "端口 22 已被其他进程监听；未做任何修改，也不会停止它" ;;
+    unknown) die "无法读取 /proc/net/tcp 检查端口 22；未做任何修改" ;;
+    esac
+
+    CREATED=0
+    if [ -e "$S" ] || [ -L "$S" ]; then
+        state_trusted || die "$S 不是 root:root 且无组/其他权限的目录；请先检查该路径"
+    else
+        mkdir -p "$S" || die "无法创建 $S（/var/local 空间不足？）"
+        CREATED=1
+        chown 0:0 "$S" 2> /dev/null || :
+        chmod 700 "$S" || die "无法设置 $S 权限"
+    fi
+    if [ -L "$S/settings" ] || { [ -e "$S/settings" ] && [ ! -d "$S/settings" ]; }; then
+        cleanup_failed_install
+        die "$S/settings 不是普通目录"
+    fi
+    mkdir -p "$S/settings/SSH" || { cleanup_failed_install; die "无法创建 settings/SSH"; }
+    if [ -L "$S/settings/SSH" ] || [ ! -d "$S/settings/SSH" ]; then
+        cleanup_failed_install
+        die "$S/settings/SSH 不是普通目录"
+    fi
+
+    STAGE=$S/.install
+    if [ -L "$STAGE" ] || [ -e "$STAGE" ]; then
+        [ -L "$STAGE" ] && { cleanup_failed_install; die "$STAGE 是符号链接"; }
+        rm -rf "$STAGE" || { cleanup_failed_install; die "无法清理旧暂存目录"; }
+    fi
+    if ! stage_files "$STAGE"; then
+        cleanup_failed_install
+        die "复制服务文件失败（/var/local 空间不足？）；未启动任何服务"
+    fi
+    for f in service.sh dropbear; do
+        if ! mv -f "$STAGE/$f" "$S/$f"; then
+            cleanup_failed_install
+            die "安装 $f 失败；未启动任何服务"
+        fi
+    done
+    for k in "$STAGE"/settings/SSH/*; do
+        [ -e "$k" ] || continue
+        if ! mv -f "$k" "$S/settings/SSH/${k##*/}"; then
+            cleanup_failed_install
+            die "安装 $(basename "$k") 失败；未启动任何服务"
+        fi
+    done
+    rm -rf "$STAGE"
+    chmod 700 "$S/service.sh" "$S/dropbear" || { cleanup_failed_install; die "设置服务文件权限失败"; }
+    chmod 600 "$S/settings/SSH/authorized_keys" || { cleanup_failed_install; die "设置公钥权限失败"; }
+
+    if ! write_job; then
+        cleanup_failed_install
+        die "写入 /etc/upstart/$JOB.conf 失败；未启动任何服务"
+    fi
+    rm -f "$S/enabled" "$S/manual-start" 2> /dev/null
+    if ! : > "$S/enabled"; then
+        cleanup_failed_install
+        die "无法写入开机标记；未启动任何服务"
+    fi
+    chmod 600 "$S/enabled" 2> /dev/null || :
+
+    chown 0:0 "$S" "$S/service.sh" "$S/dropbear" "$S/settings" \
+        "$S/settings/SSH" "$S/settings/SSH/authorized_keys" "$S/enabled" 2> /dev/null || :
+    chmod "$DIR_MODE" "$S" || die "无法设置 $S 权限"
+    initctl reload-configuration 2> /dev/null
+
+    if ! start "$JOB"; then
+        say "SSH 已安装，但启动失败；请看状态或重试“启动”"
+        exit 1
+    fi
+    sleep 1
+    if ! running; then
+        say "SSH 已安装，但服务没有保持运行；请看状态"
+        exit 1
+    fi
+    say "SSH 已安装并启动：仅公钥，端口 22，开机默认启用"
+}
+
+do_start() {
+    [ -f "$CONF" ] || die "尚未安装；请先运行“安装并启动”"
+    if running; then
+        say "SSH 已在运行"
+        return 0
+    fi
+    state_trusted || die "$S 不是 root:root 且无组/其他权限的目录；拒绝启动"
+    if [ -L "$S/enabled" ] || [ -L "$S/manual-start" ]; then
+        die "$S 下存在符号链接标记；拒绝启动"
+    fi
+    if [ ! -f "$S/enabled" ]; then
+        : > "$S/manual-start" || die "无法写入临时启动标记"
+        chmod 600 "$S/manual-start" 2> /dev/null || :
+    fi
+    if start "$JOB"; then
+        sleep 1
+        if running; then
+            say "SSH 已启动（本次手动；开机设置未改变）"
+            return 0
+        fi
+    fi
+    rm -f "$S/manual-start" 2> /dev/null
+    die "启动失败；为安全起见没有保持临时启动标记"
+}
+
+do_stop() {
+    if running; then
+        stop "$JOB" || die "停止失败"
+        say "SSH 已停止；开机设置未改变"
+    else
+        say "SSH 当前未运行；开机设置未改变"
+    fi
+}
+
+do_disable() {
+    if [ -d "$S" ]; then
+        if [ -L "$S/enabled" ] || [ -L "$S/manual-start" ]; then
+            die "$S 下存在符号链接标记；拒绝修改"
+        fi
+        rm -f "$S/enabled" "$S/manual-start" || die "无法移除开机标记"
+    fi
+    if running; then
+        stop "$JOB" || die "已移除开机标记，但停止服务失败；请重试“停止”"
+    fi
+    say "已禁用开机启动并停止；KUAL 的“启动”仍可临时运行"
+}
+
+do_uninstall() {
+    if running; then
+        stop "$JOB" || die "停止服务失败；未删除 upstart 文件"
+    fi
+    if [ -d "$S" ]; then
+        rm -f "$S/enabled" "$S/manual-start" 2> /dev/null
+    fi
+    if [ -e "$CONF" ] || [ -L "$CONF" ]; then
+        mntroot rw || die "无法把根分区挂为可写；未删除 upstart 文件"
+        RO=1
+        if ! rm -f "$CONF"; then
+            restore_ro || :
+            die "删除 $CONF 失败"
+        fi
+        sync
+        restore_ro || die "upstart 文件已删除，但根分区恢复只读失败"
+    fi
+    initctl reload-configuration 2> /dev/null
+    say "SSH 服务已卸载（upstart 文件已删除）；$S 状态保留，可重新安装恢复"
+}
+
+do_status() {
+    if [ -f "$CONF" ] && [ -f "$S/service.sh" ] && [ -f "$S/dropbear" ]; then
+        printf '安装: 已安装\n'
+    elif [ -f "$CONF" ]; then
+        printf '安装: 已安装（服务文件不完整，请重新安装）\n'
+    else
+        printf '安装: 未安装\n'
+    fi
+    if [ -f "$S/enabled" ]; then
+        printf '开机启动: 已启用\n'
+    else
+        printf '开机启动: 已禁用\n'
+    fi
+    if running; then
+        printf '运行状态: 运行中（%s）\n' "$(initctl status "$JOB" 2> /dev/null)"
+    else
+        printf '运行状态: 已停止\n'
+    fi
+    case $(port_state) in
+    busy)
+        if running; then
+            printf '端口 22: 监听中（本服务）\n'
+        else
+            printf '端口 22: 被其他进程占用（不会停止它）\n'
+        fi
+        ;;
+    free) printf '端口 22: 空闲\n' ;;
+    *) printf '端口 22: 无法检查\n' ;;
+    esac
+    if fw_present; then
+        printf '防火墙: 已放行 wlan0 TCP 22（NEW,ESTABLISHED）\n'
+    else
+        printf '防火墙: 未放行 wlan0 TCP 22\n'
+    fi
+    keys=0
+    hosts=0
+    if [ -d "$S/settings/SSH" ]; then
+        if [ -f "$S/settings/SSH/authorized_keys" ]; then
+            keys=$(grep -c . "$S/settings/SSH/authorized_keys" 2> /dev/null || true)
+        fi
+        for k in "$S"/settings/SSH/dropbear_*_host_key; do
+            [ -f "$k" ] && hosts=$((hosts + 1))
+        done
+    fi
+    printf '授权公钥: %s 行（不显示内容）\n' "${keys:-0}"
+    printf '主机密钥: %s 个（缺失时由 -R 生成）\n' "$hosts"
+    code=$(device_code)
+    fw=$(firmware_version)
+    if [ "$code" = 0PP ] && [ "$fw" = 5.18.1.1.1 ]; then
+        printf '设备: %s / %s（匹配）\n' "$code" "$fw"
+    else
+        printf '设备: %s / %s（不匹配，不能安装）\n' "${code:-未知}" "${fw:-未知}"
+    fi
+    say "SSH 状态已显示"
+}
+
+case "${1:-status}" in
+install) do_install ;;
+start) do_start ;;
+stop) do_stop ;;
+status) do_status ;;
+disable) do_disable ;;
+uninstall) do_uninstall ;;
+*)
+    printf '用法: %s install|start|stop|status|disable|uninstall\n' "$0" >&2
+    exit 2
+    ;;
+esac

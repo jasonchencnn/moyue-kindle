@@ -11,6 +11,9 @@
 //! `--face` 是正文字体，`--fallback-face` 是回退字体（可以给多次）：主字体
 //! 里没有的字形交给回退字体，比如正文用 Literata、汉字交给中文字体。
 //!
+//! `--weight N` 是正文字重（100..900，预设 300/400/600），`--no-fine` 关闭
+//! 现代精排，`--underline-scope text|full` 选文字划线或整行划线。
+//!
 //! `--cache DIR` 打开文档缓存：第一次打开照常排版，排完把结果写进 DIR；
 //! 之后用同样的排版参数再打开同一本书时直接读缓存。程序会打印这一份书
 //! 是不是从缓存里读出来的，用来对比首次和第二次打开。
@@ -48,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut partial_demo: Option<u32> = None;
     let mut new_face: Option<String> = None;
     let mut underline = inkread_engine::Underline::Off;
+    let mut underline_scope = inkread_engine::UnderlineScope::TextOnly;
     let mut night = false;
     let mut new_fallback_face: Option<String> = None;
     let mut page_size = (PAGE_WIDTH, PAGE_HEIGHT);
@@ -114,6 +118,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--line-spacing" => {
                 layout.line_spacing_percent =
                     args.next().ok_or("--line-spacing 需要一个参数")?.parse()?;
+            }
+            "--weight" => {
+                layout.font_weight = args.next().ok_or("--weight 需要一个参数")?.parse()?;
+            }
+            "--no-fine" => {
+                layout.fine_typesetting = false;
+            }
+            "--underline-scope" => {
+                let v = args.next().ok_or("--underline-scope 需要一个参数")?;
+                underline_scope = match v.as_str() {
+                    "text" | "text-only" => inkread_engine::UnderlineScope::TextOnly,
+                    "full" | "full-line" => inkread_engine::UnderlineScope::FullLine,
+                    _ => return Err(format!("未知的划线范围：{v}").into()),
+                };
             }
             "--margin" => {
                 let value: u32 = args.next().ok_or("--margin 需要一个参数")?.parse()?;
@@ -209,7 +227,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = inkread_engine::RenderOptions {
         invert_images: false,
         underline,
-        underline_gray: 0x60,
+        underline_gray: 0x20,
+        underline_scope,
     };
     println!("正文引导线：{underline:?}");
     let render_elapsed;

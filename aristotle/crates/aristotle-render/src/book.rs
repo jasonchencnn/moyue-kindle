@@ -24,7 +24,7 @@ use crate::notes;
 use crate::page::{Chrome, Folio, Page};
 use crate::position::{PosMap, Spine};
 use crate::richtext::RichText;
-use crate::style::{Style, Underline, UNDERLINE_GRAY};
+use crate::style::{Style, Underline, UnderlineScope, UNDERLINE_GRAY};
 
 /// A reading position in units that outlive one layout (see
 /// [`crate::position`]): what the library index stores.
@@ -69,6 +69,11 @@ pub enum Engine {
     /// variant is always there, so callers can tell the engines apart
     /// whatever the crate was built with.
     Crengine,
+    /// The pure-Rust vertical engine (see [`crate::vertical`]): classical
+    /// Chinese books set top to bottom, right to left. Locations are
+    /// character offsets into the flattened book, and pages are found by
+    /// laying one page out at a time.
+    Vertical,
 }
 
 /// A highlight mark resolved for crengine: page span and boundary XPointers.
@@ -127,6 +132,12 @@ pub struct Book {
     night: bool,
     /// The guide drawn under every line of body text.
     underline: Underline,
+    /// How wide the guide is: under the text only, or across the text block.
+    underline_scope: UnderlineScope,
+    /// The book as the vertical engine reads it, when `style.writing_mode`
+    /// asks for the vertical layout. The engine has no Plato document, so
+    /// [`Book::doc`] holds an empty placeholder then.
+    vertical: Option<crate::vertical::Document>,
 }
 
 /// A rectangle on the screen, in pixels: `x0..x1`, `y0..y1`.
@@ -355,6 +366,23 @@ impl Book {
                 Err(e) => eprintln!("{}: {e:#}; reading it with MuPDF", path.display()),
             }
         }
+        // The vertical engine reads the book itself: no Plato document, no
+        // crengine layout, and no TXT→EPUB conversion. A book it cannot
+        // parse, or one with no font to draw a vertical page with, falls
+        // through to the horizontal engines below: a broken EPUB or a bare
+        // data directory still opens.
+        if style.writing_mode.is_vertical()
+            && matches!(kind.as_str(), "epub" | "txt")
+            && crate::vertical::has_font(style)
+        {
+            match Self::open_vertical(&source, style, mobi.clone()) {
+                Ok(book) => return Ok(book),
+                Err(e) => eprintln!(
+                    "{}: vertical layout unavailable, reading horizontally: {e:#}",
+                    source.display()
+                ),
+            }
+        }
         let is_txt = kind == "txt";
         if is_txt {
             #[cfg(feature = "crengine")]
@@ -431,6 +459,9 @@ impl Book {
             }
             Engine::Fixed => {}
             Engine::Crengine => {}
+            // The vertical engine reads the book itself and is never reached
+            // here: `open_with_progress` returns its book before this point.
+            Engine::Vertical => {}
         }
 
         // crengine lays the whole book out as one document and prefixes the
@@ -503,7 +534,66 @@ impl Book {
             toc_locations: HashMap::new(),
             night: false,
             underline: Underline::Off,
+            underline_scope: UnderlineScope::TextOnly,
+            vertical: None,
         })
+    }
+
+    /// Open `path` with the vertical engine.
+    fn open_vertical(
+        path: &Path,
+        style: &Style,
+        mobi: Option<MobiConversion>,
+    ) -> Result<Book, Error> {
+        let document = crate::vertical::Document::open(path)?;
+        Ok(Book {
+            doc: Box::new(crate::vertical::EmptyDocument),
+            engine: Engine::Vertical,
+            style: style.clone(),
+            toc: Vec::new(),
+            #[cfg(feature = "crengine")]
+            crengine_toc: Vec::new(),
+            #[cfg(feature = "crengine")]
+            crengine: None,
+            title: document.title.clone().filter(|t| !t.trim().is_empty()),
+            author: document.author.clone().filter(|a| !a.trim().is_empty()),
+            language: document.language.clone(),
+            pages: Vec::new(),
+            complete: false,
+            mobi,
+            spine: None,
+            source: path.to_path_buf(),
+            notes: None,
+            toc_locations: HashMap::new(),
+            night: false,
+            underline: Underline::Off,
+            underline_scope: UnderlineScope::TextOnly,
+            vertical: Some(document),
+        })
+    }
+
+    /// The geometry the vertical engine lays this book out with.
+    fn vertical_style(&self) -> crate::vertical::VerticalStyle {
+        crate::vertical::VerticalStyle::from_style(&self.style)
+    }
+
+    /// The start of the page after the vertical page at `location`.
+    fn vertical_next(&self, location: usize) -> Option<usize> {
+        let doc = self.vertical.as_ref()?;
+        doc.next_page(location, &self.vertical_style())
+    }
+
+    /// The page index of a vertical location, laying pages out until it is
+    /// known.
+    fn vertical_page_index(&mut self, location: usize) -> Option<usize> {
+        loop {
+            let len = self.pages.len();
+            match self.locate(len) {
+                Some(start) if start < location => {}
+                _ => break,
+            }
+        }
+        self.index_of(location)
     }
 
     /// Set when this is a MOBI book read through its converted EPUB.
@@ -602,6 +692,14 @@ impl Book {
                 return Ok(());
             }
         }
+        if self.engine == Engine::Vertical {
+            // The vertical document does not depend on the typography: only
+            // the page chain does, so forget it and lay out again.
+            self.style = style.clone();
+            self.pages.clear();
+            self.complete = false;
+            return Ok(());
+        }
         let _ = (style, progress);
         Err(format_err!("engine does not support set_layout"))
     }
@@ -695,6 +793,22 @@ impl Book {
     /// Location of page `index` (0-based), laying out as much of the book
     /// as needed to find it. `None` past the end.
     pub fn locate(&mut self, index: usize) -> Option<usize> {
+        if self.engine == Engine::Vertical {
+            if self.pages.is_empty() {
+                self.pages.push(0);
+            }
+            while self.pages.len() <= index {
+                let last = *self.pages.last()?;
+                match self.vertical_next(last) {
+                    Some(next) => self.pages.push(next),
+                    None => {
+                        self.complete = true;
+                        return None;
+                    }
+                }
+            }
+            return self.pages.get(index).copied();
+        }
         if self.engine != Engine::Plato {
             return (index < self.len()).then_some(index);
         }
@@ -717,6 +831,15 @@ impl Book {
     /// Lay out the whole book and return its page count. Cheap for MuPDF
     /// documents; for EPUB it lays out every spine item.
     pub fn paginate(&mut self) -> usize {
+        if self.engine == Engine::Vertical {
+            while !self.complete {
+                let len = self.pages.len();
+                if self.locate(len).is_none() {
+                    self.complete = true;
+                }
+            }
+            return self.pages.len();
+        }
         if self.engine != Engine::Plato {
             return self.len();
         }
@@ -732,13 +855,16 @@ impl Book {
     /// Total pages if already known without further layout.
     pub fn known_page_count(&self) -> Option<usize> {
         match self.engine {
-            Engine::Plato => self.complete.then_some(self.pages.len()),
+            Engine::Plato | Engine::Vertical => self.complete.then_some(self.pages.len()),
             _ => Some(self.len()),
         }
     }
 
     /// Position of page `index` in the book, 0.0 to 1.0.
     pub fn progress(&self, index: usize, location: usize) -> f32 {
+        if self.engine == Engine::Vertical {
+            return self.fraction(location);
+        }
         match self.known_page_count() {
             // Agrees with the "x / y" next to it.
             Some(total) => (index + 1) as f32 / total.max(1) as f32,
@@ -750,6 +876,12 @@ impl Book {
 
     /// Title of the chapter containing `location`.
     pub fn chapter_title(&mut self, location: usize) -> Option<String> {
+        if self.engine == Engine::Vertical {
+            return self
+                .vertical
+                .as_ref()
+                .and_then(|doc| doc.chapter_title(location));
+        }
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             let index = self.crengine_chapter_index(location)?;
@@ -765,6 +897,9 @@ impl Book {
     /// Rasterise the book's content at `location`, without header and
     /// footer, as a grayscale pixmap.
     pub fn render_body(&mut self, location: usize) -> Option<Pixmap> {
+        if self.engine == Engine::Vertical {
+            return None;
+        }
         let scale = match self.engine {
             Engine::Plato | Engine::MupdfReflow => 1.0,
             Engine::Fixed => {
@@ -775,6 +910,9 @@ impl Book {
             }
             // crengine-ng renders into a gray buffer, not a pixmap.
             Engine::Crengine => return None,
+            // The vertical engine renders its own page (see
+            // `render_location_with_degraded`).
+            Engine::Vertical => return None,
         };
         self.doc
             .pixmap(Location::Exact(location), scale, 1)
@@ -795,6 +933,8 @@ impl Book {
             ),
             // crengine-ng renders into a gray buffer, not a pixmap.
             Engine::Crengine => (0, top),
+            // The vertical engine renders its own page; nothing to compose.
+            Engine::Vertical => (0, top),
         };
         page.blit_pixmap(body, x, y);
         chrome.draw(&mut page, folio);
@@ -837,6 +977,11 @@ impl Book {
     /// Size of the location space: bytes of text for Plato's engine, pages
     /// otherwise.
     pub fn len(&self) -> usize {
+        if self.engine == Engine::Vertical {
+            // An empty book still has one (blank) page, so the reader can
+            // open it and show nothing rather than failing.
+            return self.vertical.as_ref().map_or(0, |doc| doc.len().max(1));
+        }
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             return self.crengine.as_ref().map_or(0, |doc| doc.page_count());
@@ -851,6 +996,10 @@ impl Book {
     /// Start of the page that contains `location` (clamped to the book),
     /// laying out its chapter if needed.
     pub fn page_start(&mut self, location: usize) -> Option<usize> {
+        if self.engine == Engine::Vertical {
+            let doc = self.vertical.as_ref()?;
+            return Some(doc.page_start(location, &self.vertical_style()));
+        }
         let last = self.len().checked_sub(1)?;
         let location = location.min(last);
         match self.engine {
@@ -864,6 +1013,14 @@ impl Book {
 
     /// Start of the page after the one starting at `location`.
     pub fn next_page(&mut self, location: usize) -> Option<usize> {
+        if self.engine == Engine::Vertical {
+            // `location` need not be a page start: find the page it is on
+            // first, then the one after it.
+            let doc = self.vertical.as_ref()?;
+            let style = self.vertical_style();
+            let start = doc.page_start(location, &style);
+            return doc.next_page(start, &style);
+        }
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             let next = location + 1;
@@ -876,6 +1033,14 @@ impl Book {
 
     /// Start of the page before the one starting at `location`.
     pub fn previous_page(&mut self, location: usize) -> Option<usize> {
+        if self.engine == Engine::Vertical {
+            // The page before the one that starts at `location`: the page
+            // holding the character just before it.
+            let previous = location.checked_sub(1)?;
+            let doc = self.vertical.as_ref()?;
+            let start = doc.page_start(previous, &self.vertical_style());
+            return (start < location).then_some(start);
+        }
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             return location.checked_sub(1);
@@ -887,6 +1052,24 @@ impl Book {
 
     /// Start of the next (or previous) chapter in the table of contents.
     pub fn chapter_page(&mut self, location: usize, forward: bool) -> Option<usize> {
+        if self.engine == Engine::Vertical {
+            let doc = self.vertical.as_ref()?;
+            let chapter = doc.chapter_of(location)?;
+            let target = if forward {
+                doc.chapter_range(chapter).1
+            } else {
+                chapter.checked_sub(1)?
+            };
+            if forward && target >= doc.len() {
+                return None;
+            }
+            let start = if forward {
+                target
+            } else {
+                doc.chapter_range(target).0
+            };
+            return self.page_start(start);
+        }
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             return self.crengine_chapter_page(location, forward);
@@ -908,6 +1091,11 @@ impl Book {
     /// cache on disk) as the whole book's pagination. They must come from
     /// the same file and style. Ignored for engines that know their pages.
     pub fn set_pagination(&mut self, pages: Vec<usize>) {
+        if self.engine == Engine::Vertical {
+            // The vertical pages are cheap to find: the background paginator
+            // has nothing to add.
+            return;
+        }
         if self.engine == Engine::Plato && !pages.is_empty() {
             self.pages = pages;
             self.complete = true;
@@ -922,7 +1110,7 @@ impl Book {
     /// Index of the page starting at or before `location`, if known
     /// without laying anything out.
     pub fn index_of(&self, location: usize) -> Option<usize> {
-        if self.engine != Engine::Plato {
+        if !matches!(self.engine, Engine::Plato | Engine::Vertical) {
             return Some(location);
         }
         let last = *self.pages.last()?;
@@ -938,7 +1126,21 @@ impl Book {
 
     /// Position in the book, 0 to 1: "x / y" when the pages are known,
     /// else the share of the text before `location`.
+    ///
+    /// A vertical book always uses the share of the characters, even when
+    /// its pages are known: that is the measure [`Book::position_at`] saves,
+    /// so the progress on screen and the saved position name the same place.
     pub fn fraction(&self, location: usize) -> f32 {
+        if self.engine == Engine::Vertical {
+            // The share of the characters before `location`, the same
+            // measure [`Book::position_at`] saves for a vertical book. Page
+            // numbers would drift when the typography changes: a page is a
+            // different share of the book after a font size change.
+            return self
+                .vertical
+                .as_ref()
+                .map_or(0.0, |doc| doc.fraction(location));
+        }
         match (self.known_page_count(), self.index_of(location)) {
             (Some(total), Some(index)) => (index + 1) as f32 / total.max(1) as f32,
             _ => location as f32 / self.len().max(1) as f32,
@@ -993,6 +1195,15 @@ impl Book {
 
     /// The most exact position of `location` this book can name.
     pub fn position_at(&self, location: usize) -> Position {
+        if self.engine == Engine::Vertical {
+            // A share of the book: it survives the switch back to the
+            // horizontal engine and any change of the typography.
+            return Position::Fraction(
+                self.vertical
+                    .as_ref()
+                    .map_or(0.0, |doc| doc.fraction(location)),
+            );
+        }
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             // A MOBI book read through its converted EPUB has no position
@@ -1047,6 +1258,9 @@ impl Book {
         remaining: Option<String>,
         degraded: bool,
     ) -> Result<Page, Error> {
+        if self.engine == Engine::Vertical {
+            return self.render_vertical(location, chrome, remaining, degraded);
+        }
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             return self.render_crengine(location, chrome, remaining, degraded);
@@ -1078,6 +1292,9 @@ impl Book {
         let location = self
             .locate(index)
             .ok_or_else(|| format_err!("page {} is past the end of the book", index + 1))?;
+        if self.engine == Engine::Vertical {
+            return self.render_vertical(location, chrome, None, false);
+        }
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             return self.render_crengine(location, chrome, None, false);
@@ -1114,6 +1331,60 @@ impl Book {
         self.underline
     }
 
+    /// Set how wide the guide is: under the text only, or across the text
+    /// block with the blank line slots filled in.
+    ///
+    /// Like the guide itself, this is a render option: no new layout.
+    pub fn set_underline_scope(&mut self, scope: UnderlineScope) {
+        self.underline_scope = scope;
+    }
+
+    /// How wide the guide is.
+    pub fn underline_scope(&self) -> UnderlineScope {
+        self.underline_scope
+    }
+
+    /// Render the page at `location` as the vertical engine lays it out.
+    ///
+    /// The engine draws the text block and its column rules; the chrome is
+    /// drawn on top, exactly as it is over a crengine page.
+    fn render_vertical(
+        &mut self,
+        location: usize,
+        chrome: &mut Chrome,
+        remaining: Option<String>,
+        degraded: bool,
+    ) -> Result<Page, Error> {
+        let style = self.vertical_style();
+        let layout = self
+            .vertical
+            .as_ref()
+            .ok_or_else(|| format_err!("the book is not laid out vertically"))?
+            .layout_page(location, &style);
+        let mut page = crate::vertical::render_page(
+            &self.style,
+            &layout,
+            self.underline,
+            self.underline_scope,
+        )?;
+        let chapter = self
+            .chapter_title(location)
+            .or_else(|| self.title.clone())
+            .unwrap_or_default();
+        let index = self.index_of(location);
+        let folio = Folio {
+            header: self.header_line(),
+            chapter,
+            remaining,
+            page: index.map(|i| i + 1),
+            pages: self.known_page_count(),
+            progress: self.fraction(location),
+            degraded,
+        };
+        chrome.draw(&mut page, &folio);
+        Ok(page)
+    }
+
     /// Render the page at `location` as crengine-ng laid it out.
     ///
     /// crengine-ng hands out the page as a gray buffer the size of the text
@@ -1140,6 +1411,10 @@ impl Book {
                     Underline::Dotted => inkread_engine::Underline::Dotted,
                 },
                 underline_gray: UNDERLINE_GRAY,
+                underline_scope: match self.underline_scope {
+                    UnderlineScope::TextOnly => inkread_engine::UnderlineScope::TextOnly,
+                    UnderlineScope::FullLine => inkread_engine::UnderlineScope::FullLine,
+                },
             };
             (doc.render_page_with_options(location, &options)?, doc.top())
         };
@@ -1189,6 +1464,7 @@ impl Book {
             }
             // crengine-ng renders into a gray buffer, not a pixmap.
             Engine::Crengine => Some((1.0, 0, top)),
+            Engine::Vertical => Some((1.0, 0, top)),
         }
     }
 
@@ -1568,6 +1844,22 @@ impl Book {
 
     /// The table of contents, flattened with depths.
     pub fn toc_items(&self) -> Vec<TocItem> {
+        if self.engine == Engine::Vertical {
+            let Some(doc) = self.vertical.as_ref() else {
+                return Vec::new();
+            };
+            return doc
+                .toc()
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| TocItem {
+                    title: entry.title.clone(),
+                    depth: entry.depth,
+                    index,
+                    page: None,
+                })
+                .collect();
+        }
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             let omit_page = self.is_rerender_delayed();
@@ -1602,6 +1894,11 @@ impl Book {
     /// Start of the page a table of contents entry points at (lays out its
     /// chapter).
     pub fn toc_page(&mut self, index: usize) -> Option<usize> {
+        if self.engine == Engine::Vertical {
+            let start = self.vertical.as_ref()?.toc_start(index)?;
+            let page_start = self.page_start(start)?;
+            return self.vertical_page_index(page_start);
+        }
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             let entry = self.crengine_toc.get(index)?;
@@ -1620,6 +1917,11 @@ impl Book {
 
     /// The index of the table of contents entry for `location`.
     pub fn toc_current(&mut self, location: usize) -> Option<usize> {
+        if self.engine == Engine::Vertical {
+            let doc = self.vertical.as_ref()?;
+            let chapter = doc.chapter_of(location)?;
+            return doc.toc_index_of(chapter);
+        }
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             return self.crengine_chapter_index(location);
@@ -1672,6 +1974,17 @@ impl Book {
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             return self.crengine_chapter_info(location);
+        }
+        if self.engine == Engine::Vertical {
+            let doc = self.vertical.as_ref()?;
+            let chapter = doc.chapter_of(location)?;
+            let (start, end) = doc.chapter_range(chapter);
+            return Some(ChapterInfo {
+                number: chapter + 1,
+                count: doc.chapters.len(),
+                start,
+                end,
+            });
         }
         if self.engine != Engine::Plato || self.toc.is_empty() {
             return None;

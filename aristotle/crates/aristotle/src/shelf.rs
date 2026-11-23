@@ -218,22 +218,71 @@ pub fn folder_level(
     (sub.into_values().collect(), own)
 }
 
+/// Origin-channel hashes resolved from the app's sync and download stores.
+///
+/// A book's channel tag is determined by where it came from or which cloud
+/// channel tracks it rather than by which local folder holds the file on disk.
+#[derive(Clone, Debug, Default)]
+pub struct ChannelSources {
+    pub weread_hashes: std::collections::HashSet<String>,
+    pub jianguoyun_hashes: std::collections::HashSet<String>,
+    pub readest_hashes: std::collections::HashSet<String>,
+}
+
+impl ChannelSources {
+    /// Resolve the book's origin channel: channel download/sync records first,
+    /// then any directory segment fallback.
+    ///
+    /// Priority: `WeRead` > `Jianguoyun` > `Readest` > `Local`.
+    pub fn resolve(&self, rec: &BookRecord) -> ui_lib::BookSource {
+        let hash = rec.id.to_ascii_lowercase();
+        let path_source = source_from_path(&rec.file.path);
+        if self.weread_hashes.contains(&hash) || path_source == ui_lib::BookSource::WeRead {
+            ui_lib::BookSource::WeRead
+        } else if self.jianguoyun_hashes.contains(&hash)
+            || path_source == ui_lib::BookSource::Jianguoyun
+        {
+            ui_lib::BookSource::Jianguoyun
+        } else if self.readest_hashes.contains(&hash) || path_source == ui_lib::BookSource::Readest
+        {
+            ui_lib::BookSource::Readest
+        } else {
+            ui_lib::BookSource::Local
+        }
+    }
+}
+
 /// A library record as the screens show it, with the book's own cover
 /// whenever the library has a thumbnail of it. Every screen that draws a
 /// cover uses this: the generated card is only for books without one.
 pub fn screen_book(lib: &Library, rec: &BookRecord, covers: &mut Covers) -> Book {
+    screen_book_with_sources(lib, rec, covers, &ChannelSources::default())
+}
+
+/// Like [`screen_book`], resolving the badge from download/sync channels.
+pub fn screen_book_with_sources(
+    lib: &Library,
+    rec: &BookRecord,
+    covers: &mut Covers,
+    sources: &ChannelSources,
+) -> Book {
     let cover = covers.get(lib, rec);
-    screen_book_with(rec, cover)
+    screen_book_with(rec, cover, sources)
 }
 
 /// A record as the screens show it, without reading its cover. The library
 /// with covers off ("none" or "cards") takes this road: a page of a
 /// thousand books must not read a thousand thumbnails to draw cards.
 pub fn screen_book_plain(rec: &BookRecord) -> Book {
-    screen_book_with(rec, None)
+    screen_book_plain_with_sources(rec, &ChannelSources::default())
 }
 
-fn screen_book_with(rec: &BookRecord, cover: Option<GrayImage>) -> Book {
+/// Like [`screen_book_plain`], resolving the badge from download/sync channels.
+pub fn screen_book_plain_with_sources(rec: &BookRecord, sources: &ChannelSources) -> Book {
+    screen_book_with(rec, None, sources)
+}
+
+fn screen_book_with(rec: &BookRecord, cover: Option<GrayImage>, sources: &ChannelSources) -> Book {
     let author = rec
         .meta
         .authors
@@ -256,11 +305,42 @@ fn screen_book_with(rec: &BookRecord, cover: Option<GrayImage>) -> Book {
     if !dir.is_empty() {
         b.folder = Some(dir.join("/"));
     }
+    b.source = sources.resolve(rec);
     if let Some(s) = &rec.meta.series {
         b.series = Some((s.name.clone(), s.index.unwrap_or(0.0) as f32));
     }
     b.cover = cover;
     b
+}
+
+/// Infer the origin channel from any folder segment of a library-relative path.
+///
+/// The Kindle library widens `documents/` scans to `/mnt/us`, so WeRead and
+/// Readest downloads live under paths like `documents/WeRead/<id>.epub` or
+/// `documents/readest/<hash>.epub`. Checking all directory segments (excluding
+/// the filename itself) handles both `WeRead/...` and `documents/WeRead/...`.
+pub fn source_from_path(path: &str) -> ui_lib::BookSource {
+    let mut parts = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .peekable();
+    while let Some(part) = parts.next() {
+        // Skip the final file name segment.
+        if parts.peek().is_none() {
+            break;
+        }
+        if part.eq_ignore_ascii_case("weread") {
+            return ui_lib::BookSource::WeRead;
+        }
+        if part.eq_ignore_ascii_case("jianguoyun") || part.eq_ignore_ascii_case("nutstore") {
+            return ui_lib::BookSource::Jianguoyun;
+        }
+        if part.eq_ignore_ascii_case("readest") || part.eq_ignore_ascii_case("cloud") {
+            return ui_lib::BookSource::Readest;
+        }
+    }
+    ui_lib::BookSource::Local
 }
 
 impl ShelfModel {
@@ -281,6 +361,16 @@ impl ShelfModel {
     }
 
     pub fn build(lib: &Library, nav: &Nav, layout: LibraryLayout) -> ShelfModel {
+        Self::build_with_sources(lib, nav, layout, &ChannelSources::default())
+    }
+
+    /// Build the library view resolving origin badges from download/sync channels.
+    pub fn build_with_sources(
+        lib: &Library,
+        nav: &Nav,
+        layout: LibraryLayout,
+        sources: &ChannelSources,
+    ) -> ShelfModel {
         let sort = SORTS[nav.sort % SORTS.len()].0;
         let sorted = lib.query(&Query {
             sort,
@@ -344,7 +434,7 @@ impl ShelfModel {
             }
         }
         for r in book_rows {
-            items.push(Item::Book(screen_book_plain(r)));
+            items.push(Item::Book(screen_book_plain_with_sources(r, sources)));
             targets.push(Target::Book(r.id.clone()));
         }
         let total_local_books = lib.books().len();
@@ -414,19 +504,36 @@ pub struct HomeModel {
 impl HomeModel {
     /// The home screen's data for `lib`.
     pub fn build(lib: &Library, covers: &mut Covers) -> HomeModel {
+        Self::build_with_sources(lib, covers, &ChannelSources::default())
+    }
+
+    /// Build home screen rows with explicit channel source mapping.
+    pub fn build_with_sources(
+        lib: &Library,
+        covers: &mut Covers,
+        sources: &ChannelSources,
+    ) -> HomeModel {
         let sorted = lib.query(&Query {
             sort: SortKey::Recent,
             ..Query::default()
         });
-        let reading = current_book(lib)
-            .and_then(|r| lib.book(&r.id))
-            .map(|r| (r.id.clone(), screen_book(lib, r, covers)));
+        let reading = current_book(lib).and_then(|r| lib.book(&r.id)).map(|r| {
+            (
+                r.id.clone(),
+                screen_book_with_sources(lib, r, covers, sources),
+            )
+        });
         let recent = sorted
             .iter()
             .copied()
             .filter(|r| reading.as_ref().is_none_or(|(id, _)| id != &r.id))
             .take(ui_home::RECENT_BOOKS)
-            .map(|r| (r.id.clone(), screen_book(lib, r, covers)))
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    screen_book_with_sources(lib, r, covers, sources),
+                )
+            })
             .collect();
         HomeModel { reading, recent }
     }
@@ -592,5 +699,116 @@ mod tests {
         }
         assert_eq!(covers.loaded.len(), COVER_CACHE_ENTRIES);
         assert_eq!(covers.bytes, COVER_CACHE_ENTRIES);
+    }
+
+    #[test]
+    fn channel_sources_resolve_by_origin_and_nested_folder() {
+        use aristotle_library::index::{BookRecord, FileStamp};
+
+        let make_rec = |id: &str, path: &str| BookRecord {
+            id: id.into(),
+            file: FileStamp {
+                path: path.into(),
+                size: 1,
+                mtime: 0,
+                mtime_ns: 0,
+            },
+            format: aristotle_library::Format::Epub,
+            meta: Default::default(),
+            cover: None,
+            added: 0,
+            last_opened: None,
+            status: Default::default(),
+            progress: None,
+            settings: Default::default(),
+            annotations: Vec::new(),
+            annotation_tombstones: Vec::new(),
+        };
+
+        let mut sources = ChannelSources::default();
+        sources.weread_hashes.insert("wr_hash_1".into());
+        sources.jianguoyun_hashes.insert("jgy_hash_1".into());
+        sources.readest_hashes.insert("rd_hash_1".into());
+
+        // Kindle widened scan_root puts downloaded WeRead books under `documents/WeRead/...`
+        assert_eq!(
+            sources.resolve(&make_rec("other", "documents/WeRead/123.epub")),
+            ui_lib::BookSource::WeRead
+        );
+        assert_eq!(
+            sources.resolve(&make_rec("other", "WeRead/123.epub")),
+            ui_lib::BookSource::WeRead
+        );
+        // Channel hash takes precedence even if moved into another folder.
+        assert_eq!(
+            sources.resolve(&make_rec("WR_HASH_1", "documents/赘婿.epub")),
+            ui_lib::BookSource::WeRead
+        );
+        // Jianguoyun folder and hash resolution.
+        assert_eq!(
+            sources.resolve(&make_rec("other", "documents/jianguoyun/book.epub")),
+            ui_lib::BookSource::Jianguoyun
+        );
+        assert_eq!(
+            sources.resolve(&make_rec("other", "nutstore/book.epub")),
+            ui_lib::BookSource::Jianguoyun
+        );
+        assert_eq!(
+            sources.resolve(&make_rec("JGY_HASH_1", "documents/moved.epub")),
+            ui_lib::BookSource::Jianguoyun
+        );
+        assert_eq!(
+            sources.resolve(&make_rec("other", "documents/readest/abc.epub")),
+            ui_lib::BookSource::Readest
+        );
+        assert_eq!(
+            sources.resolve(&make_rec("RD_HASH_1", "documents/old_cloud_book.epub")),
+            ui_lib::BookSource::Readest
+        );
+        // Plain sideloaded book (even if filename happens to be `weread.epub`) stays Local.
+        assert_eq!(
+            sources.resolve(&make_rec("local_1", "documents/三体.epub")),
+            ui_lib::BookSource::Local
+        );
+        assert_eq!(
+            sources.resolve(&make_rec("local_2", "documents/weread.epub")),
+            ui_lib::BookSource::Local
+        );
+
+        // The priorities: WeRead > Jianguoyun > Readest > Local.
+        let mut both = ChannelSources::default();
+        both.weread_hashes.insert("h".into());
+        both.jianguoyun_hashes.insert("h".into());
+        both.readest_hashes.insert("h".into());
+        assert_eq!(
+            both.resolve(&make_rec("h", "documents/x.epub")),
+            ui_lib::BookSource::WeRead,
+            "WeRead outranks the other channels"
+        );
+        let mut jianguoyun_and_readest = ChannelSources::default();
+        jianguoyun_and_readest.jianguoyun_hashes.insert("h".into());
+        jianguoyun_and_readest.readest_hashes.insert("h".into());
+        assert_eq!(
+            jianguoyun_and_readest.resolve(&make_rec("h", "documents/x.epub")),
+            ui_lib::BookSource::Jianguoyun,
+            "Nutstore outranks Readest"
+        );
+        // The folder wins over a hash of a different channel: the file is
+        // where the channel put it.
+        assert_eq!(
+            both.resolve(&make_rec("other", "documents/nutstore/x.epub")),
+            ui_lib::BookSource::Jianguoyun
+        );
+        assert_eq!(
+            both.resolve(&make_rec("other", "documents/WeRead/x.epub")),
+            ui_lib::BookSource::WeRead,
+            "the WeRead folder is checked before the Nutstore one"
+        );
+        // A book in a folder of another channel is not retagged by a hash:
+        // the channel record names the book, not the place.
+        assert_eq!(
+            jianguoyun_and_readest.resolve(&make_rec("other", "documents/readest/x.epub")),
+            ui_lib::BookSource::Readest
+        );
     }
 }

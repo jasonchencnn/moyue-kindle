@@ -65,6 +65,34 @@ pub const MAX_MARGIN_PX: u32 = 256;
 /// 超过它一定是调用方传错了参数。
 pub const MAX_PAGE_DIMENSION_PX: u32 = 8192;
 
+/// 默认面板 DPI（Kindle Oasis 2 / PW4/5/6 为 300 ppi）。
+pub const DEFAULT_DPI: u32 = 300;
+
+/// 允许的最小面板 DPI。
+pub const MIN_DPI: u32 = 72;
+
+/// 允许的最大面板 DPI。
+pub const MAX_DPI: u32 = 600;
+
+/// 正文字重的默认值：CSS 的 `font-weight: normal`。
+pub const DEFAULT_FONT_WEIGHT: u16 = 400;
+
+/// 允许的最小正文字重（CSS `font-weight: 100`）。
+pub const MIN_FONT_WEIGHT: u16 = 100;
+
+/// 允许的最大正文字重（CSS `font-weight: 900`）。
+pub const MAX_FONT_WEIGHT: u16 = 900;
+
+/// 「细」字重预设：300（CSS `light`）。
+pub const FONT_WEIGHT_LIGHT: u16 = 300;
+
+/// 「正常」字重预设：400（CSS `normal`）。
+pub const FONT_WEIGHT_NORMAL: u16 = 400;
+
+/// 「粗」字重预设：600（介于 CSS `semibold` 与 `bold` 之间，墨水屏上
+/// 比 700 更耐看，不会把笔画糊成一团）。
+pub const FONT_WEIGHT_BOLD: u16 = 600;
+
 /// 页面宽度或高度的下限（像素）。
 ///
 /// crengine 的 `LVDocView::Resize()` 会把尺寸钳到 80..=32767：比 80 小的
@@ -158,6 +186,33 @@ pub struct LayoutSettings {
     ///
     /// 对应 crengine 的 `PROP_EMBEDDED_STYLES`（ADR-010）。
     pub embedded_styles: bool,
+    /// 是否启用 crengine 的现代精排特性。
+    ///
+    /// `true`（默认）：Web 盒模型与完整的 block rendering 标志、HarfBuzz
+    /// shaping/kerning、悬挂标点、书内嵌字体、按面板 DPI 缩放 CSS 绝对单位。
+    /// `false`：退回到 crengine 的传统行为（不启用增强 block rendering、不做
+    /// 字距调整、不悬挂标点、不加载书内嵌字体、CSS 按 96 DPI 解释），适合
+    /// 排查「精排把某本书排坏了」的兼容性问题。
+    ///
+    /// DOM 版本不随开关切换：两种状态都用 crengine 当前的
+    /// `gDOMVersionCurrent`。切到旧 DOM 版本会改变 `DocFragment` 的节点结构，
+    /// 用户来回切换精排时，已保存的 XPointer 阅读进度和高亮就会错位。
+    ///
+    /// 其余属性大多在 `LoadDocument` 之前生效：block rendering 标志、内嵌
+    /// 字体在解析时就决定文档结构，事后再改只会触发重排，改不了已经解析出来
+    /// 的 DOM（见 ENG-009）。
+    pub fine_typesetting: bool,
+    /// 正文字重，CSS 的 `font-weight` 数值，范围
+    /// [`MIN_FONT_WEIGHT`]..=[`MAX_FONT_WEIGHT`]。
+    ///
+    /// 对应 crengine 的 `PROP_FONT_BASE_WEIGHT`：它在书里每个元素自己的
+    /// 字重上叠加一个偏移（例如正文 400 的书把基准调到 600 会整体加粗），
+    /// 而不是覆盖书里的粗体规则。字体没有对应字重时 crengine 会做合成
+    /// 加粗/变细，墨水屏上仍能看出笔画粗细的差别。
+    pub font_weight: u16,
+    /// 目标屏幕 DPI（如 167 / 212 / 300 ppi），用于精排模式下按物理尺寸换算
+    /// CSS 绝对单位（`pt` / `mm` / `in`）。范围 [`MIN_DPI`]..=[`MAX_DPI`]。
+    pub dpi: u32,
     /// 用户自定义样式或额外 CSS 规则（注入在默认样式之后）。
     pub user_css: Option<String>,
 }
@@ -172,6 +227,9 @@ impl Default for LayoutSettings {
             font_face: String::new(),
             fallback_font_faces: Vec::new(),
             embedded_styles: true,
+            fine_typesetting: true,
+            font_weight: DEFAULT_FONT_WEIGHT,
+            dpi: DEFAULT_DPI,
             user_css: None,
         }
     }
@@ -209,6 +267,18 @@ impl LayoutSettings {
                 )));
             }
         }
+        if !(MIN_FONT_WEIGHT..=MAX_FONT_WEIGHT).contains(&self.font_weight) {
+            return Err(Error::InvalidLayout(format!(
+                "字重 {} 超出允许范围 {MIN_FONT_WEIGHT}~{MAX_FONT_WEIGHT}",
+                self.font_weight
+            )));
+        }
+        if !(MIN_DPI..=MAX_DPI).contains(&self.dpi) {
+            return Err(Error::InvalidLayout(format!(
+                "DPI {} 超出允许范围 {MIN_DPI}~{MAX_DPI}",
+                self.dpi
+            )));
+        }
         // 回退字体名要拼成分号隔开的名单传给引擎，名字里不能有分号或 NUL。
         for face in &self.fallback_font_faces {
             if face.is_empty() || face.contains(';') || face.contains('\0') {
@@ -243,6 +313,52 @@ mod tests {
         assert!(layout.font_face.is_empty());
         // 默认尊重书内样式（ADR-010）。
         assert!(layout.embedded_styles);
+        // 默认开启现代精排与正常字重。
+        assert!(layout.fine_typesetting);
+        assert_eq!(layout.font_weight, 400);
+    }
+
+    #[test]
+    fn font_weight_presets_match_the_documented_values() {
+        assert_eq!(FONT_WEIGHT_LIGHT, 300);
+        assert_eq!(FONT_WEIGHT_NORMAL, 400);
+        assert_eq!(FONT_WEIGHT_BOLD, 600);
+        assert_eq!(DEFAULT_FONT_WEIGHT, FONT_WEIGHT_NORMAL);
+    }
+
+    #[test]
+    fn font_weight_bounds_are_validated() {
+        // 99 与 901 越界，100/400/900 合法。
+        for (weight, valid) in [
+            (99, false),
+            (100, true),
+            (400, true),
+            (900, true),
+            (901, false),
+        ] {
+            let layout = LayoutSettings {
+                font_weight: weight,
+                ..LayoutSettings::default()
+            };
+            match layout.validate() {
+                Ok(()) => assert!(valid, "字重 {weight} 应当被拒绝"),
+                Err(Error::InvalidLayout(message)) => {
+                    assert!(!valid, "字重 {weight} 应当合法");
+                    assert!(message.contains("字重"), "错误信息应当说明字重：{message}");
+                }
+                Err(other) => panic!("字重 {weight} 返回了意外的错误：{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fine_typesetting_can_be_switched_off() {
+        let layout = LayoutSettings {
+            fine_typesetting: false,
+            ..LayoutSettings::default()
+        };
+        // 关掉精排不影响参数合法性。
+        assert!(layout.validate().is_ok());
     }
 
     #[test]

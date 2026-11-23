@@ -2,6 +2,7 @@
 //! Readest transport implementing `inkread_core::sync::HttpTransport` over `aristotle_net::http::Client`.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use inkread_core::sync::{HttpRequest, HttpResponse, HttpTransport, TransportError};
@@ -16,35 +17,94 @@ pub const MAX_READEST_BODY_BYTES: u64 = 20 * 1024 * 1024;
 /// Default timeout for Readest API calls (15 seconds).
 pub const READEST_TIMEOUT_SECS: u64 = 15;
 
-/// An HTTP transport implementation wrapping `http::Client` with device policy and timeouts.
+/// Connect/TLS handshake timeout: fail fast on stalled edge IPs so a retry can
+/// re-dial promptly instead of blocking for the whole response budget.
+const READEST_CONNECT_TIMEOUT_SECS: u64 = 8;
+
+/// Response header timeout for default Readest API calls.
+const READEST_RESPONSE_TIMEOUT_SECS: u64 = 25;
+
+/// Response body timeout for default Readest API calls.
+const READEST_BODY_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum retries after an initial transient network failure (3 attempts total).
+const MAX_RETRIES: usize = 2;
+
+/// Delay between retry attempts.
+const RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// An HTTP transport implementation wrapping a shared `http::Client` with
+/// device policy, Keep-Alive pooling, and safe retries.
 pub struct ReadestTransport {
-    client: Client,
+    client: Arc<Client>,
+    max_body_bytes: u64,
 }
 
 impl ReadestTransport {
     pub fn new(policy: Policy) -> Self {
-        let timeouts = Timeouts::quick(Duration::from_secs(READEST_TIMEOUT_SECS));
+        let timeouts = Timeouts {
+            connect: Duration::from_secs(READEST_CONNECT_TIMEOUT_SECS),
+            response: Duration::from_secs(READEST_RESPONSE_TIMEOUT_SECS),
+            body: Duration::from_secs(READEST_BODY_TIMEOUT_SECS),
+        };
         Self {
-            client: Client::new(policy, timeouts),
+            client: Client::shared(policy, timeouts),
+            max_body_bytes: MAX_READEST_BODY_BYTES,
         }
     }
 
-    /// A transport that gives up sooner, for pushes on the way to sleep.
+    /// A transport with an explicit timeout, for short pushes on sleep/exit or
+    /// generous full-sync rounds.
     pub fn with_timeout(policy: Policy, secs: u64) -> Self {
-        let timeouts = Timeouts::quick(Duration::from_secs(secs));
+        Self::with_timeout_and_limit(policy, secs, MAX_READEST_BODY_BYTES)
+    }
+
+    /// A transport with an explicit timeout and response body size limit.
+    pub fn with_timeout_and_limit(policy: Policy, secs: u64, max_body_bytes: u64) -> Self {
+        let timeouts = Timeouts {
+            connect: Duration::from_secs(secs.min(READEST_CONNECT_TIMEOUT_SECS)),
+            response: Duration::from_secs(secs),
+            body: Duration::from_secs(secs),
+        };
         Self {
-            client: Client::new(policy, timeouts),
+            client: Client::shared(policy, timeouts),
+            max_body_bytes,
         }
     }
 
     pub fn with_client(client: Client) -> Self {
-        Self { client }
+        Self {
+            client: Arc::new(client),
+            max_body_bytes: MAX_READEST_BODY_BYTES,
+        }
     }
 }
 
 impl fmt::Debug for ReadestTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadestTransport").finish_non_exhaustive()
+    }
+}
+
+fn map_http_error(e: crate::http::Error) -> TransportError {
+    match e {
+        crate::http::Error::Timeout => TransportError::Timeout,
+        crate::http::Error::Connect(d) => TransportError::Network(d),
+        // The device itself refused the address: the network is
+        // not at fault, and the UI must not say it is.
+        crate::http::Error::NotAllowed(h) => {
+            TransportError::Blocked(format!("{h} is not allowed by policy"))
+        }
+        crate::http::Error::NoTls => {
+            TransportError::Blocked("HTTPS is not supported in this build".to_string())
+        }
+        crate::http::Error::Tls { detail, .. } => {
+            TransportError::Network(format!("TLS error: {detail}"))
+        }
+        crate::http::Error::Status(s, b) => TransportError::HttpStatus(s, b),
+        crate::http::Error::TooLarge(n) => TransportError::TooLarge(n),
+        crate::http::Error::Io(io) => TransportError::Network(io.to_string()),
+        other => TransportError::Other(other.to_string()),
     }
 }
 
@@ -57,6 +117,10 @@ impl HttpTransport for ReadestTransport {
             "GET" => Method::Get,
             "POST" => Method::Post,
             "PUT" => Method::Put,
+            "PROPFIND" => Method::Propfind,
+            "MKCOL" => Method::Mkcol,
+            "HEAD" => Method::Head,
+            "DELETE" => Method::Delete,
             other => {
                 return Err(TransportError::Other(format!(
                     "unsupported HTTP method {other}"
@@ -76,40 +140,42 @@ impl HttpTransport for ReadestTransport {
             credentials: None,
         };
 
-        let response = match self.client.send(&http_req, MAX_READEST_BODY_BYTES) {
-            Ok(resp) => resp,
-            Err(e) => {
-                return Err(match e {
-                    crate::http::Error::Timeout => TransportError::Timeout,
-                    crate::http::Error::Connect(d) => TransportError::Network(d),
-                    // The device itself refused the address: the network is
-                    // not at fault, and the UI must not say it is.
-                    crate::http::Error::NotAllowed(h) => {
-                        TransportError::Blocked(format!("{h} is not allowed by policy"))
-                    }
-                    crate::http::Error::NoTls => {
-                        TransportError::Blocked("HTTPS is not supported in this build".to_string())
-                    }
-                    crate::http::Error::Tls { detail, .. } => {
-                        TransportError::Network(format!("TLS error: {detail}"))
-                    }
-                    crate::http::Error::Status(s, b) => TransportError::HttpStatus(s, b),
-                    crate::http::Error::TooLarge(n) => TransportError::TooLarge(n),
-                    other => TransportError::Other(other.to_string()),
-                });
-            }
-        };
+        let mut last_err = None;
+        for attempt in 0..=MAX_RETRIES {
+            // Always send through `self.client`: ureq drops any broken socket
+            // on error rather than returning it to the pool, so retrying via
+            // the same shared agent dials a fresh socket (via Happy Eyeballs
+            // and the updated fast-IP table) AND keeps the winning Keep-Alive
+            // connection warm for subsequent requests.
+            let res = self.client.send(&http_req, self.max_body_bytes);
 
-        let mut resp_headers = Vec::new();
-        if let Some(ct) = response.content_type {
-            resp_headers.push(("content-type".to_string(), ct));
+            match res {
+                Ok(response) => {
+                    return Ok(HttpResponse {
+                        status: response.status,
+                        headers: response.headers,
+                        body: response.body,
+                    });
+                }
+                Err(e) => {
+                    let retryable = if method.is_idempotent_read() {
+                        e.is_idempotent_retryable()
+                    } else {
+                        e.is_pre_send_retryable()
+                    };
+                    if retryable && attempt < MAX_RETRIES {
+                        std::thread::sleep(RETRY_DELAY);
+                        continue;
+                    }
+                    last_err = Some(e);
+                    break;
+                }
+            }
         }
 
-        Ok(HttpResponse {
-            status: response.status,
-            headers: resp_headers,
-            body: response.body,
-        })
+        Err(map_http_error(
+            last_err.expect("retry loop exits with Ok or last_err"),
+        ))
     }
 }
 
@@ -427,5 +493,302 @@ mod tests {
         running.store(false, Ordering::Relaxed);
         let _ = TcpStream::connect(format!("127.0.0.1:{port}"));
         let _ = server_thread.join();
+    }
+
+    #[test]
+    fn transport_forwards_custom_response_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let resp = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: application/zip\r\n",
+                "encryptkey: secret-envelope-123\r\n",
+                "Set-Cookie: wr_skey=cookie-a; Path=/\r\n",
+                "Set-Cookie: wr_rt=cookie-b; Path=/\r\n",
+                "Content-Length: 2\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+                "PK",
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+        });
+
+        let mut policy = Policy::open();
+        policy.scoped = true;
+        policy.ensure_allowed(&format!("http://127.0.0.1:{port}"));
+
+        let transport = ReadestTransport::new(policy);
+        let req = HttpRequest::new(
+            "GET",
+            format!("http://127.0.0.1:{port}/book/chapterdownload"),
+        );
+        let resp = transport.send(req).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"PK");
+        assert!(resp
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("encryptkey") && v == "secret-envelope-123"));
+        let cookies: Vec<&str> = resp
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            cookies,
+            vec!["wr_skey=cookie-a; Path=/", "wr_rt=cookie-b; Path=/"]
+        );
+    }
+
+    #[test]
+    fn transport_enforces_custom_body_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = vec![b'x'; 64];
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+            }
+        });
+
+        let mut policy = Policy::open();
+        policy.scoped = true;
+        policy.ensure_allowed(&format!("http://127.0.0.1:{port}"));
+
+        let small = ReadestTransport::with_timeout_and_limit(policy.clone(), 5, 32);
+        let err = small
+            .send(HttpRequest::new(
+                "GET",
+                format!("http://127.0.0.1:{port}/big"),
+            ))
+            .expect_err("body exceeds custom limit");
+        assert!(matches!(err, TransportError::TooLarge(_)), "{err:?}");
+
+        let large = ReadestTransport::with_timeout_and_limit(policy, 5, 128);
+        let resp = large
+            .send(HttpRequest::new(
+                "GET",
+                format!("http://127.0.0.1:{port}/big"),
+            ))
+            .expect("body fits custom limit");
+        assert_eq!(resp.body.len(), 64);
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shared_transport_reuses_keepalive_connection() {
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(AtomicBool::new(true));
+
+        let accepted_srv = Arc::clone(&accepted);
+        let running_srv = Arc::clone(&running);
+        let server = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            while running_srv.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                if !running_srv.load(Ordering::SeqCst) {
+                    break;
+                }
+                accepted_srv.fetch_add(1, Ordering::SeqCst);
+                handlers.push(thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    for req_idx in 0..2 {
+                        let header_end = loop {
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                            match stream.read(&mut tmp) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                        };
+                        buf.drain(..header_end);
+                        let (conn, body) = if req_idx == 0 {
+                            ("keep-alive", b"ok-1")
+                        } else {
+                            ("close", b"ok-2")
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {conn}\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.write_all(body);
+                        let _ = stream.flush();
+                    }
+                }));
+            }
+            for h in handlers {
+                let _ = h.join();
+            }
+        });
+
+        let mut policy = Policy::open();
+        policy.scoped = true;
+        policy.ensure_allowed(&format!("http://127.0.0.1:{port}"));
+
+        let transport1 = ReadestTransport::new(policy.clone());
+        let resp1 = transport1
+            .send(HttpRequest::new(
+                "GET",
+                format!("http://127.0.0.1:{port}/first"),
+            ))
+            .unwrap();
+        assert_eq!(resp1.status, 200);
+        assert_eq!(resp1.body, b"ok-1");
+
+        // A second ReadestTransport constructed independently with the same
+        // policy must reuse the pooled Keep-Alive TCP socket.
+        let transport2 = ReadestTransport::new(policy);
+        let resp2 = transport2
+            .send(HttpRequest::new(
+                "GET",
+                format!("http://127.0.0.1:{port}/second"),
+            ))
+            .unwrap();
+        assert_eq!(resp2.status, 200);
+        assert_eq!(resp2.body, b"ok-2");
+
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "two separate ReadestTransport::new calls should reuse 1 TCP connection"
+        );
+
+        running.store(false, Ordering::SeqCst);
+        let _ = TcpStream::connect(addr);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn transport_retries_transient_connect_drop_and_succeeds() {
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_srv = Arc::clone(&accepted);
+
+        let server = thread::spawn(move || {
+            // First connection: accept and immediately drop without replying.
+            let (first, _) = listener.accept().unwrap();
+            accepted_srv.fetch_add(1, Ordering::SeqCst);
+            drop(first);
+
+            // Second connection: read request and return 200 OK.
+            let (mut second, _) = listener.accept().unwrap();
+            accepted_srv.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 1024];
+            let _ = second.read(&mut buf);
+            let resp = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: application/json\r\n",
+                "Content-Length: 11\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+                "{\"ok\":true}",
+            );
+            second.write_all(resp.as_bytes()).unwrap();
+            second.flush().unwrap();
+        });
+
+        let mut policy = Policy::open();
+        policy.scoped = true;
+        policy.ensure_allowed(&format!("http://127.0.0.1:{port}"));
+
+        let transport = ReadestTransport::new(policy);
+        let resp = transport
+            .send(HttpRequest::new(
+                "GET",
+                format!("http://127.0.0.1:{port}/flaky"),
+            ))
+            .expect("retry should recover from dropped connection");
+        server.join().unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, br#"{"ok":true}"#);
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn transport_decompresses_gzip_response() {
+        // gzip.compress(b'{"ok":true,"sync":"gzip-works"}', mtime=0)
+        const GZIP_BODY: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xab, 0x56, 0xca, 0xcf,
+            0x56, 0xb2, 0x2a, 0x29, 0x2a, 0x4d, 0xd5, 0x51, 0x2a, 0xae, 0xcc, 0x4b, 0x56, 0xb2,
+            0x52, 0x4a, 0xaf, 0xca, 0x2c, 0xd0, 0x2d, 0xcf, 0x2f, 0xca, 0x2e, 0x56, 0xaa, 0x05,
+            0x00, 0xb4, 0x98, 0x3d, 0x31, 0x1f, 0x00, 0x00, 0x00,
+        ];
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let req_text = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+            assert!(
+                req_text.contains("accept-encoding:") && req_text.contains("gzip"),
+                "client should advertise Accept-Encoding: gzip; got:\n{req_text}"
+            );
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                GZIP_BODY.len()
+            );
+            stream.write_all(header.as_bytes()).unwrap();
+            stream.write_all(GZIP_BODY).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let mut policy = Policy::open();
+        policy.scoped = true;
+        policy.ensure_allowed(&format!("http://127.0.0.1:{port}"));
+
+        let transport = ReadestTransport::new(policy);
+        let resp = transport
+            .send(HttpRequest::new(
+                "GET",
+                format!("http://127.0.0.1:{port}/gzip"),
+            ))
+            .expect("gzip response should decompress cleanly");
+        server.join().unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, br#"{"ok":true,"sync":"gzip-works"}"#);
     }
 }

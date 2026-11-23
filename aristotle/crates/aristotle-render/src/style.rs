@@ -9,9 +9,20 @@ pub const CHROME_DIR: &str = "serif";
 /// The gray of the guide drawn under every line of body text (0 black,
 /// 255 white).
 ///
-/// Night mode inverts the whole page, so the guide becomes the light gray
-/// 159 there: still easy to see, never as heavy as the text itself.
-pub const UNDERLINE_GRAY: u8 = 0x60;
+/// 0x20 is nearly black: on a 16-level e-ink panel a 0x60 guide washes out to
+/// a faint smudge, while 0x20 keeps the same crisp edge as the text. Night
+/// mode inverts the whole page, so the guide becomes 0xDF there: light
+/// enough not to glare, dark enough to stay visible.
+pub const UNDERLINE_GRAY: u8 = 0x20;
+
+/// The font weight presets the reading panel offers, as CSS `font-weight`
+/// numbers.
+///
+/// The engine's base weight shifts every element's weight by
+/// `weight - 400`, so a book's own bold headings stay bold on top of it.
+pub const FONT_WEIGHT_LIGHT: u16 = 300;
+pub const FONT_WEIGHT_NORMAL: u16 = 400;
+pub const FONT_WEIGHT_BOLD: u16 = 600;
 
 /// The guide drawn under every line of body text.
 ///
@@ -48,6 +59,91 @@ impl Underline {
             Underline::Solid => 1,
             Underline::Dotted => 2,
         }
+    }
+}
+
+/// How wide the guide under each line of body text is.
+///
+/// It is a render option, not a typographic one: changing it needs no new
+/// layout, only a new render of the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UnderlineScope {
+    /// Under the text only: the line follows each line's own width.
+    #[default]
+    TextOnly,
+    /// Across the whole text block (`margin_left..width-margin_right`).
+    ///
+    /// The gaps after a short paragraph and the empty line slots below it are
+    /// filled on the line-height grid, so the page reads as ruled paper.
+    FullLine,
+}
+
+impl UnderlineScope {
+    /// Every scope, in the order the picker shows them.
+    pub const ALL: [UnderlineScope; 2] = [UnderlineScope::TextOnly, UnderlineScope::FullLine];
+
+    /// Turn a picker index into a scope. Anything out of range means
+    /// "text only".
+    pub fn from_index(index: usize) -> UnderlineScope {
+        match index {
+            1 => UnderlineScope::FullLine,
+            _ => UnderlineScope::TextOnly,
+        }
+    }
+
+    /// The picker's index for this scope.
+    pub fn index(self) -> usize {
+        match self {
+            UnderlineScope::TextOnly => 0,
+            UnderlineScope::FullLine => 1,
+        }
+    }
+}
+
+/// The direction the text runs in.
+///
+/// [`WritingMode::Horizontal`] is the layout of every engine Aristotle had
+/// before VERT-101: lines run left to right, the page turns forwards to the
+/// right. [`WritingMode::VerticalRtl`] is the classical Chinese and Japanese
+/// layout: characters run top to bottom, columns run right to left, and the
+/// book turns forwards to the left (see `crate::vertical`).
+///
+/// The mode decides which engine lays the book out: crengine-ng has no
+/// `writing-mode: vertical-rl`, so the vertical mode goes to the pure-Rust
+/// engine in [`crate::vertical`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WritingMode {
+    /// Left to right, top to bottom (the default, and every Latin book).
+    #[default]
+    Horizontal,
+    /// Top to bottom, right to left (classical Chinese, Japanese, Korean).
+    VerticalRtl,
+}
+
+impl WritingMode {
+    /// Every mode, in the order the picker shows them.
+    pub const ALL: [WritingMode; 2] = [WritingMode::Horizontal, WritingMode::VerticalRtl];
+
+    /// Turn a picker index into a mode. Anything out of range means
+    /// horizontal, so an old configuration keeps reading as it did.
+    pub fn from_index(index: usize) -> WritingMode {
+        match index {
+            1 => WritingMode::VerticalRtl,
+            _ => WritingMode::Horizontal,
+        }
+    }
+
+    /// The picker's index for this mode.
+    pub fn index(self) -> usize {
+        match self {
+            WritingMode::Horizontal => 0,
+            WritingMode::VerticalRtl => 1,
+        }
+    }
+
+    /// Whether the mode lays text out top to bottom, right to left.
+    pub fn is_vertical(self) -> bool {
+        matches!(self, WritingMode::VerticalRtl)
     }
 }
 
@@ -105,6 +201,26 @@ pub struct Style {
     pub cjk_indent: usize,
     /// CJK paragraph gap in ems: 0.0 (无), 0.3 (小), or 0.6 (大, default).
     pub cjk_gap: f32,
+    /// Whether crengine's modern typesetting is on: W3C box model, the
+    /// current DOM version, HarfBuzz shaping/kerning, hanging punctuation,
+    /// embedded fonts and CSS absolute units scaled for the panel DPI.
+    ///
+    /// Off is the compatibility escape hatch for a book the modern layout
+    /// breaks; it also needs a new layout, as most of it is decided while
+    /// parsing.
+    pub fine_typesetting: bool,
+    /// Body text weight as a CSS `font-weight` number (100..=900).
+    ///
+    /// The engine treats it as a base weight: every element's own weight is
+    /// shifted by `font_weight - 400`, so heading boldness survives.
+    pub font_weight: u16,
+    /// The direction the text runs in: horizontal (left to right) or the
+    /// classical vertical right-to-left layout.
+    ///
+    /// It selects the engine as well as the layout: the vertical mode is laid
+    /// out by the pure-Rust engine in [`crate::vertical`], not by crengine-ng.
+    /// A style that differs only in this field needs a new layout.
+    pub writing_mode: WritingMode,
 }
 
 impl Style {
@@ -152,6 +268,9 @@ impl Style {
             language: None,
             cjk_indent: 2,
             cjk_gap: 0.6,
+            fine_typesetting: true,
+            font_weight: FONT_WEIGHT_NORMAL,
+            writing_mode: WritingMode::Horizontal,
         }
     }
 
@@ -178,5 +297,64 @@ impl Style {
     /// Point size in FreeType's 26.6 fixed point, as `Font::set_size` wants.
     pub fn chrome_size_26_6(&self) -> u32 {
         (self.chrome_size * 64.0).round() as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pw4_defaults_enable_fine_typesetting_and_normal_weight() {
+        let style = Style::pw4();
+        assert!(style.fine_typesetting);
+        assert_eq!(style.font_weight, FONT_WEIGHT_NORMAL);
+        assert_eq!(style.font_weight, 400);
+    }
+
+    #[test]
+    fn font_weight_presets_are_light_normal_and_bold() {
+        assert_eq!(FONT_WEIGHT_LIGHT, 300);
+        assert_eq!(FONT_WEIGHT_NORMAL, 400);
+        assert_eq!(FONT_WEIGHT_BOLD, 600);
+    }
+
+    #[test]
+    fn underline_gray_is_darker_than_the_old_value() {
+        assert_eq!(UNDERLINE_GRAY, 0x20);
+    }
+
+    #[test]
+    fn writing_mode_defaults_to_horizontal_and_round_trips() {
+        assert_eq!(Style::pw4().writing_mode, WritingMode::Horizontal);
+        assert_eq!(WritingMode::default(), WritingMode::Horizontal);
+        assert_eq!(
+            WritingMode::ALL,
+            [WritingMode::Horizontal, WritingMode::VerticalRtl]
+        );
+        for (index, mode) in [(0, WritingMode::Horizontal), (1, WritingMode::VerticalRtl)] {
+            assert_eq!(WritingMode::from_index(index), mode);
+            assert_eq!(mode.index(), index);
+        }
+        // An unknown index (an older or newer configuration) reads
+        // horizontally rather than failing.
+        assert_eq!(WritingMode::from_index(7), WritingMode::Horizontal);
+        assert!(!WritingMode::Horizontal.is_vertical());
+        assert!(WritingMode::VerticalRtl.is_vertical());
+    }
+
+    #[test]
+    fn underline_scope_round_trips_through_picker_indices() {
+        for (index, scope) in [(0, UnderlineScope::TextOnly), (1, UnderlineScope::FullLine)] {
+            assert_eq!(UnderlineScope::from_index(index), scope);
+            assert_eq!(scope.index(), index);
+        }
+        assert_eq!(
+            UnderlineScope::ALL,
+            [UnderlineScope::TextOnly, UnderlineScope::FullLine]
+        );
+        // Out of range falls back to the compatible default.
+        assert_eq!(UnderlineScope::from_index(7), UnderlineScope::TextOnly);
+        assert_eq!(UnderlineScope::default(), UnderlineScope::TextOnly);
     }
 }

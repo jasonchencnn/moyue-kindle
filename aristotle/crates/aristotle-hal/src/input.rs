@@ -12,7 +12,7 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
-use aristotle_screen::model::{self, Model, PageTurnKeys};
+use aristotle_screen::model::{self, KoboModel, KoboProtocol, Model, PageTurnKeys};
 
 /// The transform of a touchscreen: the same type as the model table's.
 pub use aristotle_screen::model::TouchTransform as Transform;
@@ -28,6 +28,8 @@ const ABS_MT_SLOT: u16 = 0x2f;
 const ABS_MT_POSITION_X: u16 = 0x35;
 const ABS_MT_POSITION_Y: u16 = 0x36;
 const ABS_MT_TRACKING_ID: u16 = 0x39;
+const ABS_PRESSURE: u16 = 0x18;
+const ABS_MT_PRESSURE: u16 = 0x3a;
 
 /// `_IOW('E', 0x90, int)`
 const EVIOCGRAB: libc::c_ulong = 0x4004_4590;
@@ -75,6 +77,16 @@ struct RawEvent {
     value: i32,
 }
 
+impl RawEvent {
+    fn time_us(&self, kernel_monotonic: bool) -> u64 {
+        if kernel_monotonic {
+            self.sec as u64 * 1_000_000 + self.usec as u64
+        } else {
+            monotonic_us()
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AbsInfo {
@@ -102,8 +114,7 @@ pub struct TouchEvent {
     pub y: u32,
     pub raw_x: i32,
     pub raw_y: i32,
-    /// Kernel timestamp of the report, CLOCK_MONOTONIC microseconds
-    /// (comparable with [`monotonic_us`]).
+    /// CLOCK_MONOTONIC microseconds at the report, or at receipt on legacy evdev.
     pub time_us: u64,
 }
 
@@ -127,6 +138,92 @@ struct Slot {
     y: i32,
 }
 
+/// The single-contact Kobo digitizer state.
+///
+/// MultiB and MultiC share the position axes but release differently: a
+/// MultiB contact that is absent from a report is up (pressure is not a
+/// release signal), while MultiC releases when pressure reaches zero. Plato
+/// makes the same distinction in `parse_device_events`.
+#[derive(Clone, Copy, Debug)]
+struct KoboState {
+    protocol: KoboProtocol,
+    x: i32,
+    y: i32,
+    active: bool,
+    was_active: bool,
+    moved: bool,
+    frame_position: bool,
+}
+
+impl KoboState {
+    fn new(protocol: KoboProtocol) -> Self {
+        Self {
+            protocol,
+            x: 0,
+            y: 0,
+            active: false,
+            was_active: false,
+            moved: false,
+            frame_position: false,
+        }
+    }
+
+    /// Feed one raw evdev event; returns the touch event a `SYN_REPORT`
+    /// completes, if any.
+    fn feed(&mut self, kind: u16, code: u16, value: i32) -> Option<(Phase, i32, i32)> {
+        match (kind, code) {
+            (EV_ABS, ABS_MT_TRACKING_ID) => {
+                self.frame_position = true;
+                if value >= 0 {
+                    if !self.active {
+                        self.moved = true;
+                    }
+                    self.active = true;
+                } else {
+                    self.active = false;
+                }
+            }
+            (EV_ABS, ABS_MT_POSITION_X) | (EV_ABS, ABS_X) => {
+                self.moved |= self.x != value;
+                self.x = value;
+                self.frame_position = true;
+                self.active = true;
+            }
+            (EV_ABS, ABS_MT_POSITION_Y) | (EV_ABS, ABS_Y) => {
+                self.moved |= self.y != value;
+                self.y = value;
+                self.frame_position = true;
+                self.active = true;
+            }
+            (EV_ABS, ABS_MT_PRESSURE) | (EV_ABS, ABS_PRESSURE) => {
+                if self.protocol == KoboProtocol::MultiC && value == 0 {
+                    self.active = false;
+                }
+            }
+            (EV_KEY, BTN_TOUCH) => {
+                self.active = value != 0;
+            }
+            (EV_SYN, SYN_REPORT) => {
+                if self.protocol == KoboProtocol::MultiB && self.active && !self.frame_position {
+                    self.active = false;
+                }
+                let phase = match (self.was_active, self.active) {
+                    (false, true) => Some(Phase::Down),
+                    (true, true) if self.moved => Some(Phase::Move),
+                    (true, false) => Some(Phase::Up),
+                    _ => None,
+                };
+                self.was_active = self.active;
+                self.moved = false;
+                self.frame_position = false;
+                return phase.map(|phase| (phase, self.x, self.y));
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
 pub struct TouchScreen {
     file: File,
     path: String,
@@ -138,7 +235,10 @@ pub struct TouchScreen {
     slots: [Slot; MAX_SLOTS],
     slot: usize,
     grabbed: bool,
+    kernel_monotonic: bool,
     raw_events: u64,
+    /// Kobo's single-contact protocol; `None` on the Kindle slot protocol.
+    kobo: Option<KoboState>,
 }
 
 /// The evdev devices of the system, with their names and event nodes.
@@ -288,6 +388,20 @@ fn abs_info(file: &File, axis: u16) -> io::Result<AbsInfo> {
     }
 }
 
+fn configure_touch_clock(file: &File) -> io::Result<bool> {
+    let clock: libc::c_int = libc::CLOCK_MONOTONIC;
+    // SAFETY: EVIOCSCLOCKID takes a pointer to an int clock id.
+    if unsafe { libc::ioctl(file.as_raw_fd(), EVIOCSCLOCKID as _, &clock) } >= 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        // Linux 3.0 evdev returns EINVAL for unknown requests.
+        Some(libc::EINVAL | libc::ENOTTY) => Ok(false),
+        _ => Err(error),
+    }
+}
+
 impl TouchScreen {
     /// Open the touchscreen and map it onto a `width` x `height` framebuffer.
     ///
@@ -296,14 +410,32 @@ impl TouchScreen {
     /// axis is the longer one describes the panel in its own orientation,
     /// which is not the framebuffer's.
     pub fn open(width: u32, height: u32, transform: Transform) -> io::Result<Self> {
+        Self::open_with(width, height, transform, None)
+    }
+
+    /// Open a Kobo touchscreen speaking `protocol`.
+    pub fn open_kobo(
+        width: u32,
+        height: u32,
+        transform: Transform,
+        protocol: KoboProtocol,
+    ) -> io::Result<Self> {
+        Self::open_with(width, height, transform, Some(KoboState::new(protocol)))
+    }
+
+    fn open_with(
+        width: u32,
+        height: u32,
+        transform: Transform,
+        kobo: Option<KoboState>,
+    ) -> io::Result<Self> {
         let (path, name) = find_touchscreen()?;
         let file = File::open(&path)?;
-        // Timestamps default to CLOCK_REALTIME; monotonic makes them comparable
-        // with `monotonic_us()` for latency measurements.
-        // SAFETY: EVIOCSCLOCKID takes a pointer to an int clock id.
-        let clock: libc::c_int = libc::CLOCK_MONOTONIC;
-        if unsafe { libc::ioctl(file.as_raw_fd(), EVIOCSCLOCKID as _, &clock) } < 0 {
-            return Err(io::Error::last_os_error());
+        let kernel_monotonic = configure_touch_clock(&file)?;
+        if !kernel_monotonic {
+            eprintln!(
+                "aristotle: evdev has no monotonic clock selection; using touch receipt times"
+            );
         }
         let (abs_x, abs_y) = match (
             abs_info(&file, ABS_MT_POSITION_X),
@@ -354,7 +486,9 @@ impl TouchScreen {
             slots,
             slot,
             grabbed: false,
+            kernel_monotonic,
             raw_events: 0,
+            kobo,
         })
     }
 
@@ -384,13 +518,7 @@ impl TouchScreen {
     /// Reopen the touchscreen evdev node and refresh slot states from the kernel.
     pub fn reopen(&mut self) -> io::Result<()> {
         let file = File::open(&self.path)?;
-        // Timestamps default to CLOCK_REALTIME; monotonic makes them comparable
-        // with `monotonic_us()` for latency measurements and gesture deadlines.
-        // SAFETY: EVIOCSCLOCKID takes a pointer to an int clock id.
-        let clock: libc::c_int = libc::CLOCK_MONOTONIC;
-        if unsafe { libc::ioctl(file.as_raw_fd(), EVIOCSCLOCKID as _, &clock) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let kernel_monotonic = configure_touch_clock(&file)?;
         let slot = abs_info(&file, ABS_MT_SLOT)
             .map_or(0, |s| s.value.clamp(0, MAX_SLOTS as i32 - 1) as usize);
         let mut slots = [Slot::default(); MAX_SLOTS];
@@ -411,6 +539,7 @@ impl TouchScreen {
         }
         let was_grabbed = self.grabbed;
         self.file = file;
+        self.kernel_monotonic = kernel_monotonic;
         self.slots = slots;
         self.slot = slot;
         self.grabbed = false;
@@ -535,6 +664,22 @@ impl TouchScreen {
     }
 
     fn feed(&mut self, ev: RawEvent, out: &mut Vec<TouchEvent>) {
+        if let Some(mut kobo) = self.kobo {
+            if let Some((phase, x, y)) = kobo.feed(ev.kind, ev.code, ev.value) {
+                let (x, y) = self.map(x, y);
+                out.push(TouchEvent {
+                    phase,
+                    id: 0,
+                    x,
+                    y,
+                    raw_x: kobo.x,
+                    raw_y: kobo.y,
+                    time_us: ev.time_us(self.kernel_monotonic),
+                });
+            }
+            self.kobo = Some(kobo);
+            return;
+        }
         match (ev.kind, ev.code) {
             (EV_ABS, ABS_MT_SLOT) => self.slot = (ev.value.max(0) as usize).min(MAX_SLOTS - 1),
             (EV_ABS, ABS_MT_TRACKING_ID) => {
@@ -565,6 +710,7 @@ impl TouchScreen {
                 }
             }
             (EV_SYN, SYN_REPORT) => {
+                let time_us = ev.time_us(self.kernel_monotonic);
                 for id in 0..MAX_SLOTS {
                     let s = self.slots[id];
                     if !s.dirty {
@@ -580,7 +726,6 @@ impl TouchScreen {
                         }
                     };
                     let (x, y) = self.map(s.x, s.y);
-                    let time_us = ev.sec as u64 * 1_000_000 + ev.usec as u64;
                     out.push(TouchEvent {
                         phase,
                         id,
@@ -738,6 +883,33 @@ impl Input {
         })
     }
 
+    /// Open the touchscreen and page-turn buttons of a Kobo `model`.
+    ///
+    /// The Kobo digitizer protocol (MultiB on the Clara HD, MultiC on the
+    /// Libra 2) is selected from the model; the button codes come from the
+    /// same table. Rotation handling is the same contract as [`Self::open`],
+    /// with Kobo's mark-specific transform.
+    pub fn open_kobo(model: KoboModel, width: u32, height: u32, rotate: u32) -> io::Result<Self> {
+        let touch = TouchScreen::open_kobo(
+            width,
+            height,
+            model.touch_transform_at(rotate),
+            model.touch_protocol(),
+        )?;
+        let (keys, keys_error) = match model.page_turn_keys() {
+            None => (None, None),
+            Some(keys) => match PageKeys::open(keys) {
+                Ok(keys) => (Some(keys), None),
+                Err(e) => (None, Some(e.to_string())),
+            },
+        };
+        Ok(Self {
+            touch,
+            keys,
+            keys_error,
+        })
+    }
+
     pub fn touch(&self) -> &TouchScreen {
         &self.touch
     }
@@ -850,5 +1022,174 @@ impl Input {
             }
         }
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_touch_clock_uses_monotonic_receive_time() {
+        let file = File::open("/dev/null").unwrap();
+        let kernel_monotonic = configure_touch_clock(&file).unwrap();
+        assert!(!kernel_monotonic);
+        let event = RawEvent {
+            sec: 1_700_000_000,
+            usec: 123,
+            ..RawEvent::default()
+        };
+        let before = monotonic_us();
+        let received = event.time_us(kernel_monotonic);
+        assert!((before..=monotonic_us()).contains(&received));
+        assert_eq!(event.time_us(true), 1_700_000_000_000_123);
+    }
+
+    fn feed(state: &mut KoboState, events: &[(u16, u16, i32)]) -> Vec<(Phase, i32, i32)> {
+        let mut out = Vec::new();
+        for &(kind, code, value) in events {
+            if let Some(event) = state.feed(kind, code, value) {
+                out.push(event);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn multib_releases_a_contact_that_is_absent_from_the_report() {
+        let mut state = KoboState::new(KoboProtocol::MultiB);
+        let down = feed(
+            &mut state,
+            &[
+                (EV_ABS, ABS_MT_TRACKING_ID, 7),
+                (EV_ABS, ABS_MT_POSITION_X, 100),
+                (EV_ABS, ABS_MT_POSITION_Y, 200),
+                (EV_ABS, ABS_MT_PRESSURE, 1),
+                (EV_SYN, SYN_REPORT, 0),
+            ],
+        );
+        assert_eq!(down, vec![(Phase::Down, 100, 200)]);
+
+        let moved = feed(
+            &mut state,
+            &[(EV_ABS, ABS_MT_POSITION_X, 120), (EV_SYN, SYN_REPORT, 0)],
+        );
+        assert_eq!(moved, vec![(Phase::Move, 120, 200)]);
+
+        // MultiB's pressure is not the release signal: an absent contact is.
+        let up = feed(&mut state, &[(EV_SYN, SYN_REPORT, 0)]);
+        assert_eq!(up, vec![(Phase::Up, 120, 200)]);
+        assert!(!state.active);
+    }
+
+    #[test]
+    fn a_repeated_tracking_id_is_not_a_move() {
+        let mut state = KoboState::new(KoboProtocol::MultiB);
+        feed(
+            &mut state,
+            &[
+                (EV_ABS, ABS_MT_TRACKING_ID, 7),
+                (EV_ABS, ABS_MT_POSITION_X, 50),
+                (EV_ABS, ABS_MT_POSITION_Y, 60),
+                (EV_ABS, ABS_MT_PRESSURE, 1),
+                (EV_SYN, SYN_REPORT, 0),
+            ],
+        );
+        let repeated = feed(
+            &mut state,
+            &[(EV_ABS, ABS_MT_TRACKING_ID, 7), (EV_SYN, SYN_REPORT, 0)],
+        );
+        assert_eq!(repeated, vec![]);
+    }
+
+    #[test]
+    fn multib_up_from_a_tracking_id_release() {
+        let mut state = KoboState::new(KoboProtocol::MultiB);
+        feed(
+            &mut state,
+            &[
+                (EV_ABS, ABS_MT_POSITION_X, 10),
+                (EV_ABS, ABS_MT_POSITION_Y, 20),
+                (EV_ABS, ABS_MT_PRESSURE, 1),
+                (EV_SYN, SYN_REPORT, 0),
+            ],
+        );
+        let up = feed(
+            &mut state,
+            &[(EV_ABS, ABS_MT_TRACKING_ID, -1), (EV_SYN, SYN_REPORT, 0)],
+        );
+        assert_eq!(up, vec![(Phase::Up, 10, 20)]);
+    }
+
+    #[test]
+    fn multic_releases_a_contact_when_pressure_reaches_zero() {
+        let mut state = KoboState::new(KoboProtocol::MultiC);
+        let down = feed(
+            &mut state,
+            &[
+                (EV_ABS, ABS_MT_POSITION_X, 300),
+                (EV_ABS, ABS_MT_POSITION_Y, 400),
+                (EV_ABS, ABS_MT_PRESSURE, 5),
+                (EV_SYN, SYN_REPORT, 0),
+            ],
+        );
+        assert_eq!(down, vec![(Phase::Down, 300, 400)]);
+
+        let moved = feed(
+            &mut state,
+            &[(EV_ABS, ABS_MT_POSITION_Y, 410), (EV_SYN, SYN_REPORT, 0)],
+        );
+        assert_eq!(moved, vec![(Phase::Move, 300, 410)]);
+
+        let up = feed(
+            &mut state,
+            &[(EV_ABS, ABS_MT_PRESSURE, 0), (EV_SYN, SYN_REPORT, 0)],
+        );
+        assert_eq!(up, vec![(Phase::Up, 300, 410)]);
+        assert!(!state.active);
+    }
+
+    #[test]
+    fn multic_ignores_an_empty_frame_but_multib_releases() {
+        let mut b = KoboState::new(KoboProtocol::MultiB);
+        feed(
+            &mut b,
+            &[
+                (EV_ABS, ABS_MT_POSITION_X, 1),
+                (EV_ABS, ABS_MT_POSITION_Y, 2),
+                (EV_SYN, SYN_REPORT, 0),
+            ],
+        );
+        assert_eq!(
+            feed(&mut b, &[(EV_SYN, SYN_REPORT, 0)]),
+            vec![(Phase::Up, 1, 2)]
+        );
+
+        let mut c = KoboState::new(KoboProtocol::MultiC);
+        feed(
+            &mut c,
+            &[
+                (EV_ABS, ABS_MT_POSITION_X, 1),
+                (EV_ABS, ABS_MT_POSITION_Y, 2),
+                (EV_ABS, ABS_MT_PRESSURE, 3),
+                (EV_SYN, SYN_REPORT, 0),
+            ],
+        );
+        assert_eq!(feed(&mut c, &[(EV_SYN, SYN_REPORT, 0)]), vec![]);
+        assert!(c.active);
+    }
+
+    #[test]
+    fn the_two_kobo_models_pick_their_own_protocol_and_buttons() {
+        assert_eq!(KoboModel::ClaraHd.touch_protocol(), KoboProtocol::MultiB);
+        assert_eq!(KoboModel::Libra2.touch_protocol(), KoboProtocol::MultiC);
+        assert!(KoboModel::ClaraHd.page_turn_keys().is_none());
+        assert_eq!(
+            KoboModel::Libra2.page_turn_keys(),
+            Some(PageTurnKeys {
+                forward: 194,
+                back: 193,
+            })
+        );
     }
 }

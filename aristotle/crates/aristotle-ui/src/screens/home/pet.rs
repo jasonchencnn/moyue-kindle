@@ -78,6 +78,43 @@ impl Geometry {
         );
         Geometry { cat, line, fish }
     }
+
+    /// Places and scales the pet to fit `card` cleanly on compact six-inch
+    /// and low-DPI panels without overlapping the resume button, while keeping
+    /// the exact prototype coordinates on seven-inch 300 DPI panels.
+    pub fn for_card(
+        content: Rect,
+        card: Rect,
+        screen_wide: i32,
+        nav_top: i32,
+        density: crate::geom::Density,
+    ) -> Self {
+        if density.dpi() == 300 && card.h >= 400 {
+            return Self::new(content, screen_wide, nav_top);
+        }
+        let dpi_scale = density.dpi() as f32 / 300.0;
+        let max_cat_h = (card.h as f32 * 0.58).max(32.0);
+        let scale = (max_cat_h / CAT.1 as f32).min(dpi_scale);
+        let cat_w = (CAT.0 as f32 * scale).round().max(1.0) as i32;
+        let cat_h = (CAT.1 as f32 * scale).round().max(1.0) as i32;
+        let fish_w = (FISH.0 as f32 * scale).round().max(1.0) as i32;
+        let fish_h = (FISH.1 as f32 * scale).round().max(1.0) as i32;
+        let line_w = (LINE_W as f32 * dpi_scale).round().max(1.0) as i32;
+        // Put the rod tip in the right margin without clipping the cat off-screen.
+        let rod_x =
+            (content.right() + (screen_wide - content.right()) / 3).min(screen_wide - line_w - 2);
+        let cat_x = (rod_x - cat_w).max(card.x);
+        let cat_y = card.y + (card.h as f32 * 0.05).round() as i32;
+        let line_top = cat_y + (9.5 * scale).round() as i32;
+        let hook_x = (40.2 * scale).round() as i32;
+        let fish_x = (rod_x - hook_x).clamp(0, (screen_wide - fish_w).max(0));
+        let fish_y = nav_top + (FISH_TOP as f32 * scale).round() as i32;
+        Geometry {
+            cat: Rect::new(cat_x, cat_y, cat_w, cat_h),
+            line: Rect::new(rod_x, line_top, line_w, (nav_top - line_top).max(0)),
+            fish: Rect::new(fish_x, fish_y, fish_w, fish_h),
+        }
+    }
 }
 
 /// The desk pet, drawn over the home screen.
@@ -123,22 +160,62 @@ impl Widget for Pet {
         if self.geometry.line.h > 0 {
             p.fill_rect(self.geometry.line, INK);
         }
-        p.blend_mask(
-            self.geometry.cat.x,
-            self.geometry.cat.y,
-            CAT.0 as u32,
-            CAT.1 as u32,
-            CAT_MASK,
-            INK,
-        );
-        p.blend_mask(
-            self.geometry.fish.x,
-            self.geometry.fish.y,
-            FISH.0 as u32,
-            FISH.1 as u32,
-            FISH_MASK,
-            INK,
-        );
+        if !self.geometry.cat.is_empty() {
+            if self.geometry.cat.w == CAT.0 && self.geometry.cat.h == CAT.1 {
+                p.blend_mask(
+                    self.geometry.cat.x,
+                    self.geometry.cat.y,
+                    CAT.0 as u32,
+                    CAT.1 as u32,
+                    CAT_MASK,
+                    INK,
+                );
+            } else {
+                let scaled = crate::status::scale_mask(
+                    CAT_MASK,
+                    CAT.0 as usize,
+                    CAT.1 as usize,
+                    self.geometry.cat.w as usize,
+                    self.geometry.cat.h as usize,
+                );
+                p.blend_mask(
+                    self.geometry.cat.x,
+                    self.geometry.cat.y,
+                    self.geometry.cat.w as u32,
+                    self.geometry.cat.h as u32,
+                    &scaled,
+                    INK,
+                );
+            }
+        }
+        if !self.geometry.fish.is_empty() {
+            if self.geometry.fish.w == FISH.0 && self.geometry.fish.h == FISH.1 {
+                p.blend_mask(
+                    self.geometry.fish.x,
+                    self.geometry.fish.y,
+                    FISH.0 as u32,
+                    FISH.1 as u32,
+                    FISH_MASK,
+                    INK,
+                );
+            } else {
+                let scaled = crate::status::scale_mask(
+                    FISH_MASK,
+                    FISH.0 as usize,
+                    FISH.1 as usize,
+                    self.geometry.fish.w as usize,
+                    self.geometry.fish.h as usize,
+                );
+                p.blend_mask(
+                    self.geometry.fish.x,
+                    self.geometry.fish.y,
+                    self.geometry.fish.w as u32,
+                    self.geometry.fish.h as u32,
+                    &scaled,
+                    INK,
+                );
+            }
+        }
     }
 }
 

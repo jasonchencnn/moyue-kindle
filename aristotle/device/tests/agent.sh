@@ -341,6 +341,7 @@ run "$r" takeover.sh start
 # which the host has no.
 check "did not refuse" "! grep -q 'not a Paperwhite 4 or Oasis 2' $r.out"
 check "stock GUI stopped" "called $r 'stop -n lab126_gui'"
+check "ordinary takeover clears the blanket splash" "called $r 'lipc-set-prop com.lab126.blanket unload splash' && called $r 'lipc-send-event -r 5 com.lab126.hal bootSplashCleanup'"
 echo "guard: takeover.sh on stdin finds the installed extension's guard"
 r=$(device stdin "$PW5_SN" 5.13.6)
 AGENT_TEST_ROOT=$r PATH="$WORK/bin:$PATH" sh -s start < "$DEVICE/app/takeover.sh" > "$r.out" 2>&1
@@ -747,6 +748,10 @@ fake_app() {
     echo 'test release 1' > "$1/mnt/us/aristotle/SOURCE.txt"
     cat > "$1/mnt/us/aristotle/aristotle" << 'EOF'
 #!/bin/sh
+if [ "${1:-}" = --transition ]; then
+    echo "transition $2" >> "$AGENT_TEST_ROOT/calls"
+    exit "${FAKE_TRANSITION_RC:-0}"
+fi
 echo "app $*" >> "$AGENT_TEST_ROOT/calls"
 echo "launcher-capability ${ARISTOTLE_EXIT_ACTIONS:-unset}" >> "$AGENT_TEST_ROOT/calls"
 echo $$ > "$AGENT_TEST_ROOT/jobs/app-$$.pid"
@@ -906,6 +911,16 @@ check "runs the copy" "called $r app"
 check "then the stock GUI, screensaver back" "called $r 'start lab126_gui' && called $r 'lipc-set-prop com.lab126.blanket load screensaver'"
 check "count 0" "[ \"\$(cat $r/var/local/aristotle/ui-fails)\" = 0 ]"
 check "takeover flag gone" "[ ! -e $r/var/run/aristotle-takeover ]"
+
+check "startup transition precedes app launch" "awk '/^transition prepare$/ {ready=1} /^app / {exit !ready}' $r/calls"
+check "return transition precedes stock start" "awk '/^transition restoring$/ {ready=1} /^start lab126_gui$/ {exit !ready}' $r/calls"
+
+echo "transition renderer failure preserves app and stock recovery"
+r=$(autostarted transitionfail)
+printf 'fsp %s/mnt/us fuse.fsp rw 0 0\n' "$r" > "$r/proc/mounts"
+FAKE_TRANSITION_RC=1 ui_boot "$r"
+done_ui "$r"
+check "app still runs and returns to stock" "called $r app && called $r 'start lab126_gui' && [ ! -e $r/var/run/aristotle-takeover ]"
 
 echo "ui-boot: crash loop"
 r=$(autostarted uicrash)

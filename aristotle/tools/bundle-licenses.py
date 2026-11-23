@@ -78,9 +78,11 @@ if ENGINE_SRC:
     C_LIBS += [
         ("koreader-crengine", "GPL-2.0-or-later", [CRENGINE_DIR / "cr3gui/COPYING"]),
         ("xxhash", "BSD-2-Clause", [CRENGINE_DIR / "thirdparty/xxhash/LICENSE"]),
+        ("lunasvg", "MIT", [CRENGINE_DIR.parent / "lunasvg/LICENSE"]),
         ("fribidi", "LGPL-2.1-or-later", [ENGINE_SRC / "fribidi/COPYING"]),
         ("libunibreak", "zlib (BSD-like)", [ENGINE_SRC / "unibreak/LICENCE"]),
         ("utf8proc", "MIT", [ENGINE_SRC / "utf8proc/LICENSE.md"]),
+        ("libwebp", "BSD-3-Clause", [ENGINE_SRC / "libwebp/COPYING"]),
         (
             "zstd",
             "BSD-3-Clause (also GPL-2.0-or-later; the BSD one is used)",

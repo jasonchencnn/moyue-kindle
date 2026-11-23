@@ -4,7 +4,9 @@
 //! Visuals follow `prototype-v2/mcode/LibraryScan.dc.html` and `DESIGN-scan.md`.
 //! Chinese text uses sans-serif (Noto Sans SC fallback).
 
-use super::library::{segment_control, status_line, Segment, StatusLine};
+use super::library::{
+    segment_control_channels, status_line, ChannelVisibility, Segment, StatusLine,
+};
 use crate::geom::{Insets, Rect, Size};
 use crate::icons::Icon;
 use crate::nav::{self, Tab};
@@ -37,6 +39,10 @@ pub mod action {
     pub const RESCAN: ActionId = 7;
     /// Switch to the cloud shelf from the empty-library guide.
     pub const CLOUD_LIBRARY: ActionId = 8;
+    /// Switch to the WeRead shelf from the empty-library guide.
+    pub const WEREAD_LIBRARY: ActionId = 12;
+    /// Switch to the Nutstore shelf from the empty-library guide.
+    pub const JIANGUOYUN_LIBRARY: ActionId = 27;
     /// Open the source picker, where the folders to scan are chosen.
     pub const CHOOSE_SCOPE: ActionId = 9;
     /// Scan the chosen sources (the source picker's primary button).
@@ -402,8 +408,87 @@ impl Widget for ScanProgressBar {
 }
 
 impl ScanUi {
-    /// Builds the scan screen.
-    pub fn build(_text: &mut TextEngine, s: &Styles, screen: &ScanScreen) -> (Tree, Self) {
+    /// Builds the scan screen with both Readest and WeRead library tabs shown
+    /// on the empty-library guide.
+    pub fn build(text: &mut TextEngine, s: &Styles, screen: &ScanScreen) -> (Tree, Self) {
+        Self::build_with_sources(text, s, screen, true, true)
+    }
+
+    /// Builds the scan screen for a panel of `size` native pixels.
+    pub fn build_for_size(
+        text: &mut TextEngine,
+        s: &Styles,
+        screen: &ScanScreen,
+        size: Size,
+    ) -> (Tree, Self) {
+        Self::build_with_sources_for_size(text, s, screen, true, true, size)
+    }
+
+    /// Builds the scan screen, showing Local plus whichever cloud libraries
+    /// are enabled in Settings (`show_cloud`, `show_weread`) when the library
+    /// is empty.
+    pub fn build_with_sources(
+        text: &mut TextEngine,
+        s: &Styles,
+        screen: &ScanScreen,
+        show_cloud: bool,
+        show_weread: bool,
+    ) -> (Tree, Self) {
+        Self::build_with_channels(
+            text,
+            s,
+            screen,
+            ChannelVisibility::readest_and_weread(show_cloud, show_weread),
+        )
+    }
+
+    /// Builds the scan screen, showing Local plus whichever cloud libraries
+    /// Settings turns on: Readest, WeRead and Nutstore.
+    pub fn build_with_channels(
+        text: &mut TextEngine,
+        s: &Styles,
+        screen: &ScanScreen,
+        channels: ChannelVisibility,
+    ) -> (Tree, Self) {
+        Self::build_with_channels_for_size(
+            text,
+            s,
+            screen,
+            channels,
+            Size::new(s.density.px(1264), s.density.px(1680)),
+        )
+    }
+
+    /// Builds the scan screen for a panel of `size` native pixels, showing
+    /// Local plus whichever cloud libraries are enabled in Settings.
+    pub fn build_with_sources_for_size(
+        _text: &mut TextEngine,
+        s: &Styles,
+        screen: &ScanScreen,
+        show_cloud: bool,
+        show_weread: bool,
+        size: Size,
+    ) -> (Tree, Self) {
+        Self::build_with_channels_for_size(
+            _text,
+            s,
+            screen,
+            ChannelVisibility::readest_and_weread(show_cloud, show_weread),
+            size,
+        )
+    }
+
+    /// Builds the scan screen for a panel of `size` native pixels, showing
+    /// Local plus whichever cloud libraries Settings turns on.
+    pub fn build_with_channels_for_size(
+        _text: &mut TextEngine,
+        s: &Styles,
+        screen: &ScanScreen,
+        channels: ChannelVisibility,
+        size: Size,
+    ) -> (Tree, Self) {
+        let compact = crate::theme::PanelLayout::for_size(size, s.density)
+            == crate::theme::PanelLayout::Compact;
         let mut t = Tree::new();
         let bar = status_line(&mut t, s, &screen.status);
         let status = t.pad(Insets::new(0, home_margin(), 0, home_margin()), bar.root);
@@ -434,18 +519,21 @@ impl ScanUi {
         let header = t.pad(Insets::new(0, home_margin(), 0, home_margin()), header);
         let header = t.fixed(None, Some(HEADER_H), Some(header));
 
-        // The empty guide keeps the shelf's Local / Cloud control: a reader
-        // whose library is empty must still reach the cloud shelf, or a new
-        // device with no books online has no way to download one.
+        // The empty guide keeps the same Local / enabled cloud sources control
+        // as the populated library shelf so a new or wiped device can directly
+        // enter Readest, WeRead or Nutstore without first scanning local files.
         let mut parts = vec![status, header];
-        if matches!(screen.state, ScanState::Empty) {
-            let seg_box = segment_control(
+        if matches!(screen.state, ScanState::Empty) && channels.count() > 0 {
+            let seg_box = segment_control_channels(
                 &mut t,
                 s,
                 screen.local_books_count,
                 Segment::Local,
                 None,
-                Some(action::CLOUD_LIBRARY),
+                channels.readest.then_some(action::CLOUD_LIBRARY),
+                channels.weread.then_some(action::WEREAD_LIBRARY),
+                channels.jianguoyun.then_some(action::JIANGUOYUN_LIBRARY),
+                channels,
             );
             let seg_box = t.fixed(None, Some(76), Some(seg_box));
             let seg_control = t.pad(Insets::new(0, home_margin(), 28, home_margin()), seg_box);
@@ -458,7 +546,7 @@ impl ScanUi {
         let mut review_list = None;
         let mut review_pager = None;
         let content_node = match &screen.state {
-            ScanState::Empty => Self::build_empty(&mut t, s),
+            ScanState::Empty => Self::build_empty(&mut t, s, compact),
             ScanState::Scanning {
                 path,
                 subdirs,
@@ -478,6 +566,7 @@ impl ScanUi {
                     *progress,
                     status,
                     scanned_books,
+                    compact,
                 );
                 progress_node = Some(pb);
                 node
@@ -543,11 +632,16 @@ impl ScanUi {
                 tiles,
                 error,
                 added_books,
-            } => Self::build_done(&mut t, s, tiles, error.as_ref(), added_books),
+            } => Self::build_done(&mut t, s, tiles, error.as_ref(), added_books, compact),
         };
 
         let content_area = t.pad(
-            Insets::new(0, home_margin(), 28, home_margin()),
+            Insets::new(
+                0,
+                home_margin(),
+                if compact { 14 } else { 28 },
+                home_margin(),
+            ),
             content_node,
         );
         let content_area = t.add(Node::column(0).flex(1), [content_area]);
@@ -573,9 +667,13 @@ impl ScanUi {
     }
 
     /// Build State 1: Empty library onboarding guide.
-    fn build_empty(t: &mut Tree, s: &Styles) -> NodeId {
+    fn build_empty(t: &mut Tree, s: &Styles, compact: bool) -> NodeId {
         let ill = t.custom(EmptyLibraryIllustration);
-        let ill = t.fixed(Some(322), Some(280), Some(ill));
+        let ill = if compact {
+            t.fixed(Some(200), Some(174), Some(ill))
+        } else {
+            t.fixed(Some(322), Some(280), Some(ill))
+        };
 
         // The body is a centered column, so the labels centre themselves:
         // an Align child here would take the column's remaining height and
@@ -587,7 +685,9 @@ impl ScanUi {
 
         let desc = t.label(
             tr(Msg::LibraryScanEmptyDesc),
-            s.font_sm().gray(INK_MID).line_height(1.5),
+            s.font_sm()
+                .gray(INK_MID)
+                .line_height(if compact { 1.35 } else { 1.5 }),
         );
 
         // Black primary button "扫描本地书籍"
@@ -599,7 +699,7 @@ impl ScanUi {
         let btn = t.add(
             Node::new(Kind::Fixed {
                 w: None,
-                h: Some(96),
+                h: Some(if compact { 80 } else { 96 }),
             })
             .bg(INK)
             .border(0, INK, 20)
@@ -631,8 +731,16 @@ impl ScanUi {
             tr(Msg::LibraryScanWifiDesc),
             s.font_xs().gray(INK_MID).line_height(1.3),
         );
-        let wifi_card_content = t.add(Node::column(12), [wifi_top, wifi_sub]);
-        let wifi_card_pad = t.pad(Insets::new(24, 28, 24, 28), wifi_card_content);
+        let wifi_card_content = t.add(
+            Node::column(if compact { 8 } else { 12 }),
+            [wifi_top, wifi_sub],
+        );
+        let card_pad = if compact {
+            Insets::new(14, 20, 14, 20)
+        } else {
+            Insets::new(24, 28, 24, 28)
+        };
+        let wifi_card_pad = t.pad(card_pad, wifi_card_content);
         let wifi_card = t.add(
             Node::column(0)
                 .bg(CARD)
@@ -663,14 +771,20 @@ impl ScanUi {
             tr(Msg::LibraryScanUsbDesc),
             s.font_xs().gray(INK_MID).line_height(1.3),
         );
-        let usb_card_content = t.add(Node::column(12), [usb_top, usb_sub]);
-        let usb_card_pad = t.pad(Insets::new(24, 28, 24, 28), usb_card_content);
+        let usb_card_content = t.add(
+            Node::column(if compact { 8 } else { 12 }),
+            [usb_top, usb_sub],
+        );
+        let usb_card_pad = t.pad(card_pad, usb_card_content);
         let usb_card = t.add(
             Node::column(0).bg(CARD).border(0, 0, 24).flex(1),
             [usb_card_pad],
         );
 
-        let cards_row = t.add(Node::row(24), [wifi_card, usb_card]);
+        let cards_row = t.add(
+            Node::row(if compact { 16 } else { 24 }),
+            [wifi_card, usb_card],
+        );
 
         // Supported formats section
         let formats_label = t.label(
@@ -681,25 +795,36 @@ impl ScanUi {
         let mut chips = Vec::new();
         for f in format_names {
             let label = t.label(f, s.font_xs().bold().line_height(1.0));
-            let pad = t.pad(Insets::new(0, 22, 0, 22), label);
+            let pad = t.pad(
+                Insets::new(
+                    0,
+                    if compact { 14 } else { 22 },
+                    0,
+                    if compact { 14 } else { 22 },
+                ),
+                label,
+            );
             // MinSize shrink-wraps the label and gives it the 64 px height;
             // a Fixed box would stretch the first chip across the row.
             let chip = t.add(
-                Node::new(Kind::MinSize(Size::new(0, 64)))
+                Node::new(Kind::MinSize(Size::new(0, if compact { 52 } else { 64 })))
                     .bg(PAPER)
                     .border(2, INK, 16),
                 [pad],
             );
             chips.push(chip);
         }
-        let chips_row = t.add(Node::row(14), chips);
-        let formats_col = t.add(Node::column(16), [formats_label, chips_row]);
+        let chips_row = t.add(Node::row(if compact { 10 } else { 14 }), chips);
+        let formats_col = t.add(
+            Node::column(if compact { 10 } else { 16 }),
+            [formats_label, chips_row],
+        );
 
-        let g1 = t.gap(1, 40);
-        let g2 = t.gap(1, 16);
-        let g3 = t.gap(1, 40);
-        let g4 = t.gap(1, 24);
-        let g5 = t.gap(1, 28);
+        let g1 = t.gap(1, if compact { 16 } else { 40 });
+        let g2 = t.gap(1, if compact { 10 } else { 16 });
+        let g3 = t.gap(1, if compact { 18 } else { 40 });
+        let g4 = t.gap(1, if compact { 14 } else { 24 });
+        let g5 = t.gap(1, if compact { 14 } else { 28 });
 
         // Group into centered column
         let body = t.add(
@@ -1455,6 +1580,7 @@ impl ScanUi {
         progress: f32,
         status: &str,
         scanned_books: &[ScannedBook],
+        compact: bool,
     ) -> (NodeId, NodeId) {
         // Progress Card
         let refresh_icon = t.icon(Icon::Refresh, 36, INK);
@@ -1490,12 +1616,12 @@ impl ScanUi {
             [status_label, status_spacer, pct_label],
         );
 
-        let g1 = t.gap(1, 16);
-        let g2 = t.gap(1, 8);
-        let g3 = t.gap(1, 32);
-        let g4 = t.gap(1, 10);
-        let g5 = t.gap(1, 24);
-        let g6 = t.gap(1, 14);
+        let g1 = t.gap(1, if compact { 10 } else { 16 });
+        let g2 = t.gap(1, if compact { 4 } else { 8 });
+        let g3 = t.gap(1, if compact { 14 } else { 32 });
+        let g4 = t.gap(1, if compact { 6 } else { 10 });
+        let g5 = t.gap(1, if compact { 12 } else { 24 });
+        let g6 = t.gap(1, if compact { 8 } else { 14 });
 
         let card_inner = t.add(
             Node::column(0),
@@ -1515,12 +1641,13 @@ impl ScanUi {
                 status_row,
             ],
         );
-        let card_pad = t.pad(Insets::all(32), card_inner);
+        let card_pad = t.pad(Insets::all(if compact { 20 } else { 32 }), card_inner);
         let card = t.add(Node::column(0).bg(CARD).border(0, 0, 32), [card_pad]);
 
         // Found books section
+        let limit = if compact { 3 } else { 5 };
         let found_books_title = t.label(tr(Msg::LibraryScanFoundBooks), s.font_sm().bold());
-        let first_n = scanned_books.len().min(5);
+        let first_n = scanned_books.len().min(limit);
         let first_str = tr(Msg::LibraryScanFirstBooks).replace("{count}", &first_n.to_string());
         let first_label = t.label(&first_str, s.font_xs().gray(INK_MID));
         let header_spacer = t.spacer(1);
@@ -1530,17 +1657,27 @@ impl ScanUi {
         );
 
         let mut book_rows = Vec::new();
-        for b in scanned_books.iter().take(5) {
+        for b in scanned_books.iter().take(limit) {
             let title = t.label(&b.title, s.font_sm().bold());
             let fmt = t.label(&b.format, s.font_xs().gray(INK_MID));
             let sp = t.spacer(1);
             let row = t.add(Node::row(20).cross(Cross::Center), [title, sp, fmt]);
-            let row_pad = t.pad(Insets::new(16, 24, 16, 24), row);
+            let row_pad = t.pad(
+                if compact {
+                    Insets::new(10, 20, 10, 20)
+                } else {
+                    Insets::new(16, 24, 16, 24)
+                },
+                row,
+            );
             let row_card = t.add(Node::column(0).bg(CARD).border(0, 0, 24), [row_pad]);
             book_rows.push(row_card);
         }
-        let books_col = t.add(Node::column(12), book_rows);
-        let list_section = t.add(Node::column(16), [section_header, books_col]);
+        let books_col = t.add(Node::column(if compact { 8 } else { 12 }), book_rows);
+        let list_section = t.add(
+            Node::column(if compact { 10 } else { 16 }),
+            [section_header, books_col],
+        );
 
         // Cancel button at bottom
         let cancel_text = t.label(tr(Msg::LibraryScanCancel), s.font_base());
@@ -1548,7 +1685,7 @@ impl ScanUi {
         let cancel_btn = t.add(
             Node::new(Kind::Fixed {
                 w: None,
-                h: Some(96),
+                h: Some(if compact { 80 } else { 96 }),
             })
             .bg(PAPER)
             .border(2, INK, 20)
@@ -1557,7 +1694,7 @@ impl ScanUi {
             [cancel_align],
         );
 
-        let gap_card = t.gap(1, 28);
+        let gap_card = t.gap(1, if compact { 14 } else { 28 });
         let bottom_spacer = t.spacer(1);
         let content = t.add(
             Node::column(0).flex(1),
@@ -1573,36 +1710,42 @@ impl ScanUi {
         tiles: &[ScanTile; 6],
         error: Option<&ScanError>,
         added_books: &[AddedBook],
+        compact: bool,
     ) -> NodeId {
-        // 6 Statistic Tiles (3 columns x 2 rows)
+        // 6 Statistic Tiles (3 columns x 2 rows). Use MinSize rather than Fixed
+        // so wrapped labels in Chinese/English never crush the value line.
+        let tile_min_h = if compact { 104 } else { 124 };
+        let tile_pad = if compact {
+            Insets::new(12, 16, 12, 16)
+        } else {
+            Insets::new(20, 24, 20, 24)
+        };
         let mut tile_nodes = Vec::new();
         for tile in tiles {
             let label = t.label(&tile.label, s.font_xs().gray(INK_MID));
             let val = t.label(&tile.value, s.font_md().bold());
-            let sp = t.spacer(1);
-            let col = t.add(Node::column(0).cross(Cross::Start), [label, sp, val]);
-            let pad = t.pad(Insets::new(20, 24, 20, 24), col);
+            let gap = t.gap(1, if compact { 4 } else { 8 });
+            let col = t.add(Node::column(0).cross(Cross::Start), [label, gap, val]);
+            let pad = t.pad(tile_pad, col);
             let tile_node = t.add(
-                Node::new(Kind::Fixed {
-                    w: None,
-                    h: Some(124),
-                })
-                .bg(CARD)
-                .border(0, CARD, 24)
-                .flex(1),
+                Node::new(Kind::MinSize(Size::new(0, tile_min_h)))
+                    .bg(CARD)
+                    .border(0, CARD, 24)
+                    .flex(1),
                 [pad],
             );
             tile_nodes.push(tile_node);
         }
+        let grid_gap = if compact { 12 } else { 16 };
         let row1 = t.add(
-            Node::row(16),
+            Node::row(grid_gap),
             vec![tile_nodes[0], tile_nodes[1], tile_nodes[2]],
         );
         let row2 = t.add(
-            Node::row(16),
+            Node::row(grid_gap),
             vec![tile_nodes[3], tile_nodes[4], tile_nodes[5]],
         );
-        let tiles_grid = t.add(Node::column(16), [row1, row2]);
+        let tiles_grid = t.add(Node::column(grid_gap), [row1, row2]);
 
         let mut parts = vec![tiles_grid];
 
@@ -1626,9 +1769,16 @@ impl ScanUi {
             let err_msg = t.label(&err_msg_str, s.font_sm().bold());
             let err_text_col = t.add(Node::column(4), [err_title, err_msg]);
             let err_row = t.add(Node::row(20).cross(Cross::Center), [mark_box, err_text_col]);
-            let err_pad = t.pad(Insets::new(22, 28, 22, 28), err_row);
+            let err_pad = t.pad(
+                if compact {
+                    Insets::new(14, 22, 14, 22)
+                } else {
+                    Insets::new(22, 28, 22, 28)
+                },
+                err_row,
+            );
             let err_card = t.add(Node::column(0).bg(CARD).border(0, 0, 24), [err_pad]);
-            let g = t.gap(1, 20);
+            let g = t.gap(1, if compact { 12 } else { 20 });
             parts.push(g);
             parts.push(err_card);
         }
@@ -1640,11 +1790,13 @@ impl ScanUi {
                 tr(Msg::LibraryScanAddedPreviewTitle).replace("{count}", &count_str);
             let preview_title = t.label(&preview_title_str, s.font_sm().bold());
 
+            let preview_limit = if compact { 2 } else { 4 };
+            let (cw, ch) = if compact { (72, 96) } else { (96, 128) };
             let mut book_rows = Vec::new();
-            for b in added_books.iter().take(4) {
+            for b in added_books.iter().take(preview_limit) {
                 let cover = Cover::new(&b.title, &b.author, s.family).with_image(b.cover.clone());
                 let cover_node = t.custom(cover);
-                let cover_box = t.fixed(Some(96), Some(128), Some(cover_node));
+                let cover_box = t.fixed(Some(cw), Some(ch), Some(cover_node));
 
                 let title = t.label(&b.title, s.font_sm().bold());
                 let meta_str = format!("{} · {}", b.author, b.format);
@@ -1654,14 +1806,18 @@ impl ScanUi {
                 let row = t.add(Node::row(20).cross(Cross::Center), [cover_box, info_col]);
                 book_rows.push(row);
             }
-            let books_col = t.add(Node::column(12), book_rows);
-            let preview_section = t.add(Node::column(16), [preview_title, books_col]);
-            let g = t.gap(1, 24);
+            let books_col = t.add(Node::column(if compact { 8 } else { 12 }), book_rows);
+            let preview_section = t.add(
+                Node::column(if compact { 10 } else { 16 }),
+                [preview_title, books_col],
+            );
+            let g = t.gap(1, if compact { 12 } else { 24 });
             parts.push(g);
             parts.push(preview_section);
         }
 
         // Bottom two buttons: View Library (black) & Rescan (outline)
+        let btn_h = if compact { 80 } else { 96 };
         let view_text = t.label(
             tr(Msg::LibraryScanViewLibrary),
             s.font_base().bold().gray(PAPER),
@@ -1670,7 +1826,7 @@ impl ScanUi {
         let view_btn = t.add(
             Node::new(Kind::Fixed {
                 w: None,
-                h: Some(96),
+                h: Some(btn_h),
             })
             .bg(INK)
             .border(0, INK, 20)
@@ -1685,7 +1841,7 @@ impl ScanUi {
         let rescan_btn = t.add(
             Node::new(Kind::Fixed {
                 w: None,
-                h: Some(96),
+                h: Some(btn_h),
             })
             .bg(PAPER)
             .border(2, INK, 20)
@@ -1722,6 +1878,7 @@ mod tests {
             action::VIEW_LIBRARY,
             action::RESCAN,
             action::CLOUD_LIBRARY,
+            action::WEREAD_LIBRARY,
             action::CHOOSE_SCOPE,
             action::SCAN_SCOPE,
             action::SCOPE_PARENT,

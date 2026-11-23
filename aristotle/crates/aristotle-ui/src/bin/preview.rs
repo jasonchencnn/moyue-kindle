@@ -31,9 +31,11 @@ use aristotle_ui::screens::cloud::{
 };
 use aristotle_ui::screens::coming_soon as soon_screen;
 use aristotle_ui::screens::home as home_screen;
+use aristotle_ui::screens::jianguoyun_login as jianguoyun_login_screen;
+use aristotle_ui::screens::jianguoyun_shelf as jianguoyun_shelf_screen;
 use aristotle_ui::screens::library::{
-    self, sample_items, CoverMode, Filter, Item, Library, LibraryLayout, Place, Shelf, StatusLine,
-    View,
+    self, sample_items, ChannelVisibility, CoverMode, Filter, Item, Library, LibraryLayout, Place,
+    Shelf, StatusLine, View,
 };
 use aristotle_ui::screens::marks as marks_screen;
 use aristotle_ui::screens::mine as mine_screen;
@@ -46,6 +48,8 @@ use aristotle_ui::screens::search::{build_search_screen, SearchIndex};
 use aristotle_ui::screens::settings::{self as settings_screen, BatteryInfo, SystemView, Usb};
 use aristotle_ui::screens::sleep;
 use aristotle_ui::screens::sleep_images as sleep_images_screen;
+use aristotle_ui::screens::weread_login as weread_login_screen;
+use aristotle_ui::screens::weread_shelf as weread_shelf_screen;
 use aristotle_ui::screens::wifi as wifi_screen;
 use aristotle_ui::status::{self, Loading};
 use aristotle_ui::text::{
@@ -111,19 +115,22 @@ fn node_label(tree: &Tree, id: NodeId) -> String {
 }
 
 /// Checks one laid-out screen: every visible node on the screen, no text
-/// outside the card that holds it, nothing drawn at zero size, and no
-/// touch target under 64 px.
+/// outside the card that holds it, no sibling overlap inside non-stack
+/// containers, nothing drawn at zero size, and no touch target under
+/// `MIN_TARGET` reference pixels (scaled to the panel's density).
 fn qa_check(ui: &Ui, screen: &str) {
     let Some(root) = ui.tree.root() else {
         return;
     };
     let bounds = ui.bounds();
+    let min_target = ui.profile().density.px(MIN_TARGET);
     let mut findings = Vec::new();
     fn walk(
         tree: &Tree,
         id: NodeId,
         card: Option<Rect>,
         bounds: Rect,
+        min_target: i32,
         screen: &str,
         findings: &mut Vec<String>,
     ) {
@@ -149,9 +156,9 @@ fn qa_check(ui: &Ui, screen: &str) {
                 }
             }
         }
-        if node.action.is_some() && (rect.w < MIN_TARGET || rect.h < MIN_TARGET) {
+        if node.action.is_some() && (rect.w < min_target || rect.h < min_target) {
             findings.push(format!(
-                "{screen}\ttarget\t{here} at ({}, {}) is {}x{}",
+                "{screen}\ttarget\t{here} at ({}, {}) is {}x{} (min {min_target})",
                 rect.x, rect.y, rect.w, rect.h
             ));
         }
@@ -173,16 +180,75 @@ fn qa_check(ui: &Ui, screen: &str) {
                 rect.x, rect.y, rect.w, rect.h
             ));
         }
+        // Direct children of sequential containers must not overlap each other
+        // or spill outside the container's own bounds (which happens when a
+        // child ignores constraints or a Pages/Column overflows into a footer).
+        if matches!(
+            node.kind,
+            Kind::Row { .. } | Kind::Column { .. } | Kind::Pages { .. }
+        ) {
+            let visible_children: Vec<(NodeId, Rect)> = node
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| tree.is_visible(c))
+                .map(|c| (c, tree.rect(c)))
+                .filter(|(_, r)| !r.is_empty())
+                .collect();
+            for (i, &(a_id, a_rect)) in visible_children.iter().enumerate() {
+                if !rect.is_empty() && !rect.contains_rect(&a_rect) {
+                    findings.push(format!(
+                        "{screen}\tcontainer-overflow\t{} at ({}, {}) {}x{} outside parent ({}, {}) {}x{}",
+                        node_label(tree, a_id),
+                        a_rect.x,
+                        a_rect.y,
+                        a_rect.w,
+                        a_rect.h,
+                        rect.x,
+                        rect.y,
+                        rect.w,
+                        rect.h,
+                    ));
+                }
+                for &(b_id, b_rect) in &visible_children[i + 1..] {
+                    if let Some(inter) = a_rect.intersect(&b_rect) {
+                        findings.push(format!(
+                            "{screen}\toverlap\t{} at ({}, {}) {}x{} overlaps {} at ({}, {}) {}x{} by {}x{}",
+                            node_label(tree, a_id),
+                            a_rect.x,
+                            a_rect.y,
+                            a_rect.w,
+                            a_rect.h,
+                            node_label(tree, b_id),
+                            b_rect.x,
+                            b_rect.y,
+                            b_rect.w,
+                            b_rect.h,
+                            inter.w,
+                            inter.h,
+                        ));
+                    }
+                }
+            }
+        }
         let card = if node.bg.is_some() || node.border.is_some() {
             Some(rect)
         } else {
             card
         };
         for &child in &node.children {
-            walk(tree, child, card, bounds, screen, findings);
+            walk(tree, child, card, bounds, min_target, screen, findings);
         }
     }
-    walk(&ui.tree, root, None, bounds, screen, &mut findings);
+    walk(
+        &ui.tree,
+        root,
+        None,
+        bounds,
+        min_target,
+        screen,
+        &mut findings,
+    );
     if let Ok(mut all) = qa_findings().lock() {
         all.extend(findings);
     }
@@ -471,7 +537,30 @@ fn shelf_ui(profile: Screen, shelf: &Shelf) -> (Ui, Library) {
     let size = Size::new(profile.width as i32, profile.height as i32);
     let mut text = TextEngine::new(fonts());
     let styles = Styles::new(FamilyId(0)).with_density(profile.density);
-    let (tree, lib) = Library::build_shelf_for_width(&mut text, &styles, shelf, size.w);
+    let (tree, lib) = Library::build_shelf_for_size(&mut text, &styles, shelf, size);
+    let mut ui = Ui::with_screen(tree, text, profile);
+    ui.layout();
+    lib.sync(&mut ui.tree);
+    (ui, lib)
+}
+
+/// The same shelf with every cloud channel turned on: Local, Readest, WeRead
+/// and Nutstore share the segmented control.
+fn shelf_ui_all_channels(profile: Screen, shelf: &Shelf) -> (Ui, Library) {
+    let size = Size::new(profile.width as i32, profile.height as i32);
+    let mut text = TextEngine::new(fonts());
+    let styles = Styles::new(FamilyId(0)).with_density(profile.density);
+    let (tree, lib) = Library::build_shelf_with_channels(
+        &mut text,
+        &styles,
+        shelf,
+        size,
+        ChannelVisibility {
+            readest: true,
+            weread: true,
+            jianguoyun: true,
+        },
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     lib.sync(&mut ui.tree);
@@ -528,8 +617,7 @@ fn with_covers(books: &mut [library::Book], indexes: &[usize]) {
     }
 }
 
-/// The books the home screen shows: the ones of the reference screenshot,
-/// so the shots can be compared with it pixel by pixel.
+/// The books the home screen shows: mixed origin channels matching real usage.
 fn home_books() -> Vec<library::Book> {
     let mut reading = library::Book::new("红楼梦", "曹雪芹", 0.43);
     reading.chapter = "第七回".into();
@@ -538,8 +626,8 @@ fn home_books() -> Vec<library::Book> {
     reading.minutes_left = Some(742);
     let mut books = vec![
         reading,
-        library::Book::new("西游记", "吴承恩", 0.68),
-        library::Book::new("呐喊", "鲁迅", 0.15),
+        library::Book::new("西游记", "吴承恩", 0.68).with_source(library::BookSource::Readest),
+        library::Book::new("呐喊", "鲁迅", 0.15).with_source(library::BookSource::WeRead),
         library::Book::new("傲慢与偏见", "简·奥斯汀", 0.91),
     ];
     // Two books have a cover of their own; the other two keep the generated
@@ -552,12 +640,24 @@ fn home_books() -> Vec<library::Book> {
 fn prototype_books() -> Vec<library::Book> {
     let mut books = vec![
         library::Book::new("红楼梦", "曹雪芹", 0.43).with_format("EPUB"),
-        library::Book::new("西游记", "吴承恩", 0.68).with_format("EPUB"),
-        library::Book::new("呐喊", "鲁迅", 0.15).with_format("TXT"),
-        library::Book::new("傲慢与偏见", "简·奥斯汀", 1.0).with_format("EPUB"),
-        library::Book::new("三国演义", "罗贯中", 0.0).with_format("MOBI"),
-        library::Book::new("骆驼祥子", "老舍", 0.07).with_format("EPUB"),
-        library::Book::new("朝花夕拾", "鲁迅", 0.0).with_format("PDF"),
+        library::Book::new("西游记", "吴承恩", 0.68)
+            .with_format("EPUB")
+            .with_source(library::BookSource::Readest),
+        library::Book::new("呐喊", "鲁迅", 0.15)
+            .with_format("TXT")
+            .with_source(library::BookSource::WeRead),
+        library::Book::new("傲慢与偏见", "简·奥斯汀", 1.0)
+            .with_format("EPUB")
+            .with_source(library::BookSource::Readest),
+        library::Book::new("三国演义", "罗贯中", 0.0)
+            .with_format("MOBI")
+            .with_source(library::BookSource::WeRead),
+        library::Book::new("骆驼祥子", "老舍", 0.07)
+            .with_format("EPUB")
+            .with_source(library::BookSource::Local),
+        library::Book::new("朝花夕拾", "鲁迅", 0.0)
+            .with_format("PDF")
+            .with_source(library::BookSource::Local),
     ];
     with_covers(&mut books, &[0, 1, 3]);
     books
@@ -641,7 +741,12 @@ fn section_screens(profile: Screen, out: &Path) {
         quote: Some(quote),
         pet: true,
     };
-    let (tree, ids) = home_screen::HomeUi::build(&mut text, &styles, &home, profile.width as i32);
+    let (tree, ids) = home_screen::HomeUi::build_for_size(
+        &mut text,
+        &styles,
+        &home,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     ids.place_pet(&mut ui.tree);
@@ -662,7 +767,12 @@ fn section_screens(profile: Screen, out: &Path) {
         quote: Some(quote),
         pet: true,
     };
-    let (tree, ids) = home_screen::HomeUi::build(&mut text, &styles, &home, profile.width as i32);
+    let (tree, ids) = home_screen::HomeUi::build_for_size(
+        &mut text,
+        &styles,
+        &home,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     ids.place_pet(&mut ui.tree);
@@ -689,8 +799,12 @@ fn section_screens(profile: Screen, out: &Path) {
             quote: Some(quote),
             pet: true,
         };
-        let (tree, ids) =
-            home_screen::HomeUi::build(&mut text, &styles, &home, profile.width as i32);
+        let (tree, ids) = home_screen::HomeUi::build_for_size(
+            &mut text,
+            &styles,
+            &home,
+            Size::new(profile.width as i32, profile.height as i32),
+        );
         let mut ui = Ui::with_screen(tree, text, profile);
         ui.layout();
         ids.place_pet(&mut ui.tree);
@@ -715,8 +829,12 @@ fn section_screens(profile: Screen, out: &Path) {
             quote: quote_on.then_some(quote),
             pet: pet_on,
         };
-        let (tree, ids) =
-            home_screen::HomeUi::build(&mut text, &styles, &home, profile.width as i32);
+        let (tree, ids) = home_screen::HomeUi::build_for_size(
+            &mut text,
+            &styles,
+            &home,
+            Size::new(profile.width as i32, profile.height as i32),
+        );
         let mut ui = Ui::with_screen(tree, text, profile);
         ui.layout();
         ids.place_pet(&mut ui.tree);
@@ -735,7 +853,12 @@ fn section_screens(profile: Screen, out: &Path) {
         quote: Some(quote),
         pet: true,
     };
-    let (tree, ids) = home_screen::HomeUi::build(&mut text, &styles, &home, profile.width as i32);
+    let (tree, ids) = home_screen::HomeUi::build_for_size(
+        &mut text,
+        &styles,
+        &home,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     ids.place_pet(&mut ui.tree);
@@ -743,7 +866,12 @@ fn section_screens(profile: Screen, out: &Path) {
 
     let mut text = TextEngine::new(fonts());
     let mine = mine_screen::sample(STATUS);
-    let (tree, _ids) = mine_screen::MineUi::build(&mut text, &styles, &mine);
+    let (tree, _ids) = mine_screen::MineUi::build_for_size(
+        &mut text,
+        &styles,
+        &mine,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     day_night(&mut ui, out, "mine");
@@ -774,7 +902,12 @@ fn section_screens(profile: Screen, out: &Path) {
     // The quotation library screen.
     let mut text = TextEngine::new(fonts());
     let quote_screen = quotes_screen::sample(STATUS);
-    let (tree, _ids) = quotes_screen::QuoteUi::build(&mut text, &styles, &quote_screen);
+    let (tree, _ids) = quotes_screen::QuoteUi::build_for_size(
+        &mut text,
+        &styles,
+        &quote_screen,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     day_night(&mut ui, out, "quotelibrary");
@@ -843,8 +976,12 @@ fn status_screens(profile: Screen, out: &Path) {
             quote: Some(quote),
             pet: true,
         };
-        let (tree, ids) =
-            home_screen::HomeUi::build(&mut text, &styles, &home, profile.width as i32);
+        let (tree, ids) = home_screen::HomeUi::build_for_size(
+            &mut text,
+            &styles,
+            &home,
+            Size::new(profile.width as i32, profile.height as i32),
+        );
         let mut ui = Ui::with_screen(tree, text, profile);
         status::set_loading(&mut ui.tree, &ids.loading, Some(&loading));
         ui.layout();
@@ -875,7 +1012,12 @@ fn status_screens(profile: Screen, out: &Path) {
     // The "mine" page, with a book being laid out.
     let mut text = TextEngine::new(fonts());
     let mine = mine_screen::sample(STATUS);
-    let (tree, ids) = mine_screen::MineUi::build(&mut text, &styles, &mine);
+    let (tree, ids) = mine_screen::MineUi::build_for_size(
+        &mut text,
+        &styles,
+        &mine,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     status::set_loading(&mut ui.tree, &ids.loading, Some(&loading));
     ui.layout();
@@ -947,7 +1089,12 @@ fn calendar_screens(profile: Screen, out: &Path) {
     if let Some(book) = cal.books.first_mut() {
         book.cover = Some(sample_cover(1));
     }
-    let (tree, _ids) = calendar_screen::CalendarUi::build(&mut text, &styles, &cal);
+    let (tree, _ids) = calendar_screen::CalendarUi::build_for_size(
+        &mut text,
+        &styles,
+        &cal,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     day_night(&mut ui, out, "calendar");
@@ -1086,6 +1233,408 @@ fn cloud_screens(profile: Screen, out: &Path) {
     day_night(&mut ui, out, "cloud-downloaded");
 }
 
+/// A WeRead shelf in a fresh `Ui`, laid out and synced.
+fn weread_shelf_ui(
+    profile: Screen,
+    view: &weread_shelf_screen::WereadShelfView,
+) -> (Ui, weread_shelf_screen::WereadShelfUi) {
+    let size = Size::new(profile.width as i32, profile.height as i32);
+    let mut text = TextEngine::new(fonts());
+    let styles = Styles::new(FamilyId(0)).with_density(profile.density);
+    let (tree, shelf) =
+        weread_shelf_screen::WereadShelfView::build_for_width(&mut text, &styles, view, size.w);
+    let mut ui = Ui::with_screen(tree, text, profile);
+    ui.layout();
+    shelf.sync(&mut ui.tree);
+    (ui, shelf)
+}
+
+fn weread_view<'a>(
+    signed_in: bool,
+    filter: weread_shelf_screen::WereadFilter,
+    loading: bool,
+    message: Option<&'a str>,
+    books: &'a [weread_shelf_screen::WereadBook],
+) -> weread_shelf_screen::WereadShelfView<'a> {
+    weread_shelf_screen::WereadShelfView {
+        status: STATUS,
+        signed_in,
+        book_count: if signed_in { books.len() } else { 0 },
+        local_books_count: 128,
+        last_sync: signed_in.then_some("21:30"),
+        filter,
+        loading,
+        message,
+        page: 0,
+        books,
+    }
+}
+
+fn weread_book(
+    title: &str,
+    subtitle: &str,
+    progress: i64,
+    archive: bool,
+) -> weread_shelf_screen::WereadBook {
+    weread_shelf_screen::WereadBook {
+        id: title.to_string(),
+        title: title.to_string(),
+        format: subtitle.to_string(),
+        progress: Some(progress),
+        finished: false,
+        archive,
+        secret: false,
+        download: weread_shelf_screen::WereadDownloadState::NotDownloaded,
+    }
+}
+
+fn weread_book_downloading(
+    title: &str,
+    subtitle: &str,
+    progress: i64,
+    percent: u8,
+) -> weread_shelf_screen::WereadBook {
+    let mut book = weread_book(title, subtitle, progress, false);
+    book.download = weread_shelf_screen::WereadDownloadState::Downloading { percent };
+    book
+}
+
+fn weread_book_downloaded(
+    title: &str,
+    subtitle: &str,
+    progress: i64,
+) -> weread_shelf_screen::WereadBook {
+    let mut book = weread_book(title, subtitle, progress, false);
+    book.download = weread_shelf_screen::WereadDownloadState::Downloaded;
+    book
+}
+
+fn weread_book_failed(
+    title: &str,
+    subtitle: &str,
+    progress: i64,
+) -> weread_shelf_screen::WereadBook {
+    let mut book = weread_book(title, subtitle, progress, false);
+    book.download = weread_shelf_screen::WereadDownloadState::Failed;
+    book
+}
+
+fn weread_login_ui(profile: Screen, state: &weread_login_screen::WereadLoginState) -> Ui {
+    let text = TextEngine::new(fonts());
+    let styles = Styles::new(FamilyId(0)).with_density(profile.density);
+    let mut tree = Tree::new();
+    let (root, _) =
+        weread_login_screen::build_weread_login_screen(&mut tree, &styles, state, &STATUS);
+    tree.set_root(root);
+    let mut ui = Ui::with_screen(tree, text, profile);
+    ui.layout();
+    ui
+}
+
+fn jianguoyun_shelf_ui(
+    profile: Screen,
+    view: &jianguoyun_shelf_screen::JianguoyunShelfView,
+) -> (Ui, jianguoyun_shelf_screen::JianguoyunShelfUi) {
+    let size = Size::new(profile.width as i32, profile.height as i32);
+    let mut text = TextEngine::new(fonts());
+    let styles = Styles::new(FamilyId(0)).with_density(profile.density);
+    let (tree, shelf) = jianguoyun_shelf_screen::JianguoyunShelfView::build_for_width(
+        &mut text, &styles, view, size.w,
+    );
+    let mut ui = Ui::with_screen(tree, text, profile);
+    ui.layout();
+    shelf.sync(&mut ui.tree);
+    (ui, shelf)
+}
+
+fn jianguoyun_login_ui(
+    profile: Screen,
+    state: &jianguoyun_login_screen::JianguoyunLoginState,
+) -> Ui {
+    let text = TextEngine::new(fonts());
+    let styles = Styles::new(FamilyId(0)).with_density(profile.density);
+    let mut tree = Tree::new();
+    let root =
+        jianguoyun_login_screen::build_jianguoyun_login_screen(&mut tree, &styles, state, &STATUS);
+    tree.set_root(root);
+    let mut ui = Ui::with_screen(tree, text, profile);
+    ui.layout();
+    ui
+}
+
+fn jianguoyun_view<'a>(
+    configured: bool,
+    filter: jianguoyun_shelf_screen::JianguoyunFilter,
+    current_dir: &'a str,
+    entries: &'a [jianguoyun_shelf_screen::JianguoyunEntry],
+) -> jianguoyun_shelf_screen::JianguoyunShelfView<'a> {
+    jianguoyun_shelf_screen::JianguoyunShelfView {
+        status: STATUS,
+        configured,
+        account: configured.then_some("anna@example.com"),
+        current_dir,
+        book_count: entries.len(),
+        local_books_count: 128,
+        last_sync: configured.then_some("21:30"),
+        filter,
+        loading: false,
+        message: None,
+        entries,
+    }
+}
+
+fn jianguoyun_book(
+    path: &str,
+    name: &str,
+    format: &str,
+    size: u64,
+) -> jianguoyun_shelf_screen::JianguoyunEntry {
+    jianguoyun_shelf_screen::JianguoyunEntry::book(path, name, format, size)
+}
+
+fn jianguoyun_folder(path: &str, name: &str) -> jianguoyun_shelf_screen::JianguoyunEntry {
+    jianguoyun_shelf_screen::JianguoyunEntry::folder(path, name)
+}
+
+fn jianguoyun_screens(profile: Screen, out: &Path) {
+    // The account setup screen: empty, filled in, and refused.
+    let mut state = jianguoyun_login_screen::JianguoyunLoginState::new();
+    let mut ui = jianguoyun_login_ui(profile, &state);
+    day_night(&mut ui, out, "jianguoyun-login");
+
+    state.email = "anna@example.com".to_string();
+    state.password = "app-password".to_string();
+    state.remote_dir = "Books".to_string();
+    state.switch_field(jianguoyun_login_screen::JianguoyunLoginField::Email);
+    state.keyboard.committed = "anna@example.com".to_string();
+    let mut ui = jianguoyun_login_ui(profile, &state);
+    day_night(&mut ui, out, "jianguoyun-login-filled");
+
+    let mut failed = jianguoyun_login_screen::JianguoyunLoginState::new();
+    failed.email = "anna@example.com".to_string();
+    failed.handle_action(jianguoyun_login_screen::action::SUBMIT);
+    let mut ui = jianguoyun_login_ui(profile, &failed);
+    day_night(&mut ui, out, "jianguoyun-login-error");
+
+    // The shelf: not configured, then a folder with folders and books.
+    let empty: Vec<jianguoyun_shelf_screen::JianguoyunEntry> = Vec::new();
+    let (mut ui, _) = jianguoyun_shelf_ui(
+        profile,
+        &jianguoyun_view(
+            false,
+            jianguoyun_shelf_screen::JianguoyunFilter::All,
+            "",
+            &empty,
+        ),
+    );
+    day_night(&mut ui, out, "jianguoyun-shelf-unconfigured");
+
+    let entries = vec![
+        jianguoyun_folder("Books/Novels", "Novels"),
+        jianguoyun_folder("Books/History", "History"),
+        jianguoyun_book("Books/dune.epub", "Dune", "EPUB", 1_204_221),
+        jianguoyun_book("Books/sapiens.epub", "Sapiens", "EPUB", 2_310_412),
+        jianguoyun_book("Books/the-prince.epub", "The Prince", "EPUB", 312_004),
+    ];
+    let (mut ui, _) = jianguoyun_shelf_ui(
+        profile,
+        &jianguoyun_view(
+            true,
+            jianguoyun_shelf_screen::JianguoyunFilter::All,
+            "Books",
+            &entries,
+        ),
+    );
+    day_night(&mut ui, out, "jianguoyun-shelf");
+
+    // The same folder with a download running and one that failed.
+    let mut downloading = entries.clone();
+    downloading[2].download =
+        jianguoyun_shelf_screen::JianguoyunDownloadState::Downloading { percent: 47 };
+    downloading[3].download = jianguoyun_shelf_screen::JianguoyunDownloadState::Downloaded;
+    downloading[4].download = jianguoyun_shelf_screen::JianguoyunDownloadState::Failed;
+    let (mut ui, _) = jianguoyun_shelf_ui(
+        profile,
+        &jianguoyun_view(
+            true,
+            jianguoyun_shelf_screen::JianguoyunFilter::All,
+            "Books",
+            &downloading,
+        ),
+    );
+    day_night(&mut ui, out, "jianguoyun-shelf-downloads");
+}
+
+fn weread_screens(profile: Screen, out: &Path) {
+    let mut state = weread_login_screen::WereadLoginState::new();
+    let generation = state.restart();
+    state.set_code(
+        generation,
+        "https://open.weixin.qq.com/connect/confirm?uuid=sample-uuid-0000000000000000",
+    );
+    let mut ui = weread_login_ui(profile, &state);
+    day_night(&mut ui, out, "weread-login");
+
+    state.set_phase(generation, weread_login_screen::WereadLoginPhase::Scanned);
+    let mut ui = weread_login_ui(profile, &state);
+    day_night(&mut ui, out, "weread-login-scanned");
+
+    let mut failed = weread_login_screen::WereadLoginState::new();
+    let generation = failed.restart();
+    failed.fail(generation, tr(Msg::WereadErrNetwork).to_string());
+    let mut ui = weread_login_ui(profile, &failed);
+    day_night(&mut ui, out, "weread-login-failed");
+
+    let mut web = weread_login_screen::WereadLoginState::new();
+    web.begin_web(1);
+    web.set_web_code(
+        1,
+        "https://weread.qq.com/web/confirm?uid=sample-uid-0000000000",
+    );
+    let mut ui = weread_login_ui(profile, &web);
+    day_night(&mut ui, out, "weread-login-web");
+
+    web.set_web_phase(1, weread_login_screen::WereadWebPhase::NeedOtp, "12");
+    let mut ui = weread_login_ui(profile, &web);
+    day_night(&mut ui, out, "weread-login-web-otp");
+
+    web.set_web_phase(1, weread_login_screen::WereadWebPhase::Expired, "");
+    let mut ui = weread_login_ui(profile, &web);
+    day_night(&mut ui, out, "weread-login-web-expired");
+
+    let books = [
+        weread_book("红楼梦", "曹雪芹", 43, false),
+        weread_book("水浒传", "施耐庵", 26, true),
+        weread_book("聊斋志异", "蒲松龄", 58, false),
+        weread_book("傲慢与偏见", "简·奥斯汀", 81, true),
+        weread_book("儒林外史", "吴敬梓", 12, false),
+        weread_book("镜花缘", "李汝珍", 0, false),
+    ];
+
+    let (mut ui, _) = weread_shelf_ui(
+        profile,
+        &weread_view(
+            true,
+            weread_shelf_screen::WereadFilter::All,
+            false,
+            None,
+            &books,
+        ),
+    );
+    day_night(&mut ui, out, "weread-shelf");
+
+    let downloading = [
+        weread_book_downloading("红楼梦", "曹雪芹", 43, 12),
+        weread_book_downloading("水浒传", "施耐庵", 26, 47),
+        weread_book_downloading("聊斋志异", "蒲松龄", 58, 91),
+    ];
+    let (mut ui, _) = weread_shelf_ui(
+        profile,
+        &weread_view(
+            true,
+            weread_shelf_screen::WereadFilter::All,
+            false,
+            None,
+            &downloading,
+        ),
+    );
+    day_night(&mut ui, out, "weread-shelf-downloading");
+
+    let downloaded = [
+        weread_book_downloaded("红楼梦", "曹雪芹", 43),
+        weread_book_downloaded("水浒传", "施耐庵", 26),
+        weread_book_downloaded("聊斋志异", "蒲松龄", 58),
+    ];
+    let (mut ui, _) = weread_shelf_ui(
+        profile,
+        &weread_view(
+            true,
+            weread_shelf_screen::WereadFilter::All,
+            false,
+            None,
+            &downloaded,
+        ),
+    );
+    day_night(&mut ui, out, "weread-shelf-downloaded");
+
+    let failed = [
+        weread_book_failed("红楼梦", "曹雪芹", 43),
+        weread_book_failed("水浒传", "施耐庵", 26),
+        weread_book_failed("聊斋志异", "蒲松龄", 58),
+    ];
+    let (mut ui, _) = weread_shelf_ui(
+        profile,
+        &weread_view(
+            true,
+            weread_shelf_screen::WereadFilter::All,
+            false,
+            None,
+            &failed,
+        ),
+    );
+    day_night(&mut ui, out, "weread-shelf-failed-download");
+
+    let (mut ui, _) = weread_shelf_ui(
+        profile,
+        &weread_view(
+            true,
+            weread_shelf_screen::WereadFilter::All,
+            false,
+            None,
+            &[],
+        ),
+    );
+    day_night(&mut ui, out, "weread-shelf-empty");
+
+    let (mut ui, _) = weread_shelf_ui(
+        profile,
+        &weread_view(
+            true,
+            weread_shelf_screen::WereadFilter::All,
+            true,
+            None,
+            &[],
+        ),
+    );
+    day_night(&mut ui, out, "weread-shelf-loading");
+
+    let (mut ui, _) = weread_shelf_ui(
+        profile,
+        &weread_view(
+            true,
+            weread_shelf_screen::WereadFilter::All,
+            false,
+            Some(tr(Msg::WereadErrNetwork)),
+            &books,
+        ),
+    );
+    day_night(&mut ui, out, "weread-shelf-failed");
+
+    let (mut ui, _) = weread_shelf_ui(
+        profile,
+        &weread_view(
+            false,
+            weread_shelf_screen::WereadFilter::All,
+            false,
+            None,
+            &[],
+        ),
+    );
+    day_night(&mut ui, out, "weread-shelf-logged-out");
+
+    let (mut ui, _) = weread_shelf_ui(
+        profile,
+        &weread_view(
+            true,
+            weread_shelf_screen::WereadFilter::Lists,
+            false,
+            None,
+            &books,
+        ),
+    );
+    day_night(&mut ui, out, "weread-shelf-lists");
+}
+
 /// The library with the book's actions sheet open: the menu, the details
 /// of the book, and the question before the local file is deleted.
 fn library_actions(profile: Screen, out: &Path) {
@@ -1109,7 +1658,7 @@ fn library_actions(profile: Screen, out: &Path) {
         layout: LibraryLayout::List,
         local_books_count: all.len(),
     };
-    let (tree, lib) = Library::build_shelf_for_width(&mut text, &styles, &shelf, size.w);
+    let (tree, lib) = Library::build_shelf_for_size(&mut text, &styles, &shelf, size);
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     ui.render();
@@ -1202,6 +1751,24 @@ fn library_screens(profile: Screen, out: &Path) {
     };
 
     let all = sample_items(&books, View::Books);
+    // Every cloud channel on: the four-cell segmented control.
+    {
+        let shelf = Shelf {
+            place: Place::Home {
+                view: View::Books,
+                filter: Filter::All,
+            },
+            hero: None,
+            items: &all,
+            sort: tr(Msg::LibrarySortRecent),
+            status: STATUS,
+            covers: CoverMode::Cards,
+            layout: LibraryLayout::List,
+            local_books_count: 128,
+        };
+        let (mut ui, _lib) = shelf_ui_all_channels(profile, &shelf);
+        day_night(&mut ui, out, "library-four-channels");
+    }
     let (mut ui, mut lib) = home(
         View::Books,
         Filter::All,
@@ -1520,7 +2087,12 @@ fn wifi_screens(profile: Screen, out: &Path) {
         running: true,
     };
     let mut text = TextEngine::new(fonts());
-    let (tree, _) = wifi_screen::WifiUi::build(&mut text, &styles, &screen);
+    let (tree, _) = wifi_screen::WifiUi::build_for_size(
+        &mut text,
+        &styles,
+        &screen,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     day_night(&mut ui, out, "wifitransfer");
@@ -1567,6 +2139,13 @@ fn settings_screens(profile: Screen, out: &Path) {
         wifi_transfer: "未开启",
         account: None,
         sleep_screen_cover: false,
+        enable_readest: true,
+        enable_weread: true,
+        enable_jianguoyun: true,
+        jianguoyun_account: Some("anna@example.com"),
+        weread_readtime: true,
+        weread_readtime_note: Some((tr(Msg::SettingsWereadReadtimePaused), true)),
+        weread_notes: Some((2, 12, 4)),
     };
     let mut text = TextEngine::new(fonts());
     let styles = Styles::new(FamilyId(0)).with_density(profile.density);
@@ -1853,7 +2432,11 @@ fn sleep_images_screens(profile: Screen, out: &Path) {
         page: 0,
         pages: 2,
     };
-    let (tree, _) = sleep_images_screen::build(&styles, &view, profile.width as i32);
+    let (tree, _) = sleep_images_screen::build_for_size(
+        &styles,
+        &view,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, TextEngine::new(fonts()), profile);
     ui.layout();
     day_night(&mut ui, out, "sleep-images");
@@ -1872,7 +2455,11 @@ fn sleep_images_screens(profile: Screen, out: &Path) {
         page: 0,
         pages: 2,
     };
-    let (tree, _) = sleep_images_screen::build(&styles, &view, profile.width as i32);
+    let (tree, _) = sleep_images_screen::build_for_size(
+        &styles,
+        &view,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, TextEngine::new(fonts()), profile);
     ui.layout();
     day_night(&mut ui, out, "sleep-images-picked");
@@ -1888,7 +2475,11 @@ fn sleep_images_screens(profile: Screen, out: &Path) {
         page: 0,
         pages: 1,
     };
-    let (tree, _) = sleep_images_screen::build(&styles, &view, profile.width as i32);
+    let (tree, _) = sleep_images_screen::build_for_size(
+        &styles,
+        &view,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, TextEngine::new(fonts()), profile);
     ui.layout();
     day_night(&mut ui, out, "sleep-images-empty");
@@ -2323,7 +2914,7 @@ fn reader_screens(profile: Screen, out: &Path, fonts_dir: &Path) {
 fn typeset_screens(profile: Screen, out: &Path, fonts_dir: &Path) {
     use aristotle_ui::screens::typeset::{self, FontOption, TypesetView};
     let is_zh = aristotle_i18n::language() == "zh";
-    let (text, [lit, charis, gentium]) = engine(fonts_dir);
+    let (mut text, [lit, charis, gentium]) = engine(fonts_dir);
     let styles = Styles::new(lit).with_density(profile.density);
 
     let view = TypesetView {
@@ -2358,13 +2949,23 @@ fn typeset_screens(profile: Screen, out: &Path, fonts_dir: &Path) {
         script_index: 0,    // 简体
         gap_index: 2,       // 大 (0.6)
         underline_index: 0, // 无
-        trim_index: 0,      // 开
+        underline_scope: 0, // 文字划线
+        fine_typesetting: true,
+        font_weight: 400, // 正常
+        trim_index: 0,    // 开
         anim_enabled: false,
-        anim_speed: 1, // 标准
+        anim_speed: 1,   // 标准
+        writing_mode: 0, // 横排
     };
 
     let mut tree = Tree::new();
-    let (root, _) = typeset::build_typeset_screen(&mut tree, &styles, &view);
+    let (root, _) = typeset::build_typeset_screen_for_size(
+        &mut tree,
+        &mut text,
+        &styles,
+        &view,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     tree.set_root(root);
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
@@ -2489,6 +3090,13 @@ fn targets(profile: Screen, out: &Path) {
         wifi_transfer: "未开启",
         account: None,
         sleep_screen_cover: false,
+        enable_readest: true,
+        enable_weread: true,
+        enable_jianguoyun: true,
+        jianguoyun_account: Some("anna@example.com"),
+        weread_readtime: false,
+        weread_readtime_note: None,
+        weread_notes: None,
     };
     let mut text = TextEngine::new(fonts());
     let (tree, ids) = settings_screen::Settings::build(
@@ -2761,7 +3369,12 @@ fn scan_screens(profile: Screen, out: &Path) {
         local_books_count: 0,
     };
     let mut text = TextEngine::new(fonts());
-    let (tree, _) = scan_screen::ScanUi::build(&mut text, &styles, &empty_screen);
+    let (tree, _) = scan_screen::ScanUi::build_for_size(
+        &mut text,
+        &styles,
+        &empty_screen,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     day_night(&mut ui, out, "scan-empty");
@@ -2840,7 +3453,12 @@ fn scan_screens(profile: Screen, out: &Path) {
         },
     };
     let mut text = TextEngine::new(fonts());
-    let (tree, _) = scan_screen::ScanUi::build(&mut text, &styles, &scanning_screen);
+    let (tree, _) = scan_screen::ScanUi::build_for_size(
+        &mut text,
+        &styles,
+        &scanning_screen,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     day_night(&mut ui, out, "scan-scanning");
@@ -3255,7 +3873,12 @@ fn scan_screens(profile: Screen, out: &Path) {
         },
     };
     let mut text = TextEngine::new(fonts());
-    let (tree, _) = scan_screen::ScanUi::build(&mut text, &styles, &done_screen);
+    let (tree, _) = scan_screen::ScanUi::build_for_size(
+        &mut text,
+        &styles,
+        &done_screen,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     day_night(&mut ui, out, "scan-done");
@@ -3274,7 +3897,12 @@ fn scan_screens(profile: Screen, out: &Path) {
         },
     };
     let mut text = TextEngine::new(fonts());
-    let (tree, _) = scan_screen::ScanUi::build(&mut text, &styles, &failed_screen);
+    let (tree, _) = scan_screen::ScanUi::build_for_size(
+        &mut text,
+        &styles,
+        &failed_screen,
+        Size::new(profile.width as i32, profile.height as i32),
+    );
     let mut ui = Ui::with_screen(tree, text, profile);
     ui.layout();
     day_night(&mut ui, out, "scan-failed");
@@ -3292,6 +3920,8 @@ fn render_all(profile: Screen, out: &Path) {
     book_stats_screens(profile, out);
     library_screens(profile, out);
     cloud_screens(profile, out);
+    weread_screens(profile, out);
+    jianguoyun_screens(profile, out);
     library_actions(profile, out);
     scan_screens(profile, out);
     wifi_screens(profile, out);

@@ -1,0 +1,10 @@
+{
+  "items": [
+    {
+      "name": "墨阅适配中心",
+      "action": "sh ./center.sh",
+      "exitmenu": true,
+      "status": false
+    }
+  ]
+}

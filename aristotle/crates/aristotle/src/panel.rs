@@ -545,18 +545,6 @@ impl Device {
         self.blit_ui(ui, rect);
         Ok(())
     }
-
-    /// Leave a clean white screen behind for the stock UI, in day mode
-    /// whatever ours was.
-    pub fn clear(&mut self) -> io::Result<()> {
-        self.wait_idle();
-        self.fb.set_hw_invert(false);
-        self.night = None;
-        let all = self.fb.full_screen();
-        self.fb.fill(all, 0xff);
-        let m = self.fb.update(all, FLASH, true)?;
-        self.fb.wait(m)
-    }
 }
 
 fn log_shown(p: &InFlight, done: Instant) {
@@ -803,19 +791,6 @@ impl Panel {
     pub fn poll(&mut self) {
         if let Panel::Device(d) = self {
             d.poll();
-        }
-    }
-
-    pub fn clear(&mut self) -> io::Result<()> {
-        match self {
-            Panel::Device(d) => d.clear(),
-            Panel::Memory(m) => {
-                m.night = None;
-                m.pixels.fill(0xff);
-                let all = m.all();
-                m.record(all, FLASH.0, "clear");
-                Ok(())
-            }
         }
     }
 }

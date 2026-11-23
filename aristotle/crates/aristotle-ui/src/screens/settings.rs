@@ -3,13 +3,15 @@
 //! home screen components, reading typography and animation, power and screensaver,
 //! network and sync, device info and about card.
 //!
-//! Paged into 3 pages per the prototype specification:
+//! Paged by content height; at the reference sizes the WeRead reading-time
+//! switch has a page of its own:
 //! - Page 1: Screen (Frontlight slider with presets, Night mode toggle, Library covers chips)
 //!   and Home components (Clock style, Today's reading stats toggle, Daily quote toggle, Desk pet toggle)
-//! - Page 2: Reading (Font, Page turn animation, Full refresh interval, Clippings toggle),
-//!   Power (Auto sleep, Screensaver with preview), and Network & Sync (Readest account, Progress sync,
+//! - Page 2: Reading (Font, Page turn animation, Full refresh interval), Power
+//!   (Auto sleep, Screensaver) and Network & Sync (Readest account, Progress sync,
 //!   Book catalogs, Wi-Fi transfer)
-//! - Page 3: Device (Date & time, Storage bar, USB mode, UI language, Battery info) and About (Device facts)
+//! - Page 3: Device (Storage bar, Clippings toggle, USB mode, UI language, Battery info)
+//! - Page 4: WeRead (reading-time upload switch, its queue state and a short hint)
 
 use super::library::{status_line, CoverMode, StatusLine};
 use crate::geom::{Insets, Rect, Size};
@@ -57,6 +59,14 @@ pub mod action {
     pub const REFRESH_INTERVAL: ActionId = 122;
     pub const ACCOUNT: ActionId = 123;
     pub const WIFI_TRANSFER: ActionId = 124;
+    pub const WEREAD_READTIME: ActionId = 130;
+    pub const WEREAD_READTIME_RESUME: ActionId = 131;
+    pub const WEREAD_NOTES_CLEAR: ActionId = 132;
+    pub const ENABLE_READEST: ActionId = 133;
+    pub const ENABLE_WEREAD: ActionId = 134;
+    pub const ENABLE_JIANGUOYUN: ActionId = 135;
+    /// The Nutstore account row: opens the account setup.
+    pub const JIANGUOYUN_ACCOUNT: ActionId = 136;
 }
 
 /// Light presets: Off (0), Night (2), Medium (10), Bright (20).
@@ -137,6 +147,21 @@ pub struct SystemView<'a> {
     pub refresh_interval: usize,
     pub wifi_transfer: &'a str,
     pub account: Option<&'a str>,
+    /// Whether the Readest cloud library & reader sync controls are enabled.
+    pub enable_readest: bool,
+    /// Whether the WeRead library & reader sync controls are enabled.
+    pub enable_weread: bool,
+    /// Whether the Nutstore library & reader sync controls are enabled.
+    pub enable_jianguoyun: bool,
+    /// The signed-in Nutstore account, when there is one.
+    pub jianguoyun_account: Option<&'a str>,
+    /// Whether reading time is uploaded to WeRead (off by default).
+    pub weread_readtime: bool,
+    /// Pending/paused hint under the switch; the flag is whether a tap resumes.
+    pub weread_readtime_note: Option<(&'a str, bool)>,
+    /// Cached cloud notes: books, highlights and thoughts; `None` when the
+    /// cache is empty and there is nothing to clear.
+    pub weread_notes: Option<(u32, u32, u32)>,
 }
 
 /// Handles to the nodes the app updates in place.
@@ -444,7 +469,7 @@ fn pager_block(
     *prev_node = prev_ico;
 
     let p_label = t.text(Paragraph::plain(
-        tf!(Msg::SettingsPagerPageOf, page = 1, pages = 3),
+        tf!(Msg::SettingsPagerPageOf, page = 1, pages = 4),
         s.font_sm(),
         Align::Center,
     ));
@@ -497,15 +522,18 @@ impl Settings {
 
         let mut light_node = None;
 
-        // --- Page 1: Screen & Home components ---
-        let mut p1_items = Vec::new();
-        p1_items.push(t.label(
+        // --- Screen & Home components ---
+        // Split into compact sub-blocks (each <= ~280 ref-px) so seven-inch
+        // panels keep the canonical four pages while six-inch and narrow
+        // screens paginate cleanly without colliding with the bottom exit bar.
+        let mut screen_top = Vec::new();
+        screen_top.push(t.label(
             tr(Msg::SettingsSectionScreen),
             s.font_sm().bold().line_height(1.2),
         ));
-        p1_items.push(t.gap(0, 12));
+        screen_top.push(t.gap(0, 12));
         if let Some((step, steps)) = v.light {
-            p1_items.push(light_card(
+            screen_top.push(light_card(
                 &mut t,
                 s,
                 step,
@@ -513,100 +541,106 @@ impl Settings {
                 &LIGHT_PRESETS,
                 &mut light_node,
             ));
+            screen_top.push(t.gap(0, 12));
         }
-        p1_items.push(t.gap(0, 12));
-        p1_items.push(toggle_card(
-            &mut t,
-            s,
-            tr(Msg::SettingsNight),
-            v.night,
-            action::NIGHT,
-        ));
-        p1_items.push(t.gap(0, 12));
-        p1_items.push(covers_card(&mut t, s, v.covers));
+        let screen_top_block = t.add(Node::column(0), screen_top);
 
-        p1_items.push(t.gap(0, 28));
-        p1_items.push(t.label(
-            tr(Msg::SettingsHomeSection),
-            s.font_sm().bold().line_height(1.2),
-        ));
-        p1_items.push(t.gap(0, 12));
+        let screen_rest_items = vec![
+            toggle_card(&mut t, s, tr(Msg::SettingsNight), v.night, action::NIGHT),
+            t.gap(0, 12),
+            covers_card(&mut t, s, v.covers),
+            t.gap(0, 28),
+        ];
+        let screen_rest_block = t.add(Node::column(0), screen_rest_items);
+
         let clock_style_idx = v.clock_style.min(CLOCK_STYLES.len() - 1);
-        p1_items.push(value_card(
-            &mut t,
-            s,
-            tr(Msg::SettingsClockStyle),
-            tr(CLOCK_STYLES[clock_style_idx]),
-            action::CLOCK_STYLE,
-        ));
-        p1_items.push(t.gap(0, 12));
-        p1_items.push(toggle_card(
-            &mut t,
-            s,
-            tr(Msg::SettingsHomeStats),
-            v.home_stats,
-            action::HOME_STATS,
-        ));
-        p1_items.push(t.gap(0, 12));
-        p1_items.push(toggle_card(
-            &mut t,
-            s,
-            tr(Msg::SettingsHomeQuote),
-            v.home_quote,
-            action::HOME_QUOTE,
-        ));
-        p1_items.push(t.gap(0, 12));
-        p1_items.push(toggle_card(
-            &mut t,
-            s,
-            tr(Msg::SettingsHomePet),
-            v.home_pet,
-            action::HOME_PET,
-        ));
+        let home_top_items = vec![
+            t.label(
+                tr(Msg::SettingsHomeSection),
+                s.font_sm().bold().line_height(1.2),
+            ),
+            t.gap(0, 12),
+            value_card(
+                &mut t,
+                s,
+                tr(Msg::SettingsClockStyle),
+                tr(CLOCK_STYLES[clock_style_idx]),
+                action::CLOCK_STYLE,
+            ),
+            t.gap(0, 12),
+            toggle_card(
+                &mut t,
+                s,
+                tr(Msg::SettingsHomeStats),
+                v.home_stats,
+                action::HOME_STATS,
+            ),
+            t.gap(0, 12),
+        ];
+        let home_top_block = t.add(Node::column(0), home_top_items);
 
-        let page1 = t.add(Node::column(0), p1_items);
+        let home_rest_items = vec![
+            toggle_card(
+                &mut t,
+                s,
+                tr(Msg::SettingsHomeQuote),
+                v.home_quote,
+                action::HOME_QUOTE,
+            ),
+            t.gap(0, 12),
+            toggle_card(
+                &mut t,
+                s,
+                tr(Msg::SettingsHomePet),
+                v.home_pet,
+                action::HOME_PET,
+            ),
+        ];
+        let home_rest_block = t.add(Node::column(0), home_rest_items);
 
-        // --- Page 2: Reading, Power, Network & Sync ---
-        let mut p2_items = Vec::new();
-        p2_items.push(t.label(
+        // --- Reading, Power, Network & Sync ---
+        let mut reading_items = Vec::new();
+        reading_items.push(t.label(
             tr(Msg::SettingsSectionReading),
             s.font_sm().bold().line_height(1.2),
         ));
-        p2_items.push(t.gap(0, 12));
-        p2_items.push(value_card(
+        reading_items.push(t.gap(0, 12));
+        reading_items.push(value_card(
             &mut t,
             s,
             tr(Msg::SettingsFont),
             v.font,
             action::FONT,
         ));
-        p2_items.push(t.gap(0, 12));
+        reading_items.push(t.gap(0, 12));
         let refresh_idx = v.refresh_interval.min(REFRESH_OPTIONS.len() - 1);
-        p2_items.push(value_card(
+        reading_items.push(value_card(
             &mut t,
             s,
             tr(Msg::SettingsRefresh),
             tr(REFRESH_OPTIONS[refresh_idx]),
             action::REFRESH_INTERVAL,
         ));
+        reading_items.push(t.gap(0, 28));
+        let reading_block = t.add(Node::column(0), reading_items);
 
-        p2_items.push(t.gap(0, 28));
-        p2_items.push(t.label(
+        let mut power_items = Vec::new();
+        power_items.push(t.label(
             tr(Msg::SettingsSectionPower),
             s.font_sm().bold().line_height(1.2),
         ));
-        p2_items.push(t.gap(0, 12));
+        power_items.push(t.gap(0, 12));
         let sleep_str = sleep_label(v.sleep_minutes);
-        p2_items.push(value_card(
+        power_items.push(value_card(
             &mut t,
             s,
             tr(Msg::SettingsAutoSleep),
             &sleep_str,
             action::SLEEP,
         ));
-        p2_items.push(t.gap(0, 12));
+        power_items.push(t.gap(0, 12));
         let sleep_screen_idx = v.sleep_screen.min(SLEEP_SCREEN_OPTIONS.len() - 1);
-        p2_items.push(screensaver_card(
+        power_items.push(screensaver_card(
             &mut t,
             s,
             tr(Msg::SettingsSleepScreen),
@@ -614,73 +648,83 @@ impl Settings {
             action::SLEEP_SCREEN,
             sleep_screen_idx == SLEEP_SCREEN_OPTIONS.len() - 1,
         ));
+        power_items.push(t.gap(0, 28));
+        let power_block = t.add(Node::column(0), power_items);
 
-        p2_items.push(t.gap(0, 28));
-        p2_items.push(t.label(
-            tr(Msg::SettingsSectionNetworkSync),
-            s.font_sm().bold().line_height(1.2),
-        ));
-        p2_items.push(t.gap(0, 12));
         let account_str = match v.account {
             Some(name) => tf!(Msg::SettingsAccountSignedIn, user = name),
             None => tr(Msg::SettingsAccountGuest).to_string(),
         };
-        p2_items.push(value_card(
-            &mut t,
-            s,
-            tr(Msg::SettingsReadestAccount),
-            &account_str,
-            action::ACCOUNT,
-        ));
-        p2_items.push(t.gap(0, 12));
         let sync_str = match v.sync {
             Some(_) => tr(Msg::SettingsSyncKosyncOn).to_string(),
             None => tr(Msg::SettingsSyncKosyncOff).to_string(),
         };
-        p2_items.push(value_card(
-            &mut t,
-            s,
-            tr(Msg::SettingsProgressSync),
-            &sync_str,
-            action::SYNC,
-        ));
-        p2_items.push(t.gap(0, 12));
-        let cat_str = trn(Plural::SettingsCatalogsNum, v.catalogs);
-        p2_items.push(value_card(
-            &mut t,
-            s,
-            tr(Msg::SettingsCatalogsLabel),
-            &cat_str,
-            action::CATALOGS,
-        ));
-        p2_items.push(t.gap(0, 12));
-        p2_items.push(value_card(
-            &mut t,
-            s,
-            tr(Msg::SettingsWifiTransfer),
-            v.wifi_transfer,
-            action::WIFI_TRANSFER,
-        ));
+        let network_top_items = vec![
+            t.label(
+                tr(Msg::SettingsSectionNetworkSync),
+                s.font_sm().bold().line_height(1.2),
+            ),
+            t.gap(0, 12),
+            value_card(
+                &mut t,
+                s,
+                tr(Msg::SettingsReadestAccount),
+                &account_str,
+                action::ACCOUNT,
+            ),
+            t.gap(0, 12),
+            value_card(
+                &mut t,
+                s,
+                tr(Msg::SettingsProgressSync),
+                &sync_str,
+                action::SYNC,
+            ),
+            t.gap(0, 12),
+        ];
+        let network_top_block = t.add(Node::column(0), network_top_items);
 
-        let page2 = t.add(Node::column(0), p2_items);
+        let cat_str = trn(Plural::SettingsCatalogsNum, v.catalogs);
+        let network_rest_items = vec![
+            value_card(
+                &mut t,
+                s,
+                tr(Msg::SettingsCatalogsLabel),
+                &cat_str,
+                action::CATALOGS,
+            ),
+            t.gap(0, 12),
+            value_card(
+                &mut t,
+                s,
+                tr(Msg::SettingsWifiTransfer),
+                v.wifi_transfer,
+                action::WIFI_TRANSFER,
+            ),
+        ];
+        let network_rest_block = t.add(Node::column(0), network_rest_items);
 
         // --- Page 3: Device & About ---
-        let mut p3_items = Vec::new();
-        p3_items.push(t.label(
-            tr(Msg::SettingsSectionDevice),
-            s.font_sm().bold().line_height(1.2),
-        ));
-        p3_items.push(t.gap(0, 12));
-        p3_items.push(storage_card(&mut t, s, v.storage));
-        p3_items.push(t.gap(0, 12));
-        p3_items.push(toggle_card(
-            &mut t,
-            s,
-            tr(Msg::SettingsClippings),
-            v.clippings,
-            action::CLIPPINGS,
-        ));
-        p3_items.push(t.gap(0, 12));
+        let device_top_items = vec![
+            t.label(
+                tr(Msg::SettingsSectionDevice),
+                s.font_sm().bold().line_height(1.2),
+            ),
+            t.gap(0, 12),
+            storage_card(&mut t, s, v.storage),
+            t.gap(0, 12),
+            toggle_card(
+                &mut t,
+                s,
+                tr(Msg::SettingsClippings),
+                v.clippings,
+                action::CLIPPINGS,
+            ),
+            t.gap(0, 12),
+        ];
+        let device_top_block = t.add(Node::column(0), device_top_items);
+
+        let mut device_rest_items = Vec::new();
         // Without the agent (`aristotlectl`) the mode cannot be changed, so
         // the row is hidden rather than offering a switch that always fails.
         if let Some(usb) = v.usb {
@@ -688,14 +732,14 @@ impl Settings {
                 Usb::Network => tr(Msg::SettingsUsbNetSsh).to_string(),
                 Usb::Storage { .. } => tr(Msg::SettingsUsbDisk).to_string(),
             };
-            p3_items.push(value_card(
+            device_rest_items.push(value_card(
                 &mut t,
                 s,
                 tr(Msg::SettingsUsbMode),
                 &usb_str,
                 action::USB,
             ));
-            p3_items.push(t.gap(0, 12));
+            device_rest_items.push(t.gap(0, 12));
         }
         let locales = aristotle_i18n::locales();
         let cur_loc = locales
@@ -703,7 +747,7 @@ impl Settings {
             .find(|l| l.code == aristotle_i18n::language())
             .map(|l| l.name)
             .unwrap_or("中文");
-        p3_items.push(value_card(
+        device_rest_items.push(value_card(
             &mut t,
             s,
             tr(Msg::SettingsUiLanguage),
@@ -711,7 +755,7 @@ impl Settings {
             action::LANGUAGE,
         ));
         if let Some(b) = v.battery {
-            p3_items.push(t.gap(0, 12));
+            device_rest_items.push(t.gap(0, 12));
             let bat_str = format!(
                 "{:.0}% · {} · {} · {} °C",
                 b.level * 100.0,
@@ -719,7 +763,7 @@ impl Settings {
                 volts(b.voltage_mv),
                 b.temperature_c
             );
-            p3_items.push(value_card(
+            device_rest_items.push(value_card(
                 &mut t,
                 s,
                 tr(Msg::SettingsBattery),
@@ -727,10 +771,133 @@ impl Settings {
                 action::BATTERY,
             ));
         }
+        device_rest_items.push(t.gap(0, 20));
+        let device_rest_block = t.add(Node::column(0), device_rest_items);
 
-        let page3 = t.add(Node::column(0), p3_items);
+        // --- Page 4: Library sources + WeRead ---
+        // Split into two blocks so both sit together on Page 4 at 300 DPI (KO2)
+        // while narrow 6-inch screens (600x800) paginate them cleanly without
+        // overlapping the bottom exit bar.
+        let mut sources_items = Vec::new();
+        sources_items.push(t.label(
+            tr(Msg::SettingsSourcesHeading),
+            s.font_sm().bold().line_height(1.2),
+        ));
+        sources_items.push(t.gap(0, 12));
+        sources_items.push(toggle_card(
+            &mut t,
+            s,
+            tr(Msg::SettingsEnableReadest),
+            v.enable_readest,
+            action::ENABLE_READEST,
+        ));
+        sources_items.push(t.gap(0, 12));
+        sources_items.push(toggle_card(
+            &mut t,
+            s,
+            tr(Msg::SettingsEnableWeread),
+            v.enable_weread,
+            action::ENABLE_WEREAD,
+        ));
+        sources_items.push(t.gap(0, 12));
+        let sources_block = t.add(Node::column(0), sources_items);
 
-        let list = t.add(pages(0).flex(1), vec![page1, page2, page3]);
+        let mut jgy_items = Vec::new();
+        jgy_items.push(toggle_card(
+            &mut t,
+            s,
+            tr(Msg::SettingsEnableJianguoyun),
+            v.enable_jianguoyun,
+            action::ENABLE_JIANGUOYUN,
+        ));
+        jgy_items.push(t.gap(0, 12));
+        // The signed-in Nutstore account, or the hint that there is none.
+        let account_label = match v.jianguoyun_account {
+            Some(email) => tf!(Msg::SettingsJianguoyunAccountSignedIn, email = email),
+            None => tr(Msg::SettingsJianguoyunAccountNone).to_string(),
+        };
+        let account_text = t.label(&account_label, s.font_sm());
+        jgy_items.push(single_card(
+            &mut t,
+            account_text,
+            Some(action::JIANGUOYUN_ACCOUNT),
+            Feedback::Outline,
+        ));
+        jgy_items.push(t.gap(0, 12));
+        let jgy_hint = t.label(
+            tr(Msg::SettingsJianguoyunAutoSync),
+            s.font_xs().gray(INK_MID),
+        );
+        jgy_items.push(single_card(&mut t, jgy_hint, None, Feedback::Outline));
+        jgy_items.push(t.gap(0, 20));
+        let jianguoyun_block = t.add(Node::column(0), jgy_items);
+
+        let mut p4_items = Vec::new();
+        p4_items.push(t.label(tr(Msg::WereadTitle), s.font_sm().bold().line_height(1.2)));
+        p4_items.push(t.gap(0, 12));
+        let hint = t.label(
+            tr(Msg::SettingsWereadReadtimeHint),
+            s.font_xs().gray(INK_MID),
+        );
+        p4_items.push(single_card(&mut t, hint, None, Feedback::Outline));
+        p4_items.push(t.gap(0, 12));
+        p4_items.push(toggle_card(
+            &mut t,
+            s,
+            tr(Msg::SettingsWereadReadtime),
+            v.weread_readtime,
+            action::WEREAD_READTIME,
+        ));
+        if let Some((note, resume)) = v.weread_readtime_note {
+            p4_items.push(t.gap(0, 12));
+            let line = t.label(note, s.font_xs().gray(INK_MID));
+            p4_items.push(single_card(
+                &mut t,
+                line,
+                resume.then_some(action::WEREAD_READTIME_RESUME),
+                Feedback::Outline,
+            ));
+        }
+        if let Some((books, highlights, thoughts)) = v.weread_notes {
+            p4_items.push(t.gap(0, 12));
+            let counts = aristotle_i18n::tf!(
+                Msg::SettingsWereadNotesValue,
+                books = books,
+                highlights = highlights,
+                thoughts = thoughts
+            );
+            let line = t.label(
+                &format!("{counts} · {}", tr(Msg::SettingsWereadNotesClear)),
+                s.font_xs().gray(INK_MID),
+            );
+            p4_items.push(single_card(
+                &mut t,
+                line,
+                Some(action::WEREAD_NOTES_CLEAR),
+                Feedback::Outline,
+            ));
+        }
+
+        let weread_block = t.add(Node::column(0), p4_items);
+
+        let list = t.add(
+            pages(0).flex(1),
+            vec![
+                screen_top_block,
+                screen_rest_block,
+                home_top_block,
+                home_rest_block,
+                reading_block,
+                power_block,
+                network_top_block,
+                network_rest_block,
+                device_top_block,
+                device_rest_block,
+                sources_block,
+                jianguoyun_block,
+                weread_block,
+            ],
+        );
 
         // Bottom area: Exits + Pager
         let kindle_btn = exit_pill(
@@ -858,6 +1025,13 @@ mod tests {
             refresh_interval: 1,
             wifi_transfer: "192.168.1.23",
             account: None,
+            enable_readest: true,
+            enable_weread: true,
+            enable_jianguoyun: true,
+            jianguoyun_account: Some("anna@example.com"),
+            weread_readtime: false,
+            weread_readtime_note: Some(("Off — nothing is uploaded", false)),
+            weread_notes: Some((2, 12, 4)),
         }
     }
 
@@ -894,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn has_three_pages_and_controls_are_targets() {
+    fn has_four_pages_and_controls_are_targets() {
         for lang in ["zh", "en", "pl"] {
             aristotle_i18n::with_language(lang, || {
                 let mut text = TextEngine::new(Fonts::embedded());
@@ -903,7 +1077,7 @@ mod tests {
                 ui.layout();
                 ids.sync(&mut ui.tree);
                 let (_, count) = ui.tree.page(ids.list);
-                assert_eq!(count, 3, "{lang}: must have exactly 3 pages");
+                assert_eq!(count, 4, "{lang}: the WeRead page is separate");
 
                 // Page 1: night mode action
                 let night_node = (0..ui.tree.len())
@@ -936,6 +1110,37 @@ mod tests {
     }
 
     #[test]
+    fn the_notes_cache_row_sits_on_the_weread_page_and_offers_clear() {
+        for lang in ["zh", "en", "pl"] {
+            aristotle_i18n::with_language(lang, || {
+                let mut text = TextEngine::new(Fonts::embedded());
+                let (tree, ids) = Settings::build(&mut text, &Styles::new(FamilyId(0)), &view());
+                let mut ui = Ui::new(tree, text, 1264, 1680);
+                ui.layout();
+                ids.sync(&mut ui.tree);
+                let (_, count) = ui.tree.page(ids.list);
+                assert_eq!(count, 4, "{lang}: the WeRead section is page 4");
+                let clear = find_on_page(&mut ui, &ids, 3, action::WEREAD_NOTES_CLEAR)
+                    .expect("the notes cache row is on page 4");
+                assert!(ui.tree.rect(clear).h >= 64, "{lang}: clear target");
+
+                // An empty cache has nothing to clear, so the row is absent.
+                let mut empty = view();
+                empty.weread_notes = None;
+                let mut text = TextEngine::new(Fonts::embedded());
+                let (tree, ids) = Settings::build(&mut text, &Styles::new(FamilyId(0)), &empty);
+                let mut ui = Ui::new(tree, text, 1264, 1680);
+                ui.layout();
+                ids.sync(&mut ui.tree);
+                assert!(
+                    find_on_page(&mut ui, &ids, 3, action::WEREAD_NOTES_CLEAR).is_none(),
+                    "{lang}: no cache row without cached notes"
+                );
+            });
+        }
+    }
+
+    #[test]
     fn exit_buttons_are_touch_targets_on_every_page_in_all_languages() {
         for code in ["zh", "en", "pl"] {
             aristotle_i18n::with_language(code, || {
@@ -944,7 +1149,7 @@ mod tests {
                 let mut ui = Ui::new(tree, text, 1264, 1680);
                 ui.layout();
                 let (_, count) = ui.tree.page(ids.list);
-                assert_eq!(count, 3);
+                assert_eq!(count, 4, "{code}: four pages");
                 for page in 0..count {
                     ui.tree.set_page(ids.list, page);
                     ui.layout();
@@ -964,6 +1169,51 @@ mod tests {
                         assert!(r.h >= 64, "{code} page {page}: exit button height >= 64");
                     }
                 }
+            });
+        }
+    }
+
+    /// The first node with `action` on `page`, after laying that page out.
+    fn find_on_page(ui: &mut Ui, ids: &Settings, page: usize, action: ActionId) -> Option<NodeId> {
+        ui.tree.set_page(ids.list, page);
+        ui.layout();
+        (0..ui.tree.len())
+            .map(|i| NodeId(i as u32))
+            .find(|id| ui.tree.node(*id).action == Some(action) && !ui.tree.rect(*id).is_empty())
+    }
+
+    #[test]
+    fn the_readtime_switch_sits_on_its_own_page_and_offers_resume() {
+        for lang in ["zh", "en", "pl"] {
+            aristotle_i18n::with_language(lang, || {
+                let mut v = view();
+                v.weread_readtime = true;
+                v.weread_readtime_note = Some(("1 min waiting to upload", false));
+                let mut text = TextEngine::new(Fonts::embedded());
+                let (tree, ids) = Settings::build(&mut text, &Styles::new(FamilyId(0)), &v);
+                let mut ui = Ui::new(tree, text, 1264, 1680);
+                ui.layout();
+                ids.sync(&mut ui.tree);
+                let (_, count) = ui.tree.page(ids.list);
+                assert_eq!(count, 4, "{lang}: the WeRead section is page 4");
+                let switch = find_on_page(&mut ui, &ids, 3, action::WEREAD_READTIME)
+                    .expect("the reading-time switch is on page 4");
+                assert!(ui.tree.rect(switch).h >= 64, "{lang}: switch target");
+
+                // A paused queue shows the resume row on the same page; a
+                // pending note has no action.
+                let mut paused = v;
+                paused.weread_readtime_note = Some(("Paused: position moved elsewhere", true));
+                let mut text = TextEngine::new(Fonts::embedded());
+                let (tree, ids) = Settings::build(&mut text, &Styles::new(FamilyId(0)), &paused);
+                let mut ui = Ui::new(tree, text, 1264, 1680);
+                ui.layout();
+                ids.sync(&mut ui.tree);
+                let (_, count) = ui.tree.page(ids.list);
+                assert_eq!(count, 4, "{lang}: the WeRead section is page 4");
+                let resume = find_on_page(&mut ui, &ids, 3, action::WEREAD_READTIME_RESUME)
+                    .expect("the paused row can be tapped on page 4");
+                assert!(ui.tree.rect(resume).h >= 64, "{lang}: resume target");
             });
         }
     }

@@ -480,7 +480,8 @@ impl<T: HttpTransport> SyncClient<T> {
                 },
             };
 
-            let body_bytes = serde_json::to_vec(&chunk_req)
+            let body_bytes = chunk_req
+                .to_wire_bytes()
                 .map_err(|e| SyncError::Deserialization(e.to_string()))?;
 
             let resp = self.execute_with_auth(|token| {
@@ -809,8 +810,11 @@ mod tests {
 
         assert_eq!(pull_res.configs.len(), 1);
         assert_eq!(
-            pull_res.configs[0].view_settings.as_deref(),
-            Some("{\"fontSize\": 18}")
+            pull_res.configs[0]
+                .view_settings
+                .as_deref()
+                .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap()),
+            Some(serde_json::json!({"fontSize": 18}))
         );
         assert_eq!(pull_res.configs[0].progress, None);
         assert_eq!(pull_res.configs[0].xpointer, None);

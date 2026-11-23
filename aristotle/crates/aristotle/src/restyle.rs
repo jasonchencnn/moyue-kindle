@@ -29,13 +29,13 @@ use aristotle_render::book::{Book, Position};
 use aristotle_render::page::{Chrome, Page};
 use aristotle_render::partial::{CatchupOutcome, Outcome, PartialScheduler, StartAction};
 use aristotle_render::plato_core::anyhow::{format_err, Context, Error};
-use aristotle_render::style::Style;
+use aristotle_render::style::{Style, UnderlineScope};
 use aristotle_ui::screens::reader::Settings;
 use aristotle_ui::tree::Refresh;
 
 use crate::session::{render_page, Deco, Prepared, Session, Source, OPEN_GATE};
 use crate::turns::Turn;
-use crate::{fit_menu, ms, perf, reader_tree, update_menu_labels, App, Content, PageView, Screen};
+use crate::{fit_menu, ms, perf, update_menu_labels, App, Content, PageView, Screen};
 
 /// Result of partial anchor relayout.
 pub struct PartialReady {
@@ -401,6 +401,12 @@ impl App {
             if settings == r.settings && new_style == r.session.style {
                 return Ok(());
             }
+            // The page turns follow the engine the book on the panel really
+            // runs on, not the preference: a PDF, FB2 or fallen-back book
+            // turns the horizontal way (VERT-101 M1). The book being laid
+            // out now is only swapped in when the layout is ready, and the
+            // adopt step sets the gestures from it then.
+            r.gestures.set_vertical(r.session.is_vertical());
             r.settings = settings;
             update_menu_labels(&mut self.ui, r, self.readest.manual_message.as_deref());
             self.ui.tree.invalidate(r.menu.size_steps, Refresh::Auto);
@@ -410,11 +416,17 @@ impl App {
             };
             // The book may be lent to a worker: a partial layout or a catch-up
             // only runs for a book that can be partially laid out again.
-            let can_partial = match r.session.book_ref() {
-                Some(book) => book.can_partial_rerender(),
-                None => self.restyler.lent_to_partial_worker(),
-            };
-            (anchor, r.session.slow_relayout(), can_partial)
+            // Changing writing_mode switches engines (crengine <-> vertical)
+            // and changing fine_typesetting toggles DOM-level style flags, so
+            // both must take the full restyle path.
+            let needs_full = new_style.writing_mode != r.session.style.writing_mode
+                || new_style.fine_typesetting != r.session.style.fine_typesetting;
+            let can_partial = !needs_full
+                && match r.session.book_ref() {
+                    Some(book) => book.can_partial_rerender(),
+                    None => self.restyler.lent_to_partial_worker(),
+                };
+            (anchor, needs_full || r.session.slow_relayout(), can_partial)
         };
         self.prefs.apply(&settings);
         if let Err(e) = self.prefs.save(self.lib.data_dir()) {
@@ -488,14 +500,17 @@ impl App {
                 RestyleWorkerKind::Full(w) => {
                     if let Some(result) = w.poll() {
                         self.restyler.worker = None;
+                        self.formatting_progress.reset();
                         let outcome = self.restyler.scheduler_mut().finish_full();
                         match (outcome, result) {
                             (Outcome::Ready, Ok(prepared)) => self.adopt_restyle(prepared)?,
                             (Outcome::Ready, Err(e)) => {
                                 eprintln!("aristotle: can't lay the book out again: {e:#}");
+                                self.hide_formatting_progress()?;
                                 self.revert_restyle()?;
                             }
                             (Outcome::Discarded, Ok(prepared)) => {
+                                self.hide_formatting_progress()?;
                                 let times = prepared.times;
                                 perf!(
                                     "restyle: full layout discarded ({:.0} ms)",
@@ -503,6 +518,7 @@ impl App {
                                 );
                             }
                             (Outcome::Discarded, Err(e)) => {
+                                self.hide_formatting_progress()?;
                                 eprintln!("aristotle: can't lay the book out again: {e:#}");
                             }
                         }
@@ -630,15 +646,16 @@ impl App {
             progress,
         });
         self.restyler.started_at = Some(Instant::now());
+        self.formatting_progress.start(Instant::now());
         Ok(())
     }
 
     /// Lay the book out fully in `style` on a worker thread (fallback path).
     fn start_full_restyle(&mut self, style: Style, anchor: Progress) -> Result<(), Error> {
-        let Screen::Reader(r) = &self.screen else {
-            return Ok(());
+        let (id, progress_nodes) = match &self.screen {
+            Screen::Reader(r) => (r.session.id.clone(), r.progress),
+            _ => return Ok(()),
         };
-        let id = r.session.id.clone();
         let Some(rec) = self.lib.book(&id).cloned() else {
             return Ok(());
         };
@@ -652,7 +669,14 @@ impl App {
             kind: RestyleWorkerKind::Full(worker),
             progress,
         });
-        self.restyler.started_at = Some(Instant::now());
+        let now = Instant::now();
+        self.restyler.started_at = Some(now);
+        self.formatting_progress.start(now);
+        // Full engine relayout (e.g. toggling fine typesetting or vertical mode)
+        // takes several seconds on e-ink: show the progress bar immediately so
+        // the reader gets instant feedback instead of a silent pause.
+        let label = crate::restyle_label();
+        self.show_formatting_progress(progress_nodes, &label, 0)?;
         Ok(())
     }
 
@@ -680,10 +704,24 @@ impl App {
 
     /// Adopt finished partial relayout: enter degraded mode and show anchor page.
     fn adopt_partial_restyle(&mut self, ready: PartialReady) -> Result<(), Error> {
+        let book_id = match &self.screen {
+            Screen::Reader(r) => r.session.id.clone(),
+            _ => return Ok(()),
+        };
+        let sync_channels = self.reader_sync_channels_all(&book_id);
         let Screen::Reader(r) = &mut self.screen else {
             return Ok(());
         };
         r.session.restore_book(ready.book);
+        // The pages now come from the engine the book just laid out with:
+        // the turns follow it, not what the preference asked for (VERT-101
+        // M1).
+        r.gestures.set_vertical(r.session.is_vertical());
+        let underline = self.prefs.underline();
+        let scope = self.prefs.underline_scope();
+        let book = r.session.book();
+        book.set_underline(underline);
+        book.set_underline_scope(scope);
         r.session.degraded = true;
         r.session.style = ready.style.clone();
         r.session.clear_pages();
@@ -692,8 +730,13 @@ impl App {
         let page = Rc::new(ready.page);
         r.session.keep_page(ready.current, page.clone());
         let settings = r.settings;
-        let (tree, menu, page_node, nav, progress) =
-            reader_tree(&self.styles, &r.session.title, &settings, page.clone());
+        let (tree, menu, page_node, nav, progress) = crate::reader_tree_for_sync_channels(
+            &self.styles,
+            &r.session.title,
+            &settings,
+            page.clone(),
+            sync_channels,
+        );
         r.menu = menu;
         r.page_node = page_node;
         r.nav = nav;
@@ -741,6 +784,13 @@ impl App {
             return Ok(());
         };
         r.session.restore_book(ready.book);
+        // The turns follow the engine the book really runs on (VERT-101 M1).
+        r.gestures.set_vertical(r.session.is_vertical());
+        let underline = self.prefs.underline();
+        let scope = self.prefs.underline_scope();
+        let book = r.session.book();
+        book.set_underline(underline);
+        book.set_underline_scope(scope);
         r.session.degraded = false;
         r.session.clear_pages();
         r.session.recompute_deco();
@@ -783,20 +833,46 @@ impl App {
     /// The layout is ready (fallback full path): take it over.
     fn adopt_restyle(&mut self, prepared: Prepared) -> Result<(), Error> {
         let times = prepared.times;
+        let book_id = match &self.screen {
+            Screen::Reader(r) => r.session.id.clone(),
+            _ => return Ok(()),
+        };
+        let sync_channels = self.reader_sync_channels_all(&book_id);
         let Screen::Reader(r) = &mut self.screen else {
             return Ok(());
         };
         let here = r.session.position();
         let mut session = Session::from_prepared(prepared)?;
         session.set_speed(self.speed.secs_per_page());
+        // The worker opened the book from its source, which carries the
+        // guide but not its width, and the sheet may have changed both while
+        // the layout ran (TYPE-102). The pages it rendered came out of the
+        // old settings, so they go when the guide now spans the line.
+        let scope = self.prefs.underline_scope();
+        let underline = self.prefs.underline();
+        let book = session.book();
+        book.set_underline(underline);
+        book.set_underline_scope(scope);
+        if scope != UnderlineScope::TextOnly {
+            session.clear_pages();
+        }
         let at = session.page_of(&here).unwrap_or(session.current);
         session.current = at;
         let page = session.page(at)?;
         let settings = r.settings;
         r.session = session;
+        // The full layout may have switched engines: the turns follow the
+        // one the new book runs, not the style that asked for it (VERT-101
+        // M1).
+        r.gestures.set_vertical(r.session.is_vertical());
         let new_style = r.session.style.clone();
-        let (tree, menu, page_node, nav, progress) =
-            reader_tree(&self.styles, &r.session.title, &settings, page.clone());
+        let (tree, menu, page_node, nav, progress) = crate::reader_tree_for_sync_channels(
+            &self.styles,
+            &r.session.title,
+            &settings,
+            page.clone(),
+            sync_channels,
+        );
         r.menu = menu;
         r.page_node = page_node;
         r.nav = nav;

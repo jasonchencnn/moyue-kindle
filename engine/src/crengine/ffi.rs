@@ -85,6 +85,9 @@ struct CrLayout {
     css: *const c_char,
     embedded_styles: c_int,
     fallback_font_faces: *const c_char,
+    fine_typesetting: c_int,
+    font_weight: c_int,
+    dpi: c_int,
 }
 
 /// 排版参数在 FFI 边界上的表示。
@@ -146,6 +149,9 @@ impl CrLayoutArgs {
                 .fallback_faces
                 .as_ref()
                 .map_or(std::ptr::null(), |c| c.as_ptr()),
+            fine_typesetting: c_int::from(self.settings.fine_typesetting),
+            font_weight: self.settings.font_weight as c_int,
+            dpi: self.settings.dpi as c_int,
         }
     }
 }
@@ -271,6 +277,7 @@ extern "C" {
         invert_images: c_int,
         underline: c_int,
         underline_gray: c_int,
+        underline_scope: c_int,
         err: *mut c_char,
         err_len: usize,
     ) -> c_int;
@@ -791,13 +798,14 @@ impl Document {
 
     /// 渲染第 `page` 页（0 起）到 8 位灰度缓冲。
     pub fn render_page(&mut self, page: u32, buffer: &mut GrayBuffer) -> Result<(), String> {
-        self.render_page_with_options(page, buffer, false, 0, 0)
+        self.render_page_with_options(page, buffer, false, 0, 0, 0)
     }
 
     /// 渲染第 `page` 页（0 起）到 8 位灰度缓冲，支持设置图片反色与正文引导线。
     ///
     /// `underline` 取值：0 不画、1 实线、2 点状虚线；`underline_gray` 是
-    /// 引导线的灰度（0 黑、255 白），0 表示用引擎默认灰度。
+    /// 引导线的灰度（0 黑、255 白）；`underline_scope` 取值：0 只画文字宽度、
+    /// 1 画满正文区一整行（含空白行槽）。
     pub fn render_page_with_options(
         &mut self,
         page: u32,
@@ -805,6 +813,7 @@ impl Document {
         invert_images: bool,
         underline: u8,
         underline_gray: u8,
+        underline_scope: u8,
     ) -> Result<(), String> {
         let mut err = [0 as c_char; ERR_LEN];
         let len = buffer.pixels().len();
@@ -829,6 +838,7 @@ impl Document {
                 invert,
                 underline as c_int,
                 underline_gray as c_int,
+                underline_scope as c_int,
                 err.as_mut_ptr(),
                 ERR_LEN,
             )

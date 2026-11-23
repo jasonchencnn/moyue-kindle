@@ -13,7 +13,10 @@
 //! (the pager).
 
 use super::icon_button;
-use super::library::{list_insets, page_of, segment_control, status_line, Segment, StatusLine};
+use super::library::{
+    list_insets, page_of, segment_control_channels, status_line, ChannelVisibility, Segment,
+    StatusLine,
+};
 use crate::geom::{mm, Insets, Size, MIN_TARGET};
 use crate::icons::Icon;
 use crate::input::Direction;
@@ -32,6 +35,10 @@ pub mod action {
     pub const SYNC: ActionId = 2;
     /// The guide shown when nobody is signed in.
     pub const LOGIN: ActionId = 3;
+    /// The "WeRead" cell of the segmented control.
+    pub const WEREAD: ActionId = 4;
+    /// The "Nutstore" cell of the segmented control.
+    pub const JIANGUOYUN: ActionId = 5;
     /// `FILTER + i` selects `CloudFilter::ALL[i]`.
     pub const FILTER: ActionId = 10;
     pub const PREV_PAGE: ActionId = 20;
@@ -311,6 +318,7 @@ fn shown_books(books: &[CloudBook], filter: CloudFilter) -> Vec<&CloudBook> {
 fn book_row(t: &mut Tree, s: &Styles, book: &CloudBook, index: usize) -> NodeId {
     let cover = Cover::new(&book.title, &book.author, s.family)
         .with_mark(book.mark())
+        .with_source_tag(super::library::BookSource::Readest.label())
         .with_image(book.cover.clone());
     let cover_node = t.custom(cover);
     let cover_box = t.fixed(Some(108), Some(144), Some(cover_node));
@@ -404,7 +412,37 @@ impl<'a> CloudView<'a> {
         text: &mut TextEngine,
         s: &Styles,
         view: &CloudView,
+        width: i32,
+    ) -> (Tree, CloudUi) {
+        Self::build_for_width_with_sources(text, s, view, width, false)
+    }
+
+    /// Builds the cloud shelf for `width`, optionally showing the WeRead tab
+    /// when enabled in Settings.
+    pub fn build_for_width_with_sources(
+        text: &mut TextEngine,
+        s: &Styles,
+        view: &CloudView,
+        width: i32,
+        show_weread: bool,
+    ) -> (Tree, CloudUi) {
+        Self::build_for_width_with_channels(
+            text,
+            s,
+            view,
+            width,
+            ChannelVisibility::readest_and_weread(true, show_weread),
+        )
+    }
+
+    /// Builds the cloud shelf for `width`, showing the cloud channels
+    /// Settings turns on: Readest, WeRead and Nutstore.
+    pub fn build_for_width_with_channels(
+        text: &mut TextEngine,
+        s: &Styles,
+        view: &CloudView,
         _width: i32,
+        channels: ChannelVisibility,
     ) -> (Tree, CloudUi) {
         let _ = text;
         let mut t = Tree::new();
@@ -421,14 +459,23 @@ impl<'a> CloudView<'a> {
         let header = t.pad(Insets::new(0, home_margin(), 0, home_margin()), header);
         column.push(header);
 
-        // Local / Cloud, in the same place and size as on the library.
-        let seg = segment_control(
+        // Local / Cloud / optional WeRead and Nutstore, in the same place and
+        // size as on the library. This screen is the Readest shelf, so its
+        // own cell is always on.
+        let channels = ChannelVisibility {
+            readest: true,
+            ..channels
+        };
+        let seg = segment_control_channels(
             &mut t,
             s,
             view.local_books_count,
             Segment::Cloud,
             Some(action::LOCAL),
             None,
+            channels.weread.then_some(action::WEREAD),
+            channels.jianguoyun.then_some(action::JIANGUOYUN),
+            channels,
         );
         let seg = t.fixed(None, Some(76), Some(seg));
         let seg = t.pad(Insets::new(0, home_margin(), 28, home_margin()), seg);
@@ -478,9 +525,8 @@ impl<'a> CloudView<'a> {
             column.push(chips);
         }
 
-        // The list: four cards a page. The padding belongs to the shelf, not
-        // to its pager: the cards keep the local list's side margins and its
-        // gap below the chips.
+        // The list: paginated by available height so six-inch, seven-inch and
+        // larger panels each show as many complete cards as fit above the pager.
         let filtered = shown_books(view.books, view.filter);
         let mut rows = Vec::new();
         let mut row_books = Vec::new();
@@ -494,20 +540,7 @@ impl<'a> CloudView<'a> {
                 rows.push(book_row(&mut t, s, book, i));
                 row_books.push(book.hash.clone());
             }
-            let mut children = Vec::new();
-            for chunk in rows.chunks(4) {
-                let mut page_items = Vec::new();
-                for (ci, &card) in chunk.iter().enumerate() {
-                    if ci > 0 {
-                        page_items.push(t.gap(1, 24));
-                    }
-                    page_items.push(card);
-                }
-                let page_col = t.add(Node::column(0), page_items);
-                let page_box = t.fixed(None, Some(932), Some(page_col));
-                children.push(page_box);
-            }
-            let pages_node = t.add(pages(0).flex(1), children);
+            let pages_node = t.add(pages(24).flex(1), rows.clone());
             list_pages = Some(pages_node);
             t.add(
                 Node::new(Kind::Padding(list_insets())).flex(1),

@@ -385,11 +385,15 @@ pub struct Cover {
     pub binding: Option<(u8, u8)>,
     /// The real cover, scaled to the widget once per size.
     pub image: Option<GrayImage>,
+    /// Optional channel badge drawn at the bottom-left corner of the cover
+    /// (e.g. "本地", "Readest", "WeRead").
+    pub source_tag: Option<String>,
     size: Size,
     scaled: Option<GrayImage>,
     title_layout: Option<ParagraphLayout>,
     author_layout: Option<ParagraphLayout>,
     mark_layout: Option<ParagraphLayout>,
+    source_layout: Option<ParagraphLayout>,
     cjk_chars: Vec<(ParagraphLayout, Point)>,
     strip_rect: Option<Rect>,
     author_pos: Option<Point>,
@@ -405,11 +409,13 @@ impl Cover {
             mark: CoverMark::default(),
             binding: None,
             image: None,
+            source_tag: None,
             size: Size::default(),
             scaled: None,
             title_layout: None,
             author_layout: None,
             mark_layout: None,
+            source_layout: None,
             cjk_chars: Vec::new(),
             strip_rect: None,
             author_pos: None,
@@ -442,6 +448,13 @@ impl Cover {
 
     pub fn with_mark(mut self, mark: CoverMark) -> Self {
         self.mark = mark;
+        self
+    }
+
+    pub fn with_source_tag(mut self, tag: impl Into<String>) -> Self {
+        let tag = tag.into();
+        self.source_tag = if tag.is_empty() { None } else { Some(tag) };
+        self.source_layout = None;
         self
     }
 
@@ -479,6 +492,16 @@ impl Widget for Cover {
         let s = c.constrain(c.max);
         if s != self.size {
             self.size = s;
+            let density = text.density();
+            self.source_layout = self.source_tag.as_ref().map(|tag| {
+                let font_px = (s.w as f32 * 0.085).clamp(density.scale(14.0), density.scale(22.0));
+                let style = TextStyle::new(self.family, font_px)
+                    .bold()
+                    .line_height(1.0)
+                    .gray(WHITE);
+                let p = Paragraph::plain(tag, style, Align::Left);
+                layout_paragraph(text, &p, (s.w as f32 * 0.85).max(1.0), &NoHyphenation)
+            });
             if let Some(img) = &self.image {
                 let fit = drawn_size(img, s);
                 self.scaled = Some(if (fit.w as u32, fit.h as u32) == (img.width, img.height) {
@@ -831,6 +854,8 @@ impl Widget for Cover {
                 1,
                 RULE,
             );
+            let photo_rect = Rect::new(x, y, img.width as i32, img.height as i32);
+            self.paint_source_tag(photo_rect, cx);
             return;
         }
         let (bg, ink) = self.binding();
@@ -885,41 +910,82 @@ impl Widget for Cover {
                     );
                 }
             }
-            return;
-        }
-        let x = r.x as f32 + w * 0.12;
-        if self.large(density) {
-            // An inner frame, like a border blocked on a cloth binding.
-            let inset = (w * 0.06).round() as i32;
-            p.stroke_rect(r.outset(-inset), density.px(2), ink);
-            if let Some(m) = &self.mark_layout {
-                m.draw(cx.text, cx.painter, x, r.y as f32 + h * 0.11);
-            }
-            if let Some(t) = &self.title_layout {
-                // Short titles sit a little lower than long ones.
-                let y = r.y as f32 + h * 0.2 + (h * 0.3 - t.height).max(0.0) * 0.5;
-                t.draw(cx.text, cx.painter, x, y);
-                let rule_y = (y + t.height + h * 0.05) as i32;
-                let rw = (w * 0.16) as i32;
-                cx.painter.fill_rect(
-                    Rect::new(r.center().x - rw / 2, rule_y, rw, density.px(3)),
-                    ink,
-                );
-            }
-            if let Some(a) = &self.author_layout {
-                let ay = r.bottom() as f32 - h * 0.13 - a.height;
-                a.draw(cx.text, cx.painter, x, ay);
-            }
         } else {
-            if let Some(t) = &self.title_layout {
-                let y = r.y as f32 + (h - t.height) / 2.0;
-                t.draw(cx.text, cx.painter, r.x as f32, y);
-            }
-            if let Some(m) = &self.mark_layout {
-                let y = r.bottom() as f32 - m.height - h * 0.03;
-                m.draw(cx.text, cx.painter, r.x as f32 + w * 0.08, y);
+            let x = r.x as f32 + w * 0.12;
+            if self.large(density) {
+                // An inner frame, like a border blocked on a cloth binding.
+                let inset = (w * 0.06).round() as i32;
+                p.stroke_rect(r.outset(-inset), density.px(2), ink);
+                if let Some(m) = &self.mark_layout {
+                    m.draw(cx.text, cx.painter, x, r.y as f32 + h * 0.11);
+                }
+                if let Some(t) = &self.title_layout {
+                    // Short titles sit a little lower than long ones.
+                    let y = r.y as f32 + h * 0.2 + (h * 0.3 - t.height).max(0.0) * 0.5;
+                    t.draw(cx.text, cx.painter, x, y);
+                    let rule_y = (y + t.height + h * 0.05) as i32;
+                    let rw = (w * 0.16) as i32;
+                    cx.painter.fill_rect(
+                        Rect::new(r.center().x - rw / 2, rule_y, rw, density.px(3)),
+                        ink,
+                    );
+                }
+                if let Some(a) = &self.author_layout {
+                    let ay = r.bottom() as f32 - h * 0.13 - a.height;
+                    a.draw(cx.text, cx.painter, x, ay);
+                }
+            } else {
+                if let Some(t) = &self.title_layout {
+                    let y = r.y as f32 + (h - t.height) / 2.0;
+                    t.draw(cx.text, cx.painter, r.x as f32, y);
+                }
+                if let Some(m) = &self.mark_layout {
+                    let y = r.bottom() as f32 - m.height - h * 0.03;
+                    m.draw(cx.text, cx.painter, r.x as f32 + w * 0.08, y);
+                }
             }
         }
+        self.paint_source_tag(r, cx);
+    }
+}
+
+impl Cover {
+    fn paint_source_tag(&self, r: Rect, cx: &mut PaintCx) {
+        let Some(layout) = &self.source_layout else {
+            return;
+        };
+        let d = cx.text.density();
+        let pad_x = d.px(8).max(4);
+        let pad_y = d.px(4).max(2);
+        let inset = d.px(6).max(3);
+        let pill_w = (layout.width.ceil() as i32 + pad_x * 2).min((r.w - inset * 2).max(1));
+        let pill_h = (layout.height.ceil() as i32 + pad_y * 2).min((r.h - inset * 2).max(1));
+        // On typographic cards where bottom-left may hold author/series mark or
+        // a tall CJK title strip, place the source badge in bottom-right so it
+        // never collides with card typography.
+        let use_bottom_right = self.scaled.is_none()
+            && (self.author_pos.is_some()
+                || self.mark_pos.is_some()
+                || self.strip_rect.is_some()
+                || self.author_layout.is_some()
+                || self.mark_layout.is_some());
+        let px = if use_bottom_right {
+            (r.right() - inset - pill_w).max(r.x + inset)
+        } else {
+            r.x + inset
+        };
+        let py = (r.bottom() - inset - pill_h).max(r.y + inset);
+        let pill = Rect::new(px, py, pill_w, pill_h);
+        let radius = d.scale(6.0).min(pill_h as f32 * 0.4);
+        cx.painter.fill_round_rect(pill, radius, INK);
+        cx.painter
+            .stroke_round_rect(pill, radius, d.scale(1.5).max(1.0), WHITE);
+        layout.draw(
+            cx.text,
+            cx.painter,
+            (px + pad_x) as f32,
+            (py + pad_y) as f32,
+        );
     }
 }
 

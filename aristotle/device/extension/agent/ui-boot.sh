@@ -60,7 +60,7 @@ set_fails() {
 # come back in this boot (aristotle-ui.conf).
 stock() {
     log "stock GUI: $*"
-    sh "$S/takeover.sh" stop >> "$LOG" 2>&1
+    ARISTOTLE_TRANSITION_APP="$APP" sh "$S/takeover.sh" stop >> "$LOG" 2>&1
     if [ "$open_kual" = 1 ]; then
         sh "$S/open-kual.sh" >> "$LOG" 2>&1 || log "KUAL unavailable; stock GUI left running"
     fi
@@ -117,7 +117,7 @@ fi
 
 # Take the screen: the same steps as takeover.sh start, which is proven on
 # the device.
-if ! sh "$S/takeover.sh" start >> "$LOG" 2>&1; then
+if ! ARISTOTLE_TRANSITION_APP="$APP" sh "$S/takeover.sh" start >> "$LOG" 2>&1; then
     log "takeover refused"
     stock "takeover failed"
 fi
@@ -135,6 +135,7 @@ done
 lipc-set-prop com.lab126.blanket unload splash 2> /dev/null
 lipc-send-event -r 5 com.lab126.hal bootSplashCleanup 2> /dev/null
 log "stock GUI stopped (uptime $(uptime_s) s)"
+timeout -t 5 -s KILL "$APP" --transition prepare </dev/null >> "$LOG" 2>&1 || log "transition display unavailable"
 
 pid=
 stop_app() {

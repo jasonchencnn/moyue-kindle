@@ -81,12 +81,22 @@ pub struct Annotation {
     pub deleted_at: Option<i64>,
 }
 
+/// Strip an optional `"xpointer:"` prefix and validate that the result is a
+/// real crengine XPointer (starts with `'/'`).
+///
+/// Non-XPointer locators (`epub:`, `kindle:`, `page:`, `fraction:`, `txt2:`,
+/// or empty strings) return an empty string so callers never push invalid
+/// locators as Readest XPointers.
 pub fn clean_xpointer(s: &str) -> String {
     let trimmed = s.trim();
-    if let Some(rest) = trimmed.strip_prefix("xpointer:") {
-        rest.trim().to_string()
+    let candidate = trimmed
+        .strip_prefix("xpointer:")
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    if candidate.starts_with('/') {
+        candidate.to_string()
     } else {
-        trimmed.to_string()
+        String::new()
     }
 }
 
@@ -326,6 +336,44 @@ mod tests {
         assert_eq!(converted_back.id.as_deref(), Some("note-db"));
         assert_eq!(converted_back.color.as_deref(), Some("blue"));
         assert_eq!(converted_back.position, ann.position);
+    }
+
+    #[test]
+    fn clean_xpointer_rejects_non_crengine_locators() {
+        assert_eq!(
+            clean_xpointer("xpointer:/body/DocFragment[1]/p[2].0"),
+            "/body/DocFragment[1]/p[2].0"
+        );
+        assert_eq!(
+            clean_xpointer("/body/DocFragment[1]/p[2].0"),
+            "/body/DocFragment[1]/p[2].0"
+        );
+        assert_eq!(clean_xpointer("epub:3:120"), "");
+        assert_eq!(clean_xpointer("kindle:4500"), "");
+        assert_eq!(clean_xpointer("page:12"), "");
+        assert_eq!(clean_xpointer("fraction:0.42"), "");
+        assert_eq!(
+            clean_xpointer("txt2:xpointer:/body/DocFragment[1]/p[1].0"),
+            ""
+        );
+        assert_eq!(clean_xpointer("xpointer:epub:3:120"), "");
+        assert_eq!(clean_xpointer("   "), "");
+
+        let ann = Annotation {
+            id: Some("plato-hl".to_string()),
+            kind: NoteType::Annotation,
+            position: Some(("epub:3:120".to_string(), "epub:3:180".to_string())),
+            color: Some("yellow".to_string()),
+            style: Some("highlight".to_string()),
+            text: Some("Plato highlight".to_string()),
+            note: None,
+            created_at: None,
+            updated_at: None,
+            deleted_at: None,
+        };
+        let bn = ann.to_book_note("fallback");
+        assert_eq!(bn.xpointer0, None);
+        assert_eq!(bn.xpointer1, None);
     }
 }
 

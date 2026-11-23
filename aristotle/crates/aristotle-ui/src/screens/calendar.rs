@@ -221,14 +221,33 @@ const COVER_H: i32 = 76;
 
 impl CalendarUi {
     /// Builds the calendar screen.
-    pub fn build(_text: &mut TextEngine, s: &Styles, cal: &Calendar) -> (Tree, Self) {
+    pub fn build(text: &mut TextEngine, s: &Styles, cal: &Calendar) -> (Tree, Self) {
+        Self::build_for_size(
+            text,
+            s,
+            cal,
+            Size::new(s.density.px(1264), s.density.px(1680)),
+        )
+    }
+
+    /// Builds the calendar screen for a panel of `size` native pixels.
+    /// Six-inch panels tighten grid row height and gaps so the month summary
+    /// and selected-day detail card stay fully visible.
+    pub fn build_for_size(
+        _text: &mut TextEngine,
+        s: &Styles,
+        cal: &Calendar,
+        size: Size,
+    ) -> (Tree, Self) {
+        let compact = crate::theme::PanelLayout::for_size(size, s.density)
+            == crate::theme::PanelLayout::Compact;
         let mut t = Tree::new();
         let bar = status_line(&mut t, s, &cal.status);
         let status = t.pad(Insets::new(0, home_margin(), 0, home_margin()), bar.root);
-        let header = header(&mut t, s);
+        let header = header(&mut t, s, compact);
         let header = t.pad(Insets::new(0, home_margin(), 0, home_margin()), header);
         let mut cells = Vec::new();
-        let body = body(&mut t, s, cal, &mut cells);
+        let body = body(&mut t, s, cal, &mut cells, compact);
         let root = t.add(Node::column(0).bg(PAPER), [status, header, body]);
         t.set_root(root);
         (t, CalendarUi { cells })
@@ -236,7 +255,7 @@ impl CalendarUi {
 }
 
 /// The header: the way back and the name of the screen.
-fn header(t: &mut Tree, s: &Styles) -> NodeId {
+fn header(t: &mut Tree, s: &Styles, compact: bool) -> NodeId {
     let glyph = t.icon(Icon::ChevronLeft, ARROW, INK);
     let back = t.add(
         Node::new(Kind::MinSize(Size::new(72, 72)))
@@ -249,30 +268,41 @@ fn header(t: &mut Tree, s: &Styles) -> NodeId {
         s.font_lg().bold().line_height(1.2).tracking(4.0),
     );
     let row = t.add(Node::row(20).cross(Cross::Center), [back, title]);
-    t.fixed(None, Some(HEADER_H), Some(row))
+    t.fixed(None, Some(if compact { 88 } else { HEADER_H }), Some(row))
 }
 
 /// Everything under the header.
-fn body(t: &mut Tree, s: &Styles, cal: &Calendar, cells: &mut Vec<NodeId>) -> NodeId {
+fn body(
+    t: &mut Tree,
+    s: &Styles,
+    cal: &Calendar,
+    cells: &mut Vec<NodeId>,
+    compact: bool,
+) -> NodeId {
     let mut parts = vec![
-        month_row(t, s, cal),
-        t.gap(0, 12),
+        month_row(t, s, cal, compact),
+        t.gap(0, if compact { 6 } else { 12 }),
         legend(t, s),
-        t.gap(0, 20),
+        t.gap(0, if compact { 10 } else { 20 }),
         week_row(t, s),
-        t.gap(0, 10),
+        t.gap(0, if compact { 6 } else { 10 }),
     ];
-    parts.push(grid(t, s, cal, cells));
-    parts.push(t.gap(0, 28));
-    parts.push(month_card(t, s, cal));
-    parts.push(t.gap(0, 24));
-    parts.push(day_card(t, s, cal));
+    parts.push(grid(t, s, cal, cells, compact));
+    parts.push(t.gap(0, if compact { 12 } else { 28 }));
+    parts.push(month_card(t, s, cal, compact));
+    parts.push(t.gap(0, if compact { 10 } else { 24 }));
+    parts.push(day_card(t, s, cal, compact));
     let col = t.add(Node::column(0), parts);
-    t.pad(Insets::new(24, home_margin(), 32, home_margin()), col)
+    let pad = if compact {
+        Insets::new(10, home_margin(), 14, home_margin())
+    } else {
+        Insets::new(24, home_margin(), 32, home_margin())
+    };
+    t.pad(pad, col)
 }
 
 /// The row with the month and the two arrows that change it.
-fn month_row(t: &mut Tree, s: &Styles, cal: &Calendar) -> NodeId {
+fn month_row(t: &mut Tree, s: &Styles, cal: &Calendar, compact: bool) -> NodeId {
     let prev = arrow(t, Icon::ChevronLeft, cal.can_prev, action::PREV_MONTH);
     let next = arrow(t, Icon::ChevronRight, cal.can_next, action::NEXT_MONTH);
     let title = t.label(
@@ -283,12 +313,13 @@ fn month_row(t: &mut Tree, s: &Styles, cal: &Calendar) -> NodeId {
         ),
         s.font_px(44).bold().line_height(1.2).tracking(2.0),
     );
-    let fill = t.spacer(1);
+    let fill_left = t.spacer(1);
+    let fill_right = t.spacer(1);
     let row = t.add(
         Node::row(0).cross(Cross::Center),
-        [prev, fill, title, fill, next],
+        [prev, fill_left, title, fill_right, next],
     );
-    t.fixed(None, Some(MONTH_H), Some(row))
+    t.fixed(None, Some(if compact { 72 } else { MONTH_H }), Some(row))
 }
 
 /// One of the two arrows of the month. A month that cannot be shown leaves
@@ -332,27 +363,46 @@ fn week_row(t: &mut Tree, s: &Styles) -> NodeId {
 }
 
 /// The grid of the days of the month.
-fn grid(t: &mut Tree, s: &Styles, cal: &Calendar, cells: &mut Vec<NodeId>) -> NodeId {
+fn grid(
+    t: &mut Tree,
+    s: &Styles,
+    cal: &Calendar,
+    cells: &mut Vec<NodeId>,
+    compact: bool,
+) -> NodeId {
     let count = cal.days.len().div_ceil(7) * 7;
     let rows = count / 7;
-    let row_h = if rows > 5 { ROW_H } else { ROW_H_FEW };
+    let row_h = match (compact, rows > 5) {
+        (true, true) => 90,
+        (true, false) => 104,
+        (false, true) => ROW_H,
+        (false, false) => ROW_H_FEW,
+    };
+    let gap = if compact { 6 } else { 10 };
     let mut parts = Vec::new();
     for row in 0..rows {
         let mut line = Vec::new();
         for col in 0..7 {
             let index = row * 7 + col;
             let day = cal.days.get(index).copied();
-            let cell = cell(t, s, day, cal.selected, row_h);
+            let cell = cell(t, s, day, cal.selected, row_h, compact);
             cells.push(cell);
             line.push(cell);
         }
-        parts.push(t.add(Node::row(10), line));
+        parts.push(t.add(Node::row(gap), line));
     }
-    t.add(Node::column(10), parts)
+    t.add(Node::column(gap), parts)
 }
 
 /// One day of the grid: the number of the day and the mark of its level.
-fn cell(t: &mut Tree, s: &Styles, day: Option<Day>, selected: u8, row_h: i32) -> NodeId {
+fn cell(
+    t: &mut Tree,
+    s: &Styles,
+    day: Option<Day>,
+    selected: u8,
+    row_h: i32,
+    compact: bool,
+) -> NodeId {
     let Some(day) = day.filter(|d| d.day > 0) else {
         // A cell without a date: nothing to show.
         return t.add(
@@ -377,7 +427,10 @@ fn cell(t: &mut Tree, s: &Styles, day: Option<Day>, selected: u8, row_h: i32) ->
             gray: fg,
         }));
     }
-    let col = t.add(Node::column(16).cross(Cross::Center), parts);
+    let col = t.add(
+        Node::column(if compact { 6 } else { 16 }).cross(Cross::Center),
+        parts,
+    );
     let col = t.align(0.5, 0.5, col);
     let mut node = Node::new(Kind::Fixed {
         w: None,
@@ -395,7 +448,7 @@ fn cell(t: &mut Tree, s: &Styles, day: Option<Day>, selected: u8, row_h: i32) ->
 }
 
 /// The card with the total of the month.
-fn month_card(t: &mut Tree, s: &Styles, cal: &Calendar) -> NodeId {
+fn month_card(t: &mut Tree, s: &Styles, cal: &Calendar, compact: bool) -> NodeId {
     let hours = cal.month_minutes / 60;
     let minutes = cal.month_minutes % 60;
     let total_label = t.label(
@@ -428,8 +481,13 @@ fn month_card(t: &mut Tree, s: &Styles, cal: &Calendar) -> NodeId {
     let right = t.add(Node::column(4).cross(Cross::End), [days_label, days]);
     let fill = t.spacer(1);
     let row = t.add(Node::row(24).cross(Cross::Center), [left, fill, right]);
+    let pad = if compact {
+        Insets::new(14, 24, 14, 24)
+    } else {
+        Insets::new(22, 28, 22, 28)
+    };
     t.add(
-        Node::new(Kind::Padding(Insets::new(22, 28, 22, 28)))
+        Node::new(Kind::Padding(pad))
             .bg(CARD)
             .border(0, CARD, CARD_R),
         [row],
@@ -451,7 +509,7 @@ fn figure(t: &mut Tree, s: &Styles, parts: &[(String, bool)]) -> NodeId {
 }
 
 /// The card with the day picked: its date, its total, and the books.
-fn day_card(t: &mut Tree, s: &Styles, cal: &Calendar) -> NodeId {
+fn day_card(t: &mut Tree, s: &Styles, cal: &Calendar, compact: bool) -> NodeId {
     let title = t.label(
         &tf!(
             Msg::CalendarDayTitle,
@@ -469,7 +527,7 @@ fn day_card(t: &mut Tree, s: &Styles, cal: &Calendar) -> NodeId {
     let total = t.label(&total, s.font_xs().gray(INK_MID).line_height(1.2));
     let fill = t.spacer(1);
     let head = t.add(Node::row(20).cross(Cross::Center), [title, fill, total]);
-    let mut parts = vec![head, t.gap(0, 14)];
+    let mut parts = vec![head, t.gap(0, if compact { 8 } else { 14 })];
     if cal.books.is_empty() {
         let empty = t.label(
             tr(Msg::CalendarEmptyDay),
@@ -482,8 +540,13 @@ fn day_card(t: &mut Tree, s: &Styles, cal: &Calendar) -> NodeId {
         }
     }
     let col = t.add(Node::column(0), parts);
+    let pad = if compact {
+        Insets::new(14, 24, 10, 24)
+    } else {
+        Insets::new(22, 28, 10, 28)
+    };
     t.add(
-        Node::new(Kind::Padding(Insets::new(22, 28, 10, 28)))
+        Node::new(Kind::Padding(pad))
             .bg(CARD)
             .border(0, CARD, CARD_R),
         [col],
@@ -501,8 +564,7 @@ fn book_row(t: &mut Tree, s: &Styles, book: &Book, index: usize) -> NodeId {
                 crate::widgets::Cover::new(&book.title, &book.author, s.family)
                     .with_image(Some(image.clone())),
             );
-            let d = s.density;
-            t.fixed(Some(d.px(COVER_W)), Some(d.px(COVER_H)), Some(node))
+            t.fixed(Some(COVER_W), Some(COVER_H), Some(node))
         }
         None => t.custom(Cover { skin: index % 3 }),
     };

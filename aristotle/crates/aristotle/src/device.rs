@@ -77,12 +77,20 @@ impl Facts {
         });
         f.about
             .push((tr(Msg::SettingsAboutSoftware), software_version()));
-        if let Ok(model) = aristotle_hal::platform::Platform::model() {
+        if let Ok(Some(kobo)) = aristotle_hal::platform::detect_kobo() {
             f.about
-                .push((tr(Msg::SettingsAboutReader), model.name().to_string()));
-        }
-        if let Some(v) = system::firmware_version() {
-            f.about.push((tr(Msg::SettingsAboutFirmware), v));
+                .push((tr(Msg::SettingsAboutReader), kobo.model.name().to_string()));
+            if let Some(version) = kobo.firmware {
+                f.about.push((tr(Msg::SettingsAboutFirmware), version));
+            }
+        } else {
+            if let Ok(model) = aristotle_hal::platform::Platform::model() {
+                f.about
+                    .push((tr(Msg::SettingsAboutReader), model.name().to_string()));
+            }
+            if let Some(version) = system::firmware_version() {
+                f.about.push((tr(Msg::SettingsAboutFirmware), version));
+            }
         }
         if let Ok(m) = system::memory() {
             f.about.push((

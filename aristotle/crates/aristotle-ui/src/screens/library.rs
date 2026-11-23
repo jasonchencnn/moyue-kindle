@@ -46,6 +46,35 @@ pub enum Status {
     Finished,
 }
 
+/// Origin channel of a book in the library.
+///
+/// Extensible for future cloud channels (e.g. WebDAV / Jianguoyun). Used both
+/// for the cover badge and for channel-isolated cloud sync.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BookSource {
+    /// Side-loaded over USB or Wi-Fi transfer.
+    #[default]
+    Local,
+    /// Downloaded from Readest cloud.
+    Readest,
+    /// Downloaded from WeRead.
+    WeRead,
+    /// Downloaded from Nutstore (Jianguoyun) over WebDAV.
+    Jianguoyun,
+}
+
+impl BookSource {
+    /// Short localized badge shown on the book cover and list metadata.
+    pub fn label(self) -> &'static str {
+        tr(match self {
+            BookSource::Local => Msg::LibrarySourceLocal,
+            BookSource::Readest => Msg::LibrarySourceReadest,
+            BookSource::WeRead => Msg::LibrarySourceWeread,
+            BookSource::Jianguoyun => Msg::LibrarySourceJianguoyun,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Book {
     pub title: String,
@@ -65,6 +94,8 @@ pub struct Book {
     pub series: Option<(String, f32)>,
     /// The folder the book lies in (relative to `documents/`), if any.
     pub folder: Option<String>,
+    /// Origin channel of this book (Local / Readest / WeRead).
+    pub source: BookSource,
 }
 
 impl Book {
@@ -87,7 +118,13 @@ impl Book {
             cover: None,
             series: None,
             folder: None,
+            source: BookSource::Local,
         }
+    }
+
+    pub fn with_source(mut self, source: BookSource) -> Self {
+        self.source = source;
+        self
     }
 
     pub fn with_format(mut self, format: &str) -> Self {
@@ -304,6 +341,10 @@ pub mod action {
     pub const CLOUD_LIBRARY: ActionId = 41;
     /// Scan button
     pub const SCAN: ActionId = 42;
+    /// WeRead library segment
+    pub const WEREAD_LIBRARY: ActionId = 43;
+    /// Nutstore (Jianguoyun) library segment
+    pub const JIANGUOYUN_LIBRARY: ActionId = 44;
 
     /// `ITEM + i` opens `Shelf::items[i]`.
     pub const ITEM: ActionId = 100;
@@ -316,6 +357,38 @@ pub mod action {
 pub enum Segment {
     Local,
     Cloud,
+    Weread,
+    Jianguoyun,
+}
+
+/// Which cloud channels the library's segmented control shows.
+///
+/// The control always has the local cell; the three cloud cells (Readest,
+/// WeRead, Nutstore) appear only when their channel is turned on in Settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelVisibility {
+    /// The Readest cloud library.
+    pub readest: bool,
+    /// The WeRead library.
+    pub weread: bool,
+    /// The Nutstore (Jianguoyun) library.
+    pub jianguoyun: bool,
+}
+
+impl ChannelVisibility {
+    /// How many cloud channels are on.
+    pub fn count(self) -> usize {
+        usize::from(self.readest) + usize::from(self.weread) + usize::from(self.jianguoyun)
+    }
+
+    /// The visibility of the two channels the older call sites know about.
+    pub fn readest_and_weread(readest: bool, weread: bool) -> Self {
+        Self {
+            readest,
+            weread,
+            jianguoyun: false,
+        }
+    }
 }
 
 /// The side margins of a list shelf, and the gap above its first page: the
@@ -327,19 +400,31 @@ pub fn list_insets() -> Insets {
 
 /// One cell of the "Local / Cloud" segmented control: the chosen cell is
 /// black with white bold text and takes no action.
+///
+/// `compact` is the four-cell row: a smaller face and a single line, so that
+/// four labels fit a six-inch panel without wrapping or truncation.
 fn segment_cell(
     t: &mut Tree,
     s: &Styles,
     label: &str,
     chosen: bool,
     id: Option<ActionId>,
+    compact: bool,
 ) -> NodeId {
-    let style = if chosen {
+    let style = if compact {
+        if chosen {
+            s.font_xs().bold().gray(PAPER)
+        } else {
+            s.font_xs().gray(INK)
+        }
+    } else if chosen {
         s.font_sm().bold().gray(PAPER)
     } else {
         s.font_sm().gray(INK)
     };
-    let label = t.label(label, style);
+    let mut para = Paragraph::plain(label, style, Align::Left);
+    para.style.max_lines = Some(1);
+    let label = t.text(para);
     let aligned = t.align(0.5, 0.5, label);
     let mut cell = Node::column(0).border(0, 0, 18).flex(1);
     if chosen {
@@ -349,6 +434,16 @@ fn segment_cell(
         cell = cell.action(id).feedback(Feedback::Invert);
     }
     t.add(cell, [aligned])
+}
+
+/// The local cell's label. The four-cell row has no room for the word
+/// "books", so it drops it and keeps the count.
+pub fn segment_local_label(local_books_count: usize, compact: bool) -> String {
+    if compact {
+        tf!(Msg::LibrarySegmentLocalCompact, count = local_books_count)
+    } else {
+        tf!(Msg::LibrarySegmentLocal, count = local_books_count)
+    }
 }
 
 /// The "Local / Cloud" segmented control: the same cells, of the same size,
@@ -365,9 +460,124 @@ pub fn segment_control(
 ) -> NodeId {
     let local_str = tf!(Msg::LibrarySegmentLocal, count = local_books_count);
     let cloud_str = tr(Msg::LibrarySegmentCloud);
-    let local = segment_cell(t, s, &local_str, selected == Segment::Local, local);
-    let cloud = segment_cell(t, s, cloud_str, selected == Segment::Cloud, cloud);
+    let local = segment_cell(t, s, &local_str, selected == Segment::Local, local, false);
+    let cloud = segment_cell(t, s, cloud_str, selected == Segment::Cloud, cloud, false);
     let row = t.add(Node::row(6).cross(Cross::Stretch), [local, cloud]);
+    let inner = t.pad(Insets::all(6), row);
+    t.add(Node::column(0).bg(CARD).border(0, 0, 24), [inner])
+}
+
+/// The three cells of the library's segmented control: Local, Cloud and
+/// WeRead. `selected` takes no action; the others get the action their cell
+/// carries.
+pub fn segment_control_three(
+    t: &mut Tree,
+    s: &Styles,
+    local_books_count: usize,
+    selected: Segment,
+    local: Option<ActionId>,
+    cloud: Option<ActionId>,
+    weread: Option<ActionId>,
+) -> NodeId {
+    segment_control_for(
+        t,
+        s,
+        local_books_count,
+        selected,
+        local,
+        cloud,
+        weread,
+        true,
+        true,
+    )
+}
+
+/// Dynamic segmented control showing Local plus whichever cloud libraries are
+/// enabled in Settings (`show_cloud`, `show_weread`).
+#[allow(clippy::too_many_arguments)]
+pub fn segment_control_for(
+    t: &mut Tree,
+    s: &Styles,
+    local_books_count: usize,
+    selected: Segment,
+    local: Option<ActionId>,
+    cloud: Option<ActionId>,
+    weread: Option<ActionId>,
+    show_cloud: bool,
+    show_weread: bool,
+) -> NodeId {
+    segment_control_channels(
+        t,
+        s,
+        local_books_count,
+        selected,
+        local,
+        cloud,
+        weread,
+        None,
+        ChannelVisibility::readest_and_weread(show_cloud, show_weread),
+    )
+}
+
+/// The library's segmented control with every channel Settings turns on:
+/// Local, plus Readest, WeRead and Nutstore.
+///
+/// Four cells share the row of a six-inch panel, so the row is compact: a
+/// smaller face, a shorter local label and one line per cell. The labels
+/// never wrap, so the row keeps its height on every panel.
+#[allow(clippy::too_many_arguments)]
+pub fn segment_control_channels(
+    t: &mut Tree,
+    s: &Styles,
+    local_books_count: usize,
+    selected: Segment,
+    local: Option<ActionId>,
+    readest: Option<ActionId>,
+    weread: Option<ActionId>,
+    jianguoyun: Option<ActionId>,
+    channels: ChannelVisibility,
+) -> NodeId {
+    let mut cells: Vec<(Segment, String, Option<ActionId>)> = Vec::new();
+    cells.push((Segment::Local, String::new(), local));
+    if channels.readest {
+        cells.push((
+            Segment::Cloud,
+            tr(Msg::LibrarySegmentCloud).to_string(),
+            readest,
+        ));
+    }
+    if channels.weread {
+        cells.push((
+            Segment::Weread,
+            tr(Msg::LibrarySegmentWeread).to_string(),
+            weread,
+        ));
+    }
+    if channels.jianguoyun {
+        cells.push((
+            Segment::Jianguoyun,
+            tr(Msg::LibrarySegmentJianguoyun).to_string(),
+            jianguoyun,
+        ));
+    }
+    let compact = cells.len() > 3;
+    let local_label = segment_local_label(local_books_count, compact);
+    let nodes: Vec<NodeId> = cells
+        .into_iter()
+        .enumerate()
+        .map(|(i, (segment, label, id))| {
+            let label = if i == 0 {
+                local_label.clone()
+            } else if compact && segment == Segment::Cloud {
+                BookSource::Readest.label().to_string()
+            } else {
+                label
+            };
+            segment_cell(t, s, &label, segment == selected, id, compact)
+        })
+        .collect();
+    let gap = if compact { 2 } else { 6 };
+    let row = t.add(Node::row(gap).cross(Cross::Stretch), nodes);
     let inner = t.pad(Insets::all(6), row);
     t.add(Node::column(0).bg(CARD).border(0, 0, 24), [inner])
 }
@@ -506,7 +716,7 @@ impl Library {
 
     /// Builds the library tree for `shelf`.
     pub fn build_shelf(text: &mut TextEngine, s: &Styles, shelf: &Shelf) -> (Tree, Self) {
-        Self::build_shelf_for_width(text, s, shelf, crate::geom::SCREEN_WIDTH)
+        Self::build_shelf_for_width(text, s, shelf, s.density.px(crate::geom::SCREEN_WIDTH))
     }
 
     /// Wraps shelf filters to keep their labels visible at the supplied width.
@@ -516,6 +726,54 @@ impl Library {
         shelf: &Shelf,
         width: i32,
     ) -> (Tree, Self) {
+        Self::build_shelf_for_size(
+            text,
+            s,
+            shelf,
+            Size::new(width, s.density.px(crate::geom::SCREEN_HEIGHT)),
+        )
+    }
+
+    /// Builds a shelf using the panel's native dimensions and density.
+    pub fn build_shelf_for_size(
+        text: &mut TextEngine,
+        s: &Styles,
+        shelf: &Shelf,
+        size: Size,
+    ) -> (Tree, Self) {
+        Self::build_shelf_with_sources(text, s, shelf, size, true, true)
+    }
+
+    /// Builds a shelf using the panel's native dimensions, showing only the
+    /// enabled cloud channels (`show_cloud` for Readest, `show_weread` for WeRead).
+    pub fn build_shelf_with_sources(
+        text: &mut TextEngine,
+        s: &Styles,
+        shelf: &Shelf,
+        size: Size,
+        show_cloud: bool,
+        show_weread: bool,
+    ) -> (Tree, Self) {
+        Self::build_shelf_with_channels(
+            text,
+            s,
+            shelf,
+            size,
+            ChannelVisibility::readest_and_weread(show_cloud, show_weread),
+        )
+    }
+
+    /// Builds a shelf using the panel's native dimensions, showing the cloud
+    /// channels Settings turns on: Readest, WeRead and Nutstore.
+    pub fn build_shelf_with_channels(
+        text: &mut TextEngine,
+        s: &Styles,
+        shelf: &Shelf,
+        size: Size,
+        channels: ChannelVisibility,
+    ) -> (Tree, Self) {
+        let width = (size.w as f32 * 300.0 / s.density.dpi() as f32).round() as i32;
+        let panel = crate::theme::PanelLayout::for_size(size, s.density);
         let mut t = Tree::new();
         let bar = status_line(&mut t, s, &shelf.status);
         let status = t.pad(Insets::new(0, home_margin(), 0, home_margin()), bar.root);
@@ -564,26 +822,32 @@ impl Library {
                 let header = t.pad(Insets::new(0, home_margin(), 0, home_margin()), header);
                 column.push(header);
 
-                // Segmented control: Local / Cloud
-                let seg_box = segment_control(
-                    &mut t,
-                    s,
-                    shelf.local_books_count,
-                    Segment::Local,
-                    None,
-                    Some(action::CLOUD_LIBRARY),
-                );
-                let seg_box = t.fixed(None, Some(76), Some(seg_box));
-                let bottom_margin = if shelf.layout == LibraryLayout::Grid {
-                    24
-                } else {
-                    28
-                };
-                let seg_control = t.pad(
-                    Insets::new(0, home_margin(), bottom_margin, home_margin()),
-                    seg_box,
-                );
-                column.push(seg_control);
+                // Segmented control: Local + enabled cloud sources (omitted when
+                // every cloud channel is turned off in Settings).
+                if channels.count() > 0 {
+                    let seg_box = segment_control_channels(
+                        &mut t,
+                        s,
+                        shelf.local_books_count,
+                        Segment::Local,
+                        None,
+                        channels.readest.then_some(action::CLOUD_LIBRARY),
+                        channels.weread.then_some(action::WEREAD_LIBRARY),
+                        channels.jianguoyun.then_some(action::JIANGUOYUN_LIBRARY),
+                        channels,
+                    );
+                    let seg_box = t.fixed(None, Some(76), Some(seg_box));
+                    let bottom_margin = if shelf.layout == LibraryLayout::Grid {
+                        24
+                    } else {
+                        28
+                    };
+                    let seg_control = t.pad(
+                        Insets::new(0, home_margin(), bottom_margin, home_margin()),
+                        seg_box,
+                    );
+                    column.push(seg_control);
+                }
             }
             Place::Folder { name } | Place::Series { name } => {
                 let back = icon_button(&mut t, Icon::ArrowLeft, 44, action::BACK);
@@ -691,8 +955,9 @@ impl Library {
                     let on = *f == filter;
                     let action_id = action::FILTER + i as ActionId;
                     let style = if on { s.ui_bold() } else { s.ui() };
-                    let chip_w = text.measure(f.label(), &style).ceil() as i32
-                        + 2 * s.density.px(crate::components::CHIP_PADDING_X);
+                    let chip_w = (text.measure(f.label(), &style) * 300.0 / s.density.dpi() as f32)
+                        .ceil() as i32
+                        + 2 * crate::components::CHIP_PADDING_X;
                     if !current_chips.is_empty() && used + chip_gap + chip_w > available {
                         chip_rows.push(t.add(
                             Node::row(chip_gap).cross(Cross::Center),
@@ -790,20 +1055,9 @@ impl Library {
                     let l = t.text(Paragraph::plain(msg, s.ui().gray(INK_2), Align::Center));
                     children.push(t.pad(Insets::vh(mm(10.0), Space::L), l));
                 } else {
-                    for chunk in rows.chunks(4) {
-                        let mut page_items = Vec::new();
-                        for (ci, &card) in chunk.iter().enumerate() {
-                            if ci > 0 {
-                                page_items.push(t.gap(1, 24));
-                            }
-                            page_items.push(card);
-                        }
-                        let page_col = t.add(Node::column(0), page_items);
-                        let page_box = t.fixed(None, Some(932), Some(page_col));
-                        children.push(page_box);
-                    }
+                    children.extend(rows.iter().copied());
                 }
-                let pages_node = t.add(pages(0).flex(1), children);
+                let pages_node = t.add(pages(24).flex(1), children);
                 let list = t.add(
                     Node::new(Kind::Padding(list_insets())).flex(1),
                     [pages_node],
@@ -812,11 +1066,17 @@ impl Library {
             }
             LibraryLayout::Grid => {
                 let available = (width - 2 * home_margin()).max(1);
-                let card_w = (272 * width / 1264).clamp(160, 272);
+                // Compact covers leave room for two complete rows and the pager.
+                let (columns, card_w) = match panel {
+                    crate::theme::PanelLayout::Compact => (3, 188),
+                    crate::theme::PanelLayout::Standard => (3, 272),
+                    crate::theme::PanelLayout::Large => (4, 320),
+                };
+                let card_w =
+                    card_w.min(((available - (columns as i32 - 1) * 24) / columns as i32).max(1));
                 let cover_h = (card_w as f32 * 363.0 / 272.0).round() as i32;
                 let card = (card_w, cover_h);
-                let col_gap = ((available - 3 * card_w) / 2).max(1);
-                let page_h = 994;
+                let col_gap = ((available - columns as i32 * card_w) / (columns as i32 - 1)).max(1);
 
                 for (i, item) in shelf.items.iter().enumerate() {
                     let id = action::ITEM + i as ActionId;
@@ -861,30 +1121,15 @@ impl Library {
                     let l = t.text(Paragraph::plain(msg, s.ui().gray(INK_2), Align::Center));
                     children.push(t.pad(Insets::vh(mm(10.0), Space::L), l));
                 } else {
-                    for page_chunk in rows.chunks(6) {
-                        let mut row_nodes = Vec::new();
-                        for row_chunk in page_chunk.chunks(3) {
-                            let mut row_items = Vec::new();
-                            for (ci, &cell) in row_chunk.iter().enumerate() {
-                                if ci > 0 {
-                                    row_items.push(t.gap(col_gap, 1));
-                                }
-                                row_items.push(cell);
-                            }
-                            let r = t.add(Node::row(0), row_items);
-                            row_nodes.push(r);
-                        }
-                        let page_node = if row_nodes.len() > 1 {
-                            let g = t.gap(1, 40);
-                            t.add(Node::column(0), [row_nodes[0], g, row_nodes[1]])
-                        } else {
-                            t.add(Node::column(0), row_nodes)
-                        };
-                        let page_node = t.fixed(None, Some(page_h), Some(page_node));
-                        children.push(page_node);
+                    for row_chunk in rows.chunks(columns) {
+                        let row = t.add(
+                            Node::row(col_gap).cross(Cross::Start),
+                            row_chunk.iter().copied(),
+                        );
+                        children.push(row);
                     }
                 }
-                let pages_node = t.add(pages(0).flex(1), children);
+                let pages_node = t.add(pages(40).flex(1), children);
                 let list = t.add(
                     Node::new(Kind::Padding(Insets::new(
                         24,
@@ -928,11 +1173,7 @@ impl Library {
             Node::row(0).cross(Cross::Center),
             [prev, pager_center, next],
         );
-        let pager_h = if shelf.layout == LibraryLayout::Grid {
-            96
-        } else {
-            104
-        };
+        let pager_h = MIN_TARGET;
         let pager_fixed = t.fixed(None, Some(pager_h), Some(pager_row));
         let pager = t.pad(Insets::new(0, home_margin(), 0, home_margin()), pager_fixed);
 
@@ -989,6 +1230,7 @@ impl Library {
         let cover_box = if covers != CoverMode::None {
             let cover = Cover::new(&b.title, &b.author, s.family)
                 .with_mark(b.mark())
+                .with_source_tag(b.source.label())
                 .with_image(b.cover.clone().filter(|_| covers == CoverMode::Photos));
             let cover_node = t.custom(cover);
             image_node = Some(cover_node);
@@ -1005,14 +1247,15 @@ impl Library {
         tp.style.max_lines = Some(1);
         let title = t.text(tp);
 
+        let src_lbl = b.source.label();
         let meta_str = if let Some((series, idx)) = &b.series {
             if let Some(lbl) = series_label(series, *idx, in_series) {
-                format!("{} · {} · {}", b.author, b.format, lbl)
+                format!("{} · {} · {} · {}", b.author, b.format, src_lbl, lbl)
             } else {
-                format!("{} · {}", b.author, b.format)
+                format!("{} · {} · {}", b.author, b.format, src_lbl)
             }
         } else {
-            format!("{} · {}", b.author, b.format)
+            format!("{} · {} · {}", b.author, b.format, src_lbl)
         };
         let mut mp = Paragraph::plain(
             &meta_str,
@@ -1138,6 +1381,7 @@ impl Library {
     ) -> (NodeId, NodeId) {
         let cover = Cover::new(&b.title, &b.author, s.family)
             .with_mark(b.mark())
+            .with_source_tag(b.source.label())
             .with_image(b.cover.clone().filter(|_| covers == CoverMode::Photos));
         let cover_node = t.custom(cover);
         let cover_box = t.fixed(Some(card_w), Some(cover_h), Some(cover_node));
@@ -1656,8 +1900,8 @@ mod tests {
         };
         assert!(dark(CoverMode::Photos) > 80);
         assert!(dark(CoverMode::None) < 40);
-        // The grid follows the same setting: one black cover fills a 242 x
-        // 363 cell, so the whole screen has thousands more dark pixels with
+        // A black cover fills the compact cell, so the whole screen
+        // has thousands more dark pixels with
         // photos than with the generated card.
         let dark_grid = |covers| {
             let (ui, _) = ui_for(&Shelf {
@@ -1674,7 +1918,7 @@ mod tests {
             n
         };
         assert!(
-            dark_grid(CoverMode::Photos) > dark_grid(CoverMode::Cards) + 50_000,
+            dark_grid(CoverMode::Photos) > dark_grid(CoverMode::Cards) + 30_000,
             "the grid draws the photo only in the photos setting"
         );
     }
@@ -1813,13 +2057,13 @@ mod tests {
     }
 
     #[test]
-    fn list_layout_paginates_four_items_per_page() {
+    fn list_layout_paginates_complete_rows() {
         let books = sample_books();
         let items = sample_items(&books, View::Books);
         let shelf = home(&items, View::Books, Filter::All, CoverMode::Cards);
         let (mut ui, mut lib) = ui_for(&shelf);
         assert_eq!(lib.rows.len(), items.len());
-        let expected_pages = items.len().div_ceil(4);
+        let expected_pages = items.len().div_ceil(3);
         let (page, count) = ui.tree.page(lib.list);
         assert_eq!(page, 0);
         assert_eq!(count, expected_pages);
@@ -1833,7 +2077,7 @@ mod tests {
 
     #[test]
     fn photo_loading_tracks_only_the_visible_page() {
-        for (layout, per_page) in [(LibraryLayout::List, 4), (LibraryLayout::Grid, 6)] {
+        for (layout, per_page) in [(LibraryLayout::List, 3), (LibraryLayout::Grid, 6)] {
             let items: Vec<Item> = (0..200)
                 .map(|i| Item::Book(Book::new(&format!("Book {i}"), "Test author", 0.0)))
                 .collect();

@@ -845,6 +845,12 @@ impl App {
                     total,
                 } => self.on_download_progress(token, bytes, total)?,
                 Done::Downloaded { token, result } => self.on_downloaded(token, result)?,
+                Done::Ota { generation, report } => self.on_ota_report(generation, report)?,
+                Done::ReadestPrewarmed { store } => {
+                    if self.net.is_current_store(store) {
+                        self.net.persist_session();
+                    }
+                }
                 Done::ReadestLogin { result } => self.on_readest_login(result)?,
                 Done::ReadestPulled {
                     book,
@@ -901,6 +907,56 @@ impl App {
                     store,
                     result,
                 } => self.on_cloud_downloaded(token, hash, store, result)?,
+                Done::WereadQr {
+                    generation,
+                    url,
+                    phase,
+                } => self.on_weread_qr(generation, url, phase)?,
+                Done::WereadLoggedIn {
+                    generation,
+                    credentials,
+                } => self.on_weread_logged_in(generation, credentials)?,
+                Done::WereadLoginExpired { generation } => self.on_weread_qr_expired(generation)?,
+                Done::WereadLoginFailed {
+                    generation,
+                    message,
+                } => self.on_weread_login_failed(generation, message)?,
+                Done::WereadLoginCancelled { generation } => {
+                    self.on_weread_login_cancelled(generation)
+                }
+                Done::WereadShelf {
+                    token,
+                    credentials,
+                    result,
+                } => self.on_weread_shelf(token, credentials, result)?,
+                Done::JianguoyunTestLogin {
+                    token,
+                    settings,
+                    result,
+                } => self.on_jianguoyun_test_login(token, settings, result)?,
+                Done::JianguoyunListed {
+                    token,
+                    dir_path,
+                    result,
+                } => self.on_jianguoyun_listed(token, dir_path, result)?,
+                Done::JianguoyunProgress {
+                    token,
+                    remote_path,
+                    bytes,
+                    total,
+                } => self.on_jianguoyun_progress(token, remote_path, bytes, total)?,
+                Done::JianguoyunDownloaded {
+                    token,
+                    remote_path,
+                    result,
+                } => self.on_jianguoyun_downloaded(token, remote_path, result)?,
+                Done::JianguoyunBookSynced {
+                    book,
+                    token,
+                    manual,
+                    push_only,
+                    result,
+                } => self.on_jianguoyun_book_synced(book, token, manual, push_only, result)?,
             }
         }
         if previous_sync_message != self.sync.message && self.asleep.is_none() {

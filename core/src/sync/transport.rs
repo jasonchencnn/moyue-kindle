@@ -35,6 +35,20 @@ impl HttpRequest {
     }
 }
 
+fn sensitive_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "apikey"
+            | "cookie"
+            | "set-cookie"
+            | "vid"
+            | "accesstoken"
+            | "x-vid"
+            | "x-skey"
+    )
+}
+
 fn mask_sensitive_url(url: &str) -> String {
     if let Some(idx) = url.find('?') {
         let query = &url[idx + 1..];
@@ -47,6 +61,7 @@ fn mask_sensitive_url(url: &str) -> String {
             || lower.contains("auth=")
             || lower.contains("filekey=")
             || lower.contains("ticket=")
+            || lower.contains("otp=")
         {
             format!("{}?[QUERY_REDACTED]", &url[..idx])
         } else {
@@ -64,8 +79,7 @@ impl fmt::Debug for HttpRequest {
             .headers
             .iter()
             .map(|(k, v)| {
-                let lower = k.to_ascii_lowercase();
-                if lower == "authorization" || lower == "apikey" {
+                if sensitive_header(k) {
                     (k.clone(), "[REDACTED]".to_string())
                 } else {
                     (k.clone(), v.clone())

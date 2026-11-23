@@ -7,11 +7,22 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(NOT DEFINED KO_CRE_DIR)
     set(KO_CRE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/koreader-crengine")
 endif()
+if(NOT DEFINED LUNASVG_DIR)
+    set(LUNASVG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/lunasvg")
+endif()
+
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(LUNASVG_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(XTENDED_DIR "${LUNASVG_DIR}/xtended" CACHE PATH "" FORCE)
+add_subdirectory("${LUNASVG_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/lunasvg")
+target_compile_options(lunasvg PRIVATE -Wno-everything)
 
 include_directories(
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${KO_CRE_DIR}/crengine/include"
     "${KO_CRE_DIR}/thirdparty/xxhash"
+    "${LUNASVG_DIR}/include"
+    "${LUNASVG_DIR}/xtended"
     ${EXTRA_INCLUDES}
 )
 

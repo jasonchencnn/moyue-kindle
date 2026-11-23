@@ -1,0 +1,67 @@
+diff --git a/crengine/src/epubfmt.cpp b/crengine/src/epubfmt.cpp
+index b3d8272..b730b51 100644
+--- a/crengine/src/epubfmt.cpp
++++ b/crengine/src/epubfmt.cpp
+@@ -11,18 +11,21 @@ public:
+     lString32 mediaType;
+     lString32 id;
+     lString32 title;
++    lString32 spineProperties;
+     bool is_xhtml;
+     bool nonlinear;
+     EpubItem()
+     { }
+     EpubItem( const EpubItem & v )
+-        : href(v.href), mediaType(v.mediaType), id(v.id), is_xhtml(v.is_xhtml)
++        : href(v.href), mediaType(v.mediaType), id(v.id), spineProperties(v.spineProperties),
++          is_xhtml(v.is_xhtml), nonlinear(v.nonlinear)
+     { }
+     EpubItem & operator = ( const EpubItem & v )
+     {
+         href = v.href;
+         mediaType = v.mediaType;
+         id = v.id;
++        spineProperties = v.spineProperties;
+         return *this;
+     }
+ };
+@@ -1816,6 +1819,7 @@ bool ImportEpubDocument( LVStreamRef stream, ldomDocument * m_doc, LVDocViewCall
+                     EpubItem * epubItem = epubItems.findById( item->getAttributeValue("idref") );
+                     if ( epubItem ) {
+                         epubItem->nonlinear = lString32(item->getAttributeValue("linear")).lowercase() == U"no";
++                        epubItem->spineProperties = item->getAttributeValue("properties");
+                         spineItems.add( epubItem );
+                     }
+                 }
+@@ -1908,7 +1912,7 @@ bool ImportEpubDocument( LVStreamRef stream, ldomDocument * m_doc, LVDocViewCall
+                 bool handled = false;
+                 appender.setCodeBase( name );
+                 appender.setNonLinearFlag(spineItems[i]->nonlinear);
+-                appender.setFragmentType(); // unset
++                appender.setFragmentType(spineItems[i]->spineProperties);
+                 CRLog::debug("Checking fragment: %s", LCSTR(name));
+                 LVStreamRef stream = m_arc->OpenStream(name.c_str(), LVOM_READ);
+                 if ( !stream.isNull() ) {
+diff --git a/crengine/src/lvstsheet.cpp b/crengine/src/lvstsheet.cpp
+index 991243a..c7240f3 100644
+--- a/crengine/src/lvstsheet.cpp
++++ b/crengine/src/lvstsheet.cpp
+@@ -3646,6 +3646,18 @@ bool LVCssDeclaration::parse( const char * &decl, lUInt32 domVersion, bool highe
+             case cssd_display:
+                 IF_g_SET_n_AND_break(false, css_d_inherit, css_d_inline);
+                 n = parse_name( decl, css_d_names, -1 );
++                if (n == -1) {
++                    static const char * css_d_modern_block[] = {
++                        "flex", "-webkit-flex", "grid", "flow-root", NULL
++                    };
++                    static const char * css_d_modern_inline_block[] = {
++                        "inline-flex", "-webkit-inline-flex", "inline-grid", NULL
++                    };
++                    if (parse_name(decl, css_d_modern_block, -1) >= 0)
++                        n = css_d_block;
++                    else if (parse_name(decl, css_d_modern_inline_block, -1) >= 0)
++                        n = css_d_inline_block;
++                }
+                 if (n == css_d_list_item_block && doc && doc->getDOMVersionRequested() < 20180524) {
+                     n = css_d_list_item_legacy; // legacy rendering of list-item
+                 }

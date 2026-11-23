@@ -199,7 +199,9 @@ impl PowerEvents {
             let initial_proc = match spawn2() {
                 Ok(child_proc) => Some(child_proc),
                 Err(e) => {
-                    eprintln!("aristotle: initial volumd listener spawn failed ({e}), worker will retry");
+                    eprintln!(
+                        "aristotle: initial volumd listener spawn failed ({e}), worker will retry"
+                    );
                     None
                 }
             };

@@ -1,58 +1,93 @@
-/* Inkread built-in stylesheet.
+/* 墨阅 · 中文出版级精排与主流精排规范（多看 / 微信读书 / 豆瓣 / 掌阅 / EPUB3）基础样式表。
  *
- * Compiled into the binary and applied to every document as the BASE
- * stylesheet. A book's own CSS is NOT dropped: crengine's embedded styles
- * (PROP_EMBEDDED_STYLES, enabled by default and set explicitly by the
- * shim) layer the book's <style> blocks, linked stylesheets and inline
- * style attributes on top of this base. Rules that must always win belong
- * here with !important.
+ * 本样式表作为 crengine 的基础样式（UA stylesheet）编译进二进制，在精排模式下
+ * 与书内 <style>、外链 CSS 和行内 style 属性层叠（PROP_EMBEDDED_STYLES=true）：
+ * - 基础规则不写 !important，保证书内精排样式（居中标题、图注、诗歌、引文、
+ *   装饰框、场景留白）始终优先生效；
+ * - 针对中文排版（CLREQ）和多看/微信读书/豆瓣/掌阅等常见精排规范提供开箱即用
+ *   的深度适配（中文字格对齐、上标/图标不撑行高、图文防拆页、页下注、全屏插图）。
  *
- * Only properties crengine understands are used; the list lives in
- * crengine/src/lvstsheet.cpp (css_decl_name).
- *
- * Line height is deliberately NOT set here: it is driven by the engine's
- * setDefaultInterlineSpace(), so the reader's line-height setting takes
- * effect immediately instead of being overridden by CSS.
+ * 仅使用 koreader/crengine 支持的属性与 -cr-hint（见 lvstsheet.cpp / cssdef.h）。
+ * 行高由引擎 setDefaultInterlineSpace() 驱动，不在此处写死。
  */
 
-/* Body text: 2em first-line indent, justified, no extra space around it. */
+/* -------------------------------------------------------------------------
+ * 1. 文档根与 HTML5 语义块级元素
+ * ------------------------------------------------------------------------- */
+
+html,
 body {
-    margin: 0em;
-    padding: 0em;
+    margin: 0;
+    padding: 0;
     text-indent: 2em;
     text-align: justify;
+    -cr-hint: cjk-tailored;
+}
+
+article,
+aside,
+details,
+figcaption,
+figure,
+footer,
+header,
+hgroup,
+main,
+nav,
+section,
+summary,
+address {
+    display: block;
+}
+
+div {
+    display: block;
 }
 
 p {
-    margin-top: 0em;
+    margin-top: 0;
     margin-bottom: 0.6em;
     text-indent: 2em;
     text-align: justify;
+    orphans: 2;
+    widows: 2;
+    -cr-hint: cjk-tailored;
 }
 
-/* Headings: bold and larger, centered, and never indented. */
+/* -------------------------------------------------------------------------
+ * 2. 标题层级与防孤行（禁止标题孤挂页底）
+ * ------------------------------------------------------------------------- */
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+    font-weight: bold;
+    text-indent: 0;
+    page-break-after: avoid;
+    break-after: avoid;
+    orphans: 2;
+    widows: 2;
+}
+
 h1 {
     font-size: 160%;
-    font-weight: bold;
     text-align: center;
-    text-indent: 0em;
-    margin-top: 0.4em;
-    margin-bottom: 0.8em;
+    margin-top: 0.6em;
+    margin-bottom: 0.9em;
 }
 
 h2 {
     font-size: 130%;
-    font-weight: bold;
     text-align: center;
-    text-indent: 0em;
     margin-top: 0.6em;
-    margin-bottom: 0.6em;
+    margin-bottom: 0.7em;
 }
 
 h3 {
     font-size: 115%;
-    font-weight: bold;
-    text-indent: 0em;
     margin-top: 0.5em;
     margin-bottom: 0.5em;
 }
@@ -61,45 +96,476 @@ h4,
 h5,
 h6 {
     font-size: 105%;
-    font-weight: bold;
-    text-indent: 0em;
     margin-top: 0.4em;
     margin-bottom: 0.4em;
 }
 
-/* Quotes: indented block, no first-line indent. */
+/* -------------------------------------------------------------------------
+ * 3. 引文、分隔线、预格式化代码、列表、定义表与表格
+ * ------------------------------------------------------------------------- */
+
 blockquote {
-    margin-left: 2em;
-    margin-right: 2em;
-    margin-top: 0.4em;
-    margin-bottom: 0.4em;
-    text-indent: 0em;
+    margin-left: 1.6em;
+    margin-right: 1.2em;
+    margin-top: 0.6em;
+    margin-bottom: 0.6em;
+    padding-left: 0.8em;
+    border-left: 2px solid #888888;
+    text-indent: 0;
     text-align: justify;
 }
 
-/* Preformatted text: keep spaces, no indent, no justification. */
+blockquote p {
+    text-indent: 0;
+}
+
+hr {
+    display: block;
+    height: 1px;
+    border: 0;
+    border-top: 1px solid #888888;
+    margin-top: 0.9em;
+    margin-bottom: 0.9em;
+    margin-left: 15%;
+    margin-right: 15%;
+}
+
 pre {
     font-family: monospace;
-    white-space: pre;
-    text-indent: 0em;
+    white-space: pre-wrap;
+    text-indent: 0;
     text-align: left;
-    margin-top: 0.4em;
-    margin-bottom: 0.4em;
+    margin-top: 0.5em;
+    margin-bottom: 0.5em;
+    padding: 0.4em 0.6em;
 }
 
-/* Lists: no first-line indent. */
+code,
+kbd,
+samp,
+tt {
+    font-family: monospace;
+}
+
 ul,
 ol {
+    margin-top: 0.4em;
+    margin-bottom: 0.4em;
+    padding-left: 1.8em;
+    text-indent: 0;
+}
+
+li {
+    text-indent: 0;
+}
+
+li p {
+    text-indent: 0;
+    margin-bottom: 0.3em;
+}
+
+dl {
+    margin-top: 0.5em;
+    margin-bottom: 0.5em;
+    text-indent: 0;
+}
+
+dt {
+    font-weight: bold;
+    text-indent: 0;
+    margin-top: 0.4em;
+}
+
+dd {
+    margin-left: 1.6em;
+    text-indent: 0;
+    margin-bottom: 0.3em;
+}
+
+table {
+    border-collapse: collapse;
+    margin-top: 0.6em;
+    margin-bottom: 0.6em;
+    text-indent: 0;
+    max-width: 100%;
+}
+
+caption {
+    text-align: center;
+    text-indent: 0;
+    font-size: 0.9em;
+    margin-bottom: 0.3em;
+}
+
+th,
+td {
+    border: 1px solid #999999;
+    padding: 0.3em 0.45em;
+    text-indent: 0;
+    vertical-align: top;
+}
+
+th {
+    font-weight: bold;
+    background-color: #efefef;
+}
+
+/* -------------------------------------------------------------------------
+ * 4. 行内语义、上标/下标防撑行距、中文注音 Ruby
+ * ------------------------------------------------------------------------- */
+
+sup,
+sub {
+    font-size: 72%;
+    line-height: 0;
+    -cr-hint: strut-confined;
+}
+
+sup {
+    vertical-align: super;
+}
+
+sub {
+    vertical-align: sub;
+}
+
+small {
+    font-size: 85%;
+}
+
+abbr,
+cite,
+em,
+i,
+dfn,
+var {
+    font-style: italic;
+}
+
+b,
+strong {
+    font-weight: bold;
+}
+
+del,
+s,
+strike {
+    text-decoration: line-through;
+}
+
+u,
+ins {
+    text-decoration: underline;
+}
+
+mark {
+    background-color: #e4e4e4;
+}
+
+ruby {
+    display: ruby;
+    ruby-position: over;
+    text-indent: 0;
+    -cr-hint: none;
+}
+
+rb,
+rt,
+rtc {
+    text-indent: 0;
+    text-align: center;
+    -cr-hint: none;
+}
+
+rt {
+    font-size: 55%;
+    line-height: 1.1;
+}
+
+rp {
+    display: none;
+}
+
+/* -------------------------------------------------------------------------
+ * 5. 图片、SVG 与标准 HTML5 图注（图文防拆页、零错误缩进）
+ * ------------------------------------------------------------------------- */
+
+img,
+svg {
+    max-width: 100%;
+    height: auto;
+    text-indent: 0;
+}
+
+figure {
+    margin-top: 0.8em;
+    margin-bottom: 0.8em;
+    margin-left: 0;
+    margin-right: 0;
+    text-align: center;
+    text-indent: 0;
+    page-break-inside: avoid;
+    break-inside: avoid;
+}
+
+figure p {
+    text-indent: 0;
+    text-align: center;
+}
+
+figcaption {
+    font-size: 0.85em;
+    color: #555555;
+    text-align: center;
+    text-indent: 0;
+    margin-top: 0.35em;
+    margin-bottom: 0.2em;
+    page-break-before: avoid;
+    break-before: avoid;
+}
+
+/* -------------------------------------------------------------------------
+ * 6. 多看（Duokan）精排专有规范定制级适配
+ * ------------------------------------------------------------------------- */
+
+/* 多看全屏/适配插图页（OPF spine itemref properties="duokan-page-fullscreen"） */
+DocFragment[T~="duokan-page-fullscreen"],
+DocFragment[T~="duokan-page-fitwindow"] {
+    margin: 0;
+    padding: 0;
+    text-indent: 0;
+    text-align: center;
+    page-break-before: always;
+    page-break-after: always;
+}
+
+DocFragment[T~="duokan-page-fullscreen"] p,
+DocFragment[T~="duokan-page-fitwindow"] p,
+DocFragment[T~="duokan-page-fullscreen"] div,
+DocFragment[T~="duokan-page-fitwindow"] div {
+    margin: 0;
+    padding: 0;
+    text-indent: 0;
+    text-align: center;
+}
+
+DocFragment[T~="duokan-page-fullscreen"] img,
+DocFragment[T~="duokan-page-fullscreen"] svg,
+DocFragment[T~="duokan-page-fitwindow"] img,
+DocFragment[T~="duokan-page-fitwindow"] svg {
+    display: block;
+    margin-left: auto;
+    margin-right: auto;
+    max-width: 100%;
+    max-height: 98%;
+    height: auto;
+    width: auto;
+}
+
+/* 多看单图与图集容器：图文防拆页、居中、不缩进 */
+.duokan-image-single,
+.duokan-image-gallery,
+.duokan-image-box {
+    display: block;
+    text-align: center;
+    text-indent: 0;
+    margin-top: 0.8em;
+    margin-bottom: 0.8em;
+    page-break-inside: avoid;
+    break-inside: avoid;
+}
+
+.duokan-image-single p,
+.duokan-image-gallery p,
+.duokan-image-box p {
+    text-indent: 0;
+    text-align: center;
+    margin-top: 0.2em;
+    margin-bottom: 0.2em;
+}
+
+.duokan-image-single img,
+.duokan-image-gallery img,
+.duokan-image-box img {
+    max-width: 100%;
+    height: auto;
+    text-indent: 0;
+}
+
+.duokan-image-maintitle {
+    font-size: 0.9em;
+    font-weight: bold;
+    text-align: center;
+    text-indent: 0;
+    margin-top: 0.35em;
+    margin-bottom: 0.15em;
+    page-break-before: avoid;
+    break-before: avoid;
+}
+
+.duokan-image-subtitle,
+.duokan-image-des {
+    font-size: 0.82em;
+    color: #555555;
+    text-align: center;
+    text-indent: 0;
+    margin-top: 0.2em;
+    margin-bottom: 0.3em;
+    page-break-before: avoid;
+    break-before: avoid;
+}
+
+/* 多看文内注释图标：行内小图标绝不撑裂行距，标记 noteref */
+a.duokan-footnote {
+    text-decoration: none;
+    -cr-hint: noteref strut-confined;
+}
+
+a.duokan-footnote img {
+    display: inline;
+    height: 0.9em;
+    width: auto;
+    max-height: 1.0em;
+    vertical-align: middle;
+    margin-left: 0.1em;
+    margin-right: 0.1em;
+    -cr-hint: strut-confined;
+}
+
+/* 多看富文本脚注容器：页下注联动 + 消除重复编号 + 零缩进 */
+ol.duokan-footnote-content,
+ul.duokan-footnote-content {
+    list-style-type: none;
+    padding-left: 0;
+    margin-top: 0.6em;
+    margin-bottom: 0.6em;
+    font-size: 0.85em;
+    text-indent: 0;
+}
+
+li.duokan-footnote-item,
+aside.duokan-footnote-content,
+div.duokan-footnote-content {
+    font-size: 0.85em;
+    text-indent: 0;
+    margin-top: 0.2em;
+    margin-bottom: 0.2em;
+    -cr-hint: footnote footnote-inpage;
+}
+
+li.duokan-footnote-item p,
+aside.duokan-footnote-content p,
+div.duokan-footnote-content p {
+    text-indent: 0;
+    margin-top: 0.1em;
+    margin-bottom: 0.2em;
+}
+
+.duokan-text-indent {
+    text-indent: 2em;
+}
+
+.duokan-quote {
+    margin-left: 1.6em;
+    margin-right: 1.2em;
+    text-indent: 0;
+}
+
+/* -------------------------------------------------------------------------
+ * 7. 微信读书 / 豆瓣 / 掌阅 / EPUB3 精排规范定制适配
+ * ------------------------------------------------------------------------- */
+
+a[epub|type~="noteref"],
+a[role="doc-noteref"],
+a.qqreader-footnote,
+a.wr-footnote,
+a.ireader-footnote,
+a.zhangyue-footnote,
+a.footnote-ref,
+a.noteref {
+    text-decoration: none;
+    -cr-hint: noteref strut-confined;
+}
+
+a.qqreader-footnote img,
+a.wr-footnote img,
+a.ireader-footnote img,
+a.zhangyue-footnote img,
+a[epub|type~="noteref"] img {
+    display: inline;
+    height: 0.9em;
+    width: auto;
+    max-height: 1.0em;
+    vertical-align: middle;
+    -cr-hint: strut-confined;
+}
+
+aside[epub|type~="footnote"],
+aside[epub|type~="endnote"],
+aside[epub|type~="rearnote"],
+[role="doc-footnote"],
+.qqreader-footnote-content,
+.wr-footnote-content {
+    font-size: 0.85em;
+    text-indent: 0;
     margin-top: 0.3em;
     margin-bottom: 0.3em;
-    text-indent: 0em;
+    -cr-hint: footnote footnote-inpage;
 }
 
-/* Tables and images: no first-line indent. */
-table {
-    text-indent: 0em;
+aside[epub|type~="footnote"] p,
+aside[epub|type~="endnote"] p,
+[role="doc-footnote"] p {
+    text-indent: 0;
+    margin-bottom: 0.2em;
 }
 
-img {
-    text-indent: 0em;
+/* 常见中文精排图注、题记、诗词、版权块：避免错误继承 body 的 2em 首行缩进 */
+.caption,
+.pic-desc,
+.img-caption,
+.image-caption,
+.figure-caption,
+.photo-caption,
+.img-desc,
+.pic-title {
+    font-size: 0.85em;
+    color: #555555;
+    text-align: center;
+    text-indent: 0;
+    margin-top: 0.3em;
+    margin-bottom: 0.5em;
+    page-break-before: avoid;
+    break-before: avoid;
+}
+
+.epigraph,
+.dedication,
+.poetry,
+.poem,
+.verse,
+.copyright,
+.colophon,
+.author-note,
+.callout-box {
+    text-indent: 0;
+}
+
+.epigraph p,
+.dedication p,
+.poetry p,
+.poem p,
+.verse p,
+.copyright p,
+.colophon p {
+    text-indent: 0;
+}
+
+/* -------------------------------------------------------------------------
+ * 8. MathML 数学公式基础样式（配合 MATHML_SUPPORT=1）
+ * ------------------------------------------------------------------------- */
+
+math {
+    text-indent: 0;
+    -cr-hint: none;
 }

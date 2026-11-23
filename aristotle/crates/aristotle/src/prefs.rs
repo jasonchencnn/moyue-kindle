@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use aristotle_render::style::{Style, Underline};
+use aristotle_render::style::{Style, Underline, UnderlineScope};
 use aristotle_ui::screens::library::{CoverMode, LibraryLayout, View};
 use aristotle_ui::screens::reader::Settings;
 use serde::{Deserialize, Serialize};
@@ -214,6 +214,25 @@ pub struct Prefs {
     /// "today" on the "mine" screen fills up to it.
     #[serde(default = "default_daily_goal")]
     pub daily_goal_minutes: u32,
+    /// Whether the Readest cloud library and reader sync buttons are enabled.
+    #[serde(default = "default_true")]
+    pub enable_readest: bool,
+    /// Whether the WeRead library and reader sync buttons are enabled.
+    #[serde(default = "default_true")]
+    pub enable_weread: bool,
+    /// Whether the Nutstore (Jianguoyun) library and reader sync buttons are
+    /// enabled.
+    ///
+    /// A `reader.json` written before the channel existed has no such field
+    /// and gets the default, on: the switch only hides the channel, it never
+    /// signs the reader out.
+    #[serde(default = "default_true")]
+    pub enable_jianguoyun: bool,
+    /// Whether reading time is uploaded to WeRead (§14.5/§14.6). Off by
+    /// default: the switch is the privacy red line, and turning it on never
+    /// backfills the statistics already on the card.
+    #[serde(default)]
+    pub weread_readtime: bool,
     /// Append new highlights to the library root's `My Clippings.txt`, as
     /// the stock reader does. Off, highlights stay in the library index and
     /// the Markdown notes, and the user's file is never written.
@@ -294,6 +313,28 @@ pub struct Prefs {
     /// of the book, only the way a page is drawn.
     #[serde(default)]
     pub underline: usize,
+    /// How wide that guide is: 0 under the text only, 1 across the whole
+    /// text block. A render option like the guide itself (TYPE-102).
+    #[serde(default)]
+    pub underline_scope: usize,
+    /// crengine's modern typesetting: W3C box model, HarfBuzz shaping,
+    /// hanging punctuation and the rest of it (TYPE-101).
+    ///
+    /// A `reader.json` from before it existed has no such field and gets
+    /// the default, on: the modern layout is the one to read in.
+    #[serde(default = "yes")]
+    pub fine_typesetting: bool,
+    /// Body text weight as a CSS `font-weight` number, 100 to 900; 400 is
+    /// normal (TYPE-101). A file from before it existed gets 400.
+    #[serde(default = "default_font_weight")]
+    pub font_weight: u16,
+    /// The writing direction: 0 horizontal (left to right), 1 vertical (top
+    /// to bottom, right to left) (VERT-101).
+    ///
+    /// A `reader.json` from before it existed has no such field and reads
+    /// horizontally, the way it always did.
+    #[serde(default)]
+    pub writing_mode: usize,
 }
 
 fn default_cjk_gap() -> usize {
@@ -325,6 +366,11 @@ fn yes() -> bool {
     true
 }
 
+/// Normal weight: the weight every reader had before the setting existed.
+fn default_font_weight() -> u16 {
+    aristotle_ui::screens::typeset::WEIGHT_NORMAL
+}
+
 /// The UI language of a `reader.json` written before Chinese existed: it
 /// has no `language` field, and the reader it belonged to spoke English.
 fn legacy_language() -> String {
@@ -334,6 +380,10 @@ fn legacy_language() -> String {
 /// The daily reading goal: half an hour, as the prototype.
 fn default_daily_goal() -> u32 {
     30
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Prefs {
@@ -357,6 +407,10 @@ impl Default for Prefs {
             language: "zh".into(),
             daily_goal_minutes: default_daily_goal(),
             clippings: true,
+            enable_readest: true,
+            enable_weread: true,
+            enable_jianguoyun: true,
+            weread_readtime: false,
             font_latin: fonts::DEFAULT_LATIN.into(),
             font_dir: None,
             font_ui: 0,
@@ -379,6 +433,10 @@ impl Default for Prefs {
             cjk_trim: true,
             library_destination: None,
             underline: 0,
+            underline_scope: 0,
+            fine_typesetting: true,
+            font_weight: aristotle_ui::screens::typeset::WEIGHT_NORMAL,
+            writing_mode: 0,
         }
     }
 }
@@ -447,6 +505,12 @@ impl Prefs {
         self.cjk_script = self.cjk_script.min(1);
         self.cjk_gap = self.cjk_gap.min(2);
         self.underline = self.underline.min(2);
+        self.underline_scope = self.underline_scope.min(1);
+        self.font_weight = aristotle_ui::screens::typeset::weight_clamped(self.font_weight);
+        // Only 0 and 1 are writing modes: anything else reads horizontally,
+        // as `WritingMode::from_index` does (VERT-101 S1).
+        self.writing_mode =
+            aristotle_render::style::WritingMode::from_index(self.writing_mode).index();
         if !aristotle_i18n::locales()
             .iter()
             .any(|l| l.code == self.language)
@@ -461,6 +525,12 @@ impl Prefs {
         Underline::from_index(self.underline.min(2))
     }
 
+    /// How wide that guide is: under the text only, or across the whole
+    /// text block.
+    pub fn underline_scope(&self) -> UnderlineScope {
+        UnderlineScope::from_index(self.underline_scope.min(1))
+    }
+
     /// The page style for these preferences.
     pub fn style(&self) -> Style {
         let p = self.clone().clamped();
@@ -472,6 +542,9 @@ impl Prefs {
         s.cjk_font_family = p.font_cjk.clone();
         s.cjk_indent = aristotle_ui::screens::typeset::indent_chars(p.cjk_indent);
         s.cjk_gap = aristotle_ui::screens::typeset::gap_ratio(p.cjk_gap);
+        s.fine_typesetting = p.fine_typesetting;
+        s.font_weight = p.font_weight;
+        s.writing_mode = aristotle_render::style::WritingMode::from_index(p.writing_mode);
         if let Some(dir) = p.font_dir.filter(|_| p.font_latin != fonts::DEFAULT_LATIN) {
             s.font_dir = dir;
         }
@@ -600,6 +673,10 @@ mod tests {
     fn file_round_trip_and_bad_values() {
         let dir = crate::testdir("prefs");
         assert_eq!(Prefs::load(&dir), Prefs::default());
+        assert!(
+            !Prefs::default().weread_readtime,
+            "the WeRead reading-time switch is off by default"
+        );
         let p = Prefs {
             size: 4,
             spacing: 0,
@@ -619,6 +696,10 @@ mod tests {
             language: "pl".into(),
             daily_goal_minutes: 45,
             clippings: false,
+            enable_readest: true,
+            enable_weread: true,
+            enable_jianguoyun: true,
+            weread_readtime: true,
             font_latin: "Gentium Book".into(),
             font_dir: None,
             font_ui: 0,
@@ -641,6 +722,10 @@ mod tests {
             cjk_trim: true,
             library_destination: None,
             underline: 0,
+            underline_scope: 0,
+            fine_typesetting: true,
+            font_weight: 400,
+            writing_mode: 0,
         };
         p.save(&dir).unwrap();
         assert_eq!(Prefs::load(&dir), p);
@@ -674,6 +759,33 @@ mod tests {
             )
             .unwrap();
             assert_eq!(Prefs::load(&dir).language, code);
+        }
+    }
+
+    #[test]
+    fn the_nutstore_switch_is_on_for_old_files_and_round_trips() {
+        // A `reader.json` from before the Nutstore channel existed has no
+        // field: the channel is on, and hiding it is the reader's choice.
+        let old: Prefs = serde_json::from_str(r#"{"size":3,"enable_readest":false}"#).unwrap();
+        assert!(
+            old.enable_jianguoyun,
+            "the Nutstore library is on by default"
+        );
+        assert!(!old.enable_readest, "the older field keeps its value");
+        assert!(Prefs::default().enable_jianguoyun);
+
+        for enabled in [true, false] {
+            let prefs = Prefs {
+                enable_jianguoyun: enabled,
+                ..Prefs::default()
+            };
+            let encoded = serde_json::to_string(&prefs).unwrap();
+            assert!(
+                encoded.contains(&format!(r#""enable_jianguoyun":{enabled}"#)),
+                "{encoded}"
+            );
+            let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.enable_jianguoyun, enabled);
         }
     }
 
@@ -925,6 +1037,110 @@ mod tests {
         assert_eq!(p.refresh_pages(), 10);
         p.refresh_interval = 0;
         assert_eq!(p.refresh_pages(), 1);
+    }
+
+    #[test]
+    fn writing_mode_defaults_to_horizontal_for_an_older_file() {
+        // A reader.json from before VERT-101 has no writing_mode: it reads
+        // horizontally, as it always did.
+        let old: Prefs = serde_json::from_str(r#"{"size":3,"underline":1}"#).unwrap();
+        assert_eq!(old.writing_mode, 0);
+        assert_eq!(
+            old.style().writing_mode,
+            aristotle_render::style::WritingMode::Horizontal
+        );
+        assert_eq!(Prefs::default().writing_mode, 0);
+
+        // It round-trips, and a value out of range reads horizontally.
+        let prefs = Prefs {
+            writing_mode: 1,
+            ..Prefs::default()
+        };
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        assert!(encoded.contains(r#""writing_mode":1"#), "{encoded}");
+        let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.writing_mode, 1);
+        assert_eq!(
+            decoded.style().writing_mode,
+            aristotle_render::style::WritingMode::VerticalRtl
+        );
+        // Out of range reads horizontally, like `WritingMode::from_index`.
+        let wild = Prefs {
+            writing_mode: 7,
+            ..Prefs::default()
+        };
+        let wild = wild.clamped();
+        assert_eq!(wild.writing_mode, 0);
+        assert_eq!(wild.style().writing_mode.index(), 0);
+    }
+
+    #[test]
+    fn new_typography_settings_default_for_an_older_file() {
+        // A reader.json from before TYPE-102 has none of the three fields:
+        // the modern layout stays on, the weight is normal and the guide
+        // follows the text, as a fresh install.
+        let old: Prefs = serde_json::from_str(r#"{"size":3,"underline":1}"#).unwrap();
+        assert!(old.fine_typesetting, "fine typesetting is on by default");
+        assert_eq!(old.font_weight, 400);
+        assert_eq!(old.underline_scope, 0);
+        assert_eq!(old.underline, 1, "the older fields keep their values");
+        assert!(Prefs::default().fine_typesetting);
+        assert_eq!(Prefs::default().font_weight, 400);
+        assert_eq!(Prefs::default().underline_scope, 0);
+
+        // All three round-trip through the file.
+        let prefs = Prefs {
+            fine_typesetting: false,
+            font_weight: 600,
+            underline_scope: 1,
+            ..Prefs::default()
+        };
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        assert!(encoded.contains(r#""fine_typesetting":false"#), "{encoded}");
+        assert!(encoded.contains(r#""font_weight":600"#), "{encoded}");
+        assert!(encoded.contains(r#""underline_scope":1"#), "{encoded}");
+        let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            (
+                decoded.fine_typesetting,
+                decoded.font_weight,
+                decoded.underline_scope
+            ),
+            (false, 600, 1)
+        );
+    }
+
+    #[test]
+    fn weight_and_scope_are_clamped_and_reach_the_page() {
+        let mut p = Prefs::default();
+        // The engine takes 100 to 900; a file outside that is clamped.
+        for (written, kept) in [
+            (50u16, 100u16),
+            (99, 100),
+            (400, 400),
+            (901, 900),
+            (2000, 900),
+        ] {
+            let file = format!(r#"{{"font_weight":{written},"underline_scope":7}}"#);
+            let read: Prefs = serde_json::from_str(&file).unwrap();
+            let q = read.clamped();
+            assert_eq!(q.font_weight, kept, "font_weight {written}");
+            assert_eq!(q.underline_scope, 1, "underline_scope is clamped to 1");
+        }
+        // The weight goes to the renderer, the scope to the book.
+        let style = p.style();
+        assert_eq!(style.font_weight, 400);
+        assert!(style.fine_typesetting);
+        p.font_weight = 300;
+        p.fine_typesetting = false;
+        let style = p.style();
+        assert_eq!(style.font_weight, 300);
+        assert!(!style.fine_typesetting);
+        assert_eq!(p.underline_scope(), UnderlineScope::TextOnly);
+        p.underline_scope = 1;
+        assert_eq!(p.underline_scope(), UnderlineScope::FullLine);
+        p.underline_scope = 9;
+        assert_eq!(p.underline_scope(), UnderlineScope::FullLine);
     }
 
     #[test]

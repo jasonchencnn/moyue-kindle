@@ -169,12 +169,55 @@ guard() {
     echo "takeover: guard.sh not found; refusing (ARISTOTLE_FORCE=1 overrides)" >&2
     return 1
 }
+# The transition renderer is part of the existing app binary. Display errors
+# must not prevent the stock interface from being restored.
+TRANSITION_PID=$R/var/run/aristotle-transition.pid
+transition_app() {
+    [ -n "${ARISTOTLE_TRANSITION_APP:-}" ] && [ -x "$ARISTOTLE_TRANSITION_APP" ] && {
+        printf '%s\n' "$ARISTOTLE_TRANSITION_APP"; return;
+    }
+    case "$0" in */takeover.sh) base=${0%/*} ;; *) base=. ;; esac
+    for app in "$base/aristotle" "$base/app/aristotle" "$R/mnt/us/aristotle/aristotle"; do
+        [ -x "$app" ] && { printf '%s\n' "$app"; return; }
+    done
+    return 1
+}
+transition_draw() {
+    renderer=$(transition_app) || return 0
+    timeout -t 5 -s KILL "$renderer" --transition "$1" </dev/null ||
+        echo "takeover: transition display unavailable" >&2
+}
+transition_owner() {
+    [ -r "$R/proc/$observer/cmdline" ] || return 1
+    command_line=$(tr '\000' '\n' < "$R/proc/$observer/cmdline")
+    [ "$command_line" = "$(printf '%s\n--transition\nwatch' "$renderer")" ]
+}
+transition_cancel() {
+    [ -r "$TRANSITION_PID" ] || return 0
+    { read -r observer; read -r renderer; } < "$TRANSITION_PID"
+    case "$observer" in '' | *[!0-9]*) rm -f "$TRANSITION_PID"; return ;; esac
+    if [ "$observer" -gt 1 ] && transition_owner; then
+        kill -TERM "$observer" 2>/dev/null || true
+        attempts=0
+        while kill -0 "$observer" 2>/dev/null && transition_owner && [ "$attempts" -lt 20 ]; do
+            sleep 0.1
+            attempts=$((attempts + 1))
+        done
+        transition_owner && kill -KILL "$observer" 2>/dev/null || true
+    fi
+    rm -f "$TRANSITION_PID"
+}
+transition_watch() {
+    renderer=$(transition_app) || return 0
+    "$renderer" --transition watch </dev/null >/dev/null 2>&1 &
+    printf '%s\n%s\n' "$!" "$renderer" > "$TRANSITION_PID"
+}
 # Processes frozen by `pause`: everything that would draw over us.
 FROZEN="awesome cvm AaMenuApplication KindleContentDownloadManagerApplication"
 
 mem() {
     awk '/MemTotal/ {t=$2} /MemFree/ {f=$2} /^Buffers/ {b=$2} /^Cached/ {c=$2}
-         END {printf "RAM: %d MB total, %d MB available\n", t/1024, (f+b+c)/1024}' /proc/meminfo
+         END {printf "RAM: %d MB total, %d MB available\n", t/1024, (f+b+c)/1024}' "$R/proc/meminfo"
 }
 
 state() {
@@ -186,6 +229,7 @@ state() {
 case "${1:-status}" in
 start)
     guard || exit 1
+    transition_cancel
     mem
     # Before the stock GUI goes: its shutdown is what makes the stock
     # processes die by signal.
@@ -221,10 +265,21 @@ start)
     # The screensaver and sleep are the app's business from here: it
     # unloads blanket's screensaver and follows powerd's events. The rest of
     # cvm's shutdown runs in the background.
-    echo "takeover: stock GUI stopping"
+    # Blanket can retain the last framework splash after the GUI job stops.
+    lipc-set-prop com.lab126.blanket unload splash 2>/dev/null || true
+    lipc-send-event -r 5 com.lab126.hal bootSplashCleanup 2>/dev/null || true
+    transition_draw prepare
+    echo "takeover: stock GUI stopping; splash cleanup requested"
     mem
     ;;
 stop)
+    # Repeated stop requests must not repaint an already active stock UI.
+    transitioning=0
+    [ ! -e "$TAKEOVER" ] || transitioning=1
+    transition_cancel
+    if [ "$transitioning" = 1 ]; then
+        transition_draw restoring
+    fi
     governor_stop || echo "warning: could not restore CPU governor" >&2
     # Earlier versions kept the flag in the agent's persistent state.
     rm -f "$TAKEOVER" "$R/var/local/aristotle/takeover"
@@ -236,6 +291,7 @@ stop)
     # leave the stock GUI without them.
     lipc-set-prop com.lab126.blanket load screensaver 2> /dev/null
     lipc-set-prop com.lab126.blanket load usb 2> /dev/null
+    [ "$transitioning" = 0 ] || transition_watch
     start "$GUI" > /dev/null 2>&1
     echo "takeover: stock GUI starting (takes about 20 s)"
     ;;

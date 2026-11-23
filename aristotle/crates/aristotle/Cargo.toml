@@ -52,3 +52,6 @@ regex = "1.12.2"
 # As aristotle-render has it: the open test writes a small EPUB.
 zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2"] }
 encoding_rs = "0.8"
+# The WeRead sign-in and shelf tests drive the core mock transport
+# (`core::weread::mock`); tests only, the app binary never links it.
+inkread-core = { path = "../../../core", features = ["mock"] }

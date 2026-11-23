@@ -32,6 +32,8 @@ use serde::{Deserialize, Serialize};
 
 /// The cache file in the library's data directory.
 pub const CACHE_FILE: &str = "cloud-library.json";
+/// Persisted Readest-originated book hashes (downloaded or pulled from Readest).
+pub const CHANNEL_HASHES_FILE: &str = "readest-channel.json";
 /// The longest a downloaded book may be, matching the OPDS downloader.
 pub const MAX_BOOK: u64 = download::MAX_BOOK;
 /// Free space to leave on the userstore after a download.
@@ -67,6 +69,8 @@ pub struct CloudState {
     pub offline: bool,
     /// The cache has been read once this session.
     pub loaded: bool,
+    /// Lowercased hashes of books downloaded or tracked via Readest cloud.
+    pub channel_hashes: HashSet<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -94,6 +98,55 @@ pub fn now_ms() -> i64 {
 
 pub fn cache_path(data_dir: &Path) -> PathBuf {
     data_dir.join(CACHE_FILE)
+}
+
+pub fn channel_hashes_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(CHANNEL_HASHES_FILE)
+}
+
+impl CloudState {
+    /// Load cached Readest cloud shelf and explicit Readest download hashes at
+    /// startup so cover badges reflect channel provenance before Cloud is opened.
+    pub fn preload_cache(&mut self, data_dir: &Path) {
+        if let Ok(bytes) = fs::read(channel_hashes_path(data_dir)) {
+            if let Ok(hashes) = serde_json::from_slice::<Vec<String>>(&bytes) {
+                self.channel_hashes
+                    .extend(hashes.into_iter().map(|h| h.to_ascii_lowercase()));
+            }
+        }
+        if !self.loaded {
+            if let Some((cached_at, user_id, books)) = load_cache(&cache_path(data_dir)) {
+                for b in &books {
+                    if b.deleted_at.is_none() {
+                        self.channel_hashes.insert(b.book_hash.to_ascii_lowercase());
+                    }
+                }
+                self.books = books;
+                self.user_id = user_id;
+                self.cache_time = Some(cached_at);
+                self.last_sync = Some(cached_at);
+                self.loaded = true;
+            }
+        }
+    }
+
+    /// Record a book hash belonging to the Readest download/sync channel.
+    pub fn record_channel_hash(&mut self, data_dir: &Path, hash: &str) {
+        if hash.is_empty() {
+            return;
+        }
+        if self.channel_hashes.insert(hash.to_ascii_lowercase()) {
+            let mut list: Vec<&str> = self.channel_hashes.iter().map(String::as_str).collect();
+            list.sort_unstable();
+            if let Ok(json) = serde_json::to_vec(&list) {
+                let path = channel_hashes_path(data_dir);
+                let tmp = path.with_extension("json.tmp");
+                if fs::write(&tmp, json).is_ok() {
+                    let _ = fs::rename(&tmp, path);
+                }
+            }
+        }
+    }
 }
 
 /// Read the cached list. A missing or damaged file is no cache.
@@ -350,7 +403,7 @@ impl App {
             let cover = rec.as_ref().and_then(|r| self.covers.get(&self.lib, r));
             let mut view_book = CloudViewBook::new(&b.title, &b.author, &b.format);
             view_book.hash = b.book_hash.clone();
-            view_book.progress = b.progress;
+            view_book.progress = effective_cloud_progress(b, rec.as_ref());
             view_book.state = state;
             view_book.progress_fraction = fraction;
             view_book.progress_known = progress_known;
@@ -372,8 +425,14 @@ impl App {
             books: &ui_books,
         };
         let width = self.ui.bounds().w;
-        let (tree, cloud) =
-            CloudView::build_for_width(&mut self.ui.text, &self.styles, &view, width);
+        let channels = self.channel_visibility();
+        let (tree, cloud) = CloudView::build_for_width_with_channels(
+            &mut self.ui.text,
+            &self.styles,
+            &view,
+            width,
+            channels,
+        );
         // The row actions of this screen belong to this list, in this order.
         self.cloud.rows = cloud.row_books.clone();
         self.ui.set_tree_with(tree, refresh);
@@ -442,6 +501,13 @@ impl App {
         match result {
             Ok((books, user_id)) => {
                 let now = now_secs();
+                for b in &books {
+                    if b.deleted_at.is_none() {
+                        self.cloud
+                            .channel_hashes
+                            .insert(b.book_hash.to_ascii_lowercase());
+                    }
+                }
                 self.cloud.books = books;
                 self.cloud.user_id = user_id;
                 self.cloud.last_sync = Some(now);
@@ -450,6 +516,9 @@ impl App {
                 self.cloud.failed = None;
                 let path = cache_path(self.lib.data_dir());
                 save_cache(&path, self.cloud.user_id.as_deref(), &self.cloud.books, now);
+                if self.seed_cloud_progress_into_library() {
+                    self.saver.save(&self.lib);
+                }
             }
             Err(e) => {
                 // "Showing the last saved list" only when there is one.
@@ -494,6 +563,12 @@ impl App {
                 } else if id == a::LOGIN {
                     self.cancel_cloud_on_leave();
                     self.show_mine(Refresh::Full)?;
+                } else if id == a::WEREAD {
+                    self.cancel_cloud_on_leave();
+                    self.open_weread()?;
+                } else if id == a::JIANGUOYUN {
+                    self.cancel_cloud_on_leave();
+                    self.open_jianguoyun()?;
                 } else if id == a::SYNC {
                     let page = self.list_page();
                     self.refresh_cloud();
@@ -595,7 +670,8 @@ impl App {
         let api_base = config.api_base.clone();
         let session = self.net.readest_session.clone();
         let epoch = session.epoch();
-        let dir = self.root.clone();
+        let dir = self.root.join("readest");
+        let _ = std::fs::create_dir_all(&dir);
         let cancel = Arc::new(AtomicBool::new(false));
         self.cloud.cancel = Some(cancel.clone());
         let ui_book = book.clone();
@@ -658,8 +734,20 @@ impl App {
         {
             return Ok(());
         }
+        let prev = self.cloud.download_progress;
         self.cloud.download_progress = Some((bytes, total));
-        if matches!(self.screen, Screen::Cloud(_)) {
+        let should_redraw = match (prev, total) {
+            (None, _) => true,
+            (Some((prev_bytes, Some(prev_total))), Some(cur_total))
+                if prev_total > 0 && cur_total > 0 =>
+            {
+                let prev_pct = ((prev_bytes.min(prev_total) * 100) / prev_total).min(100);
+                let cur_pct = ((bytes.min(cur_total) * 100) / cur_total).min(100);
+                cur_pct != prev_pct
+            }
+            (Some((prev_bytes, _)), _) => bytes.saturating_sub(prev_bytes) >= 256 * 1024,
+        };
+        if should_redraw && matches!(self.screen, Screen::Cloud(_)) {
             let page = self.list_page();
             self.show_cloud(Refresh::Auto, page)?;
         }
@@ -704,6 +792,7 @@ impl App {
                 // Index only the file the reader asked for: the background
                 // walk refreshes known books and admits this path alone
                 // (UX-112).
+                self.cloud.record_channel_hash(self.lib.data_dir(), &hash);
                 self.admit_explicit_file(&path);
                 self.cloud.failed = None;
                 self.cloud.message = Some(downloaded_ready(&title));
@@ -725,6 +814,207 @@ impl App {
         }
         Ok(())
     }
+
+    /// Update the cached cloud shelf entry from a pushed local progress so
+    /// `Screen::Cloud` immediately matches `Screen::Home` and `Screen::Library`.
+    pub(crate) fn update_cloud_book_from_local_progress(
+        &mut self,
+        book_hash: &str,
+        p: &aristotle_library::Progress,
+    ) {
+        if p.updated <= 0 {
+            return;
+        }
+        let local_ms = p.updated * 1000;
+        let mut changed = false;
+        if let Some(b) = self
+            .cloud
+            .books
+            .iter_mut()
+            .find(|b| b.book_hash == book_hash)
+        {
+            let cloud_ms = b
+                .updated_at
+                .as_deref()
+                .and_then(|s| inkread_core::sync::parse_iso8601(s).ok())
+                .unwrap_or(0);
+            if b.progress.is_none() || local_ms >= cloud_ms {
+                let total = b.progress.map(|(_, t)| t).filter(|&t| t > 0).unwrap_or(100);
+                let cur = if p.fraction > 0.0 {
+                    ((p.fraction.clamp(0.0, 1.0) * total as f32).floor() as u32).clamp(1, total)
+                } else {
+                    0
+                };
+                b.progress = Some((cur, total));
+                b.updated_at = Some(inkread_core::sync::format_iso8601(local_ms));
+                changed = true;
+            }
+        }
+        if changed {
+            let when = self.cloud.last_sync.unwrap_or_else(now_secs);
+            let path = cache_path(self.lib.data_dir());
+            save_cache(
+                &path,
+                self.cloud.user_id.as_deref(),
+                &self.cloud.books,
+                when,
+            );
+        }
+    }
+
+    /// Update the cached cloud shelf entry from a pulled `DbBookConfig`.
+    pub(crate) fn update_cloud_book_from_config(&mut self, cfg: &inkread_core::sync::DbBookConfig) {
+        let Some(progress) = cfg.to_model().progress.filter(|(_, total)| *total > 0) else {
+            return;
+        };
+        let cfg_ms = cfg
+            .updated_at
+            .as_deref()
+            .and_then(|s| inkread_core::sync::parse_iso8601(s).ok())
+            .unwrap_or(0);
+        let mut changed = false;
+        if let Some(b) = self
+            .cloud
+            .books
+            .iter_mut()
+            .find(|b| b.book_hash == cfg.book_hash)
+        {
+            let cloud_ms = b
+                .updated_at
+                .as_deref()
+                .and_then(|s| inkread_core::sync::parse_iso8601(s).ok())
+                .unwrap_or(0);
+            if b.progress.is_none() || cfg_ms >= cloud_ms {
+                b.progress = Some(progress);
+                if cfg.updated_at.is_some() {
+                    b.updated_at = cfg.updated_at.clone();
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            let when = self.cloud.last_sync.unwrap_or_else(now_secs);
+            let path = cache_path(self.lib.data_dir());
+            save_cache(
+                &path,
+                self.cloud.user_id.as_deref(),
+                &self.cloud.books,
+                when,
+            );
+        }
+    }
+
+    /// Seed an unread local book (no local reading timestamp yet) from a pulled
+    /// `DbBookConfig` so Home and Local Library match Cloud Library progress.
+    ///
+    /// Books with local reading history (`updated > 0`) are left untouched so
+    /// opening them still prompts the user before moving (contract §5.2).
+    pub(crate) fn seed_unread_local_book_from_config(
+        &mut self,
+        cfg: &inkread_core::sync::DbBookConfig,
+    ) -> bool {
+        if self.is_weread_book(&cfg.book_hash) {
+            return false;
+        }
+        let Some(rec) = self.lib.book(&cfg.book_hash) else {
+            return false;
+        };
+        if matches!(rec.format, aristotle_library::Format::Txt) {
+            return false;
+        }
+        if rec.progress.as_ref().is_some_and(|p| p.updated > 0) {
+            return false;
+        }
+        let fraction = cfg
+            .to_model()
+            .progress
+            .filter(|(cur, total)| *cur > 0 && *total > 0)
+            .map(|(cur, total)| (cur as f32 / total as f32).clamp(0.0, 1.0))
+            .or_else(|| rec.progress.as_ref().map(|p| p.fraction))
+            .unwrap_or(0.0);
+        let xpointer = cfg
+            .xpointer
+            .as_deref()
+            .map(inkread_core::model::clean_xpointer)
+            .filter(|xp| !xp.is_empty());
+        if fraction <= 0.0 && xpointer.is_none() {
+            return false;
+        }
+        let locator = match xpointer {
+            Some(xp) => aristotle_library::Locator::XPointer { xpointer: xp },
+            None => rec
+                .progress
+                .as_ref()
+                .map(|p| p.locator.clone())
+                .unwrap_or(aristotle_library::Locator::Page { index: 0 }),
+        };
+        self.lib.set_progress(
+            &cfg.book_hash,
+            aristotle_library::Progress {
+                fraction,
+                locator,
+                updated: 0,
+                source: Some("readest-cloud".into()),
+                page: None,
+            },
+        );
+        true
+    }
+
+    /// Seed newly downloaded / unread local copies of Readest cloud books with
+    /// their cloud progress percentage so Cloud, Library and Home agree.
+    pub(crate) fn seed_cloud_progress_into_library(&mut self) -> bool {
+        let mut changed = false;
+        let books = self.cloud.books.clone();
+        for b in books {
+            if b.deleted_at.is_some() || self.is_weread_book(&b.book_hash) {
+                continue;
+            }
+            let Some((cur, total)) = b.progress.filter(|(cur, total)| *cur > 0 && *total > 0)
+            else {
+                continue;
+            };
+            let Some(rec) = self.lib.book(&b.book_hash) else {
+                continue;
+            };
+            if matches!(rec.format, aristotle_library::Format::Txt) || rec.progress.is_some() {
+                continue;
+            }
+            self.lib.set_progress(
+                &b.book_hash,
+                aristotle_library::Progress {
+                    fraction: (cur as f32 / total as f32).clamp(0.0, 1.0),
+                    locator: aristotle_library::Locator::Page { index: 0 },
+                    updated: 0,
+                    source: Some("readest-cloud".into()),
+                    page: None,
+                },
+            );
+            changed = true;
+        }
+        changed
+    }
+}
+
+/// Progress shown on a Readest cloud card: prefers newer local reading progress
+/// when the book is already on this device so Cloud, Home and Library agree.
+fn effective_cloud_progress(
+    b: &CloudBook,
+    rec: Option<&aristotle_library::index::BookRecord>,
+) -> Option<(u32, u32)> {
+    let cloud_ms = b
+        .updated_at
+        .as_deref()
+        .and_then(|s| inkread_core::sync::parse_iso8601(s).ok())
+        .unwrap_or(0);
+    if let Some(p) = rec.and_then(|r| r.progress.as_ref()) {
+        if p.updated > 0 && (b.progress.is_none() || p.updated * 1000 >= cloud_ms) {
+            let pct = (p.fraction.clamp(0.0, 1.0) * 100.0).floor() as u32;
+            let cur = if p.fraction > 0.0 { pct.max(1) } else { 0 };
+            return Some((cur.min(100), 100));
+        }
+    }
+    b.progress
 }
 
 #[cfg(test)]

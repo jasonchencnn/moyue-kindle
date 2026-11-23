@@ -33,6 +33,8 @@ use crate::perf;
 /// File names of the settings the reader writes by hand, next to the app.
 pub const SYNC_IMPORT: &str = "sync.json";
 pub const CATALOGS_IMPORT: &str = "catalogs.json";
+/// The Nutstore (Jianguoyun) account, written by hand or copied over USB.
+pub const JIANGUOYUN_IMPORT: &str = "jianguoyun.json";
 
 /// What a worker thread finished, for the main loop.
 pub enum Done {
@@ -65,6 +67,17 @@ pub enum Done {
     Downloaded {
         token: u64,
         result: Result<PathBuf, HttpError>,
+    },
+    /// The software update moved on. `generation` says which run the report
+    /// belongs to, so a report of a run that was given up on is thrown away.
+    Ota {
+        generation: u64,
+        report: crate::ota::Report,
+    },
+    /// Background Readest startup token pre-warm finished.
+    ReadestPrewarmed {
+        /// The account the pre-warm worked for.
+        store: u64,
     },
     /// Readest GoTrue password login.
     ReadestLogin {
@@ -145,13 +158,88 @@ pub enum Done {
         store: u64,
         result: Result<PathBuf, aristotle_net::cloud::DownloadError>,
     },
+    /// A new code or phase of the WeRead sign-in (not the end of the job).
+    WereadQr {
+        generation: u64,
+        url: String,
+        phase: aristotle_ui::screens::weread_login::WereadLoginPhase,
+    },
+    /// The WeRead sign-in exchanged its code for credentials.
+    WereadLoggedIn {
+        generation: u64,
+        credentials: inkread_core::weread::Credentials,
+    },
+    /// The WeRead code expired; the app makes another one.
+    WereadLoginExpired { generation: u64 },
+    /// The WeRead sign-in failed, in the reader's language.
+    WereadLoginFailed { generation: u64, message: String },
+    /// The sign-in screen was left; its worker stopped.
+    WereadLoginCancelled { generation: u64 },
+    /// The WeRead shelf arrived.
+    WereadShelf {
+        token: u64,
+        credentials: inkread_core::weread::Credentials,
+        result: Result<inkread_core::weread::ShelfSync, inkread_core::weread::WeReadError>,
+    },
+    /// Jianguoyun WebDAV connection test finished.
+    JianguoyunTestLogin {
+        token: u64,
+        settings: aristotle_net::store::JianguoyunSettings,
+        result: Result<(), inkread_core::jianguoyun::JianguoyunError>,
+    },
+    /// Jianguoyun WebDAV directory listing finished.
+    JianguoyunListed {
+        token: u64,
+        dir_path: String,
+        result: Result<
+            Vec<inkread_core::jianguoyun::RemoteEntry>,
+            inkread_core::jianguoyun::JianguoyunError,
+        >,
+    },
+    /// Bytes of a Jianguoyun book downloaded so far.
+    JianguoyunProgress {
+        token: u64,
+        remote_path: String,
+        bytes: u64,
+        total: Option<u64>,
+    },
+    /// A Jianguoyun book finished downloading into the library folder.
+    JianguoyunDownloaded {
+        token: u64,
+        remote_path: String,
+        result: Result<
+            aristotle_net::jianguoyun::DownloadedBook,
+            aristotle_net::jianguoyun::DownloadError,
+        >,
+    },
+    /// A Jianguoyun per-book sync (pull/push/merge) finished.
+    JianguoyunBookSynced {
+        book: String,
+        token: u64,
+        manual: bool,
+        push_only: bool,
+        result: Result<
+            Option<inkread_core::jianguoyun::JianguoyunBookSync>,
+            inkread_core::jianguoyun::JianguoyunError,
+        >,
+    },
 }
 
 impl Done {
     /// Progress reports come from a worker that is still running: they do
     /// not end it.
     fn is_progress(&self) -> bool {
-        matches!(self, Done::Progress { .. } | Done::CloudProgress { .. })
+        matches!(
+            self,
+            Done::Progress { .. }
+                | Done::CloudProgress { .. }
+                | Done::JianguoyunProgress { .. }
+                | Done::WereadQr { .. }
+                | Done::Ota {
+                    report: crate::ota::Report::Progress(_),
+                    ..
+                }
+        )
     }
 }
 
@@ -229,13 +317,21 @@ impl Net {
     ///
     /// The store is the only place a session comes from: a worker that
     /// finished with an older copy cannot write it over the newer one.
+    /// Skips the blocking disk `fsync` when the persisted fields
+    /// (`refresh_token` and `expires_at`) did not change.
     pub fn persist_session(&mut self) {
+        let mut disk_changed = false;
         if let Some(sess) = self.readest_session.current() {
             if let Some(r) = self.accounts.readest.as_mut() {
+                if r.refresh_token != sess.refresh_token || r.expires_at != sess.expires_at {
+                    disk_changed = true;
+                }
                 r.update_session(&sess);
             }
         }
-        self.save();
+        if disk_changed {
+            self.save();
+        }
     }
 
     pub fn import_path(&self, file: &str) -> PathBuf {
@@ -249,12 +345,14 @@ impl Net {
         let before = self.accounts.allow_entries();
         let mut out = Vec::new();
         let mut changed = false;
-        for file in [SYNC_IMPORT, CATALOGS_IMPORT] {
+        for file in [SYNC_IMPORT, CATALOGS_IMPORT, JIANGUOYUN_IMPORT] {
             let path = self.import_path(file);
             let r = if file == SYNC_IMPORT {
                 self.accounts.import_sync(&path, force)
-            } else {
+            } else if file == CATALOGS_IMPORT {
                 self.accounts.import_catalogs(&path, force)
+            } else {
+                self.accounts.import_jianguoyun(&path, force)
             };
             match r {
                 Ok(Imported::Loaded) => {

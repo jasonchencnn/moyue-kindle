@@ -70,6 +70,7 @@ lay_out() {
     mkdir -p "$1/extensions/aristotle"
     cp -R "$REPO/device/extension/." "$1/extensions/aristotle/"
     cp "$REPO/device/app/takeover.sh" "$REPO/device/app/open-kual.sh" "$1/extensions/aristotle/"
+    find "$1" -type f -name '*.sh' -exec chmod 755 {} +
     # The updater compares the app and extension versions before it swaps
     # anything.  Keep the one version in Cargo.toml and the extension in step.
     ext_version=$(sed -n 's:.*<version>\([0-9][0-9.]*\)</version>.*:\1:p' \
