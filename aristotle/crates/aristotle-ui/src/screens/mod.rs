@@ -8,6 +8,7 @@
 //! tests feed them sample data.
 
 pub mod about;
+pub mod bluetooth_settings;
 pub mod book_actions;
 pub mod book_stats;
 pub mod calendar;
@@ -16,14 +17,17 @@ pub mod coming_soon;
 pub mod home;
 pub mod jianguoyun_login;
 pub mod jianguoyun_shelf;
+pub mod key_settings;
 pub mod library;
 pub mod marks;
 pub mod mine;
 pub mod network;
 pub mod ota;
+pub mod pin_lock;
 pub mod quote_add;
 pub mod quotes;
 pub mod reader;
+pub mod reader_bars;
 pub mod readest_edit;
 pub mod readest_login;
 pub mod readest_status;
@@ -34,13 +38,17 @@ pub mod settings;
 pub mod sheet;
 pub mod sleep;
 pub mod sleep_images;
+pub mod time_settings;
 pub mod toc;
 pub mod transition;
 pub mod translate;
+pub mod tts_player;
+pub mod tts_settings;
 pub mod typeset;
 pub mod weread_login;
 pub mod weread_shelf;
 pub mod wifi;
+pub mod wifi_settings;
 
 use crate::geom::Insets;
 use crate::icons::Icon;

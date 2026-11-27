@@ -642,7 +642,7 @@ fn layout_steps(mut d: Driver) -> Result<(), Error> {
     let p = d.button(action::TYPESET)?;
     d.tap("typeset", p)?;
     let before = d.app.prefs.size;
-    let p = d.button(typeset::SIZE_BASE + (before + 1) as ActionId)?;
+    let p = d.button(typeset::SIZE_UP)?;
     d.tap("larger text", p)?;
     if d.app.prefs.size != before + 1 {
         return Err(format_err!("text size did not change"));

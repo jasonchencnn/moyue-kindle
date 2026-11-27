@@ -169,7 +169,8 @@ impl MineUi {
         let header = header(&mut t, s);
         let header = t.pad(Insets::new(0, home_margin(), 0, home_margin()), header);
         let mut rows = Vec::new();
-        let body = body(&mut t, s, mine, &mut rows, panel);
+        let landscape = size.w > size.h;
+        let body = body(&mut t, s, mine, &mut rows, panel, landscape);
         let nav = crate::nav::build(&mut t, s, crate::nav::Tab::Mine);
         let root = t.add(Node::column(0), [status, header, body, nav.root]);
         t.set_root(root);
@@ -212,7 +213,34 @@ fn body(
     mine: &Mine,
     rows: &mut Vec<NodeId>,
     panel: PanelLayout,
+    landscape: bool,
 ) -> NodeId {
+    if landscape {
+        // In landscape (wide, shorter viewport e.g. 1680x1264), split the
+        // body into two columns so the entry list (including Settings) never
+        // gets clipped off the bottom.
+        let left_parts = vec![
+            account_card(t, s, &mine.account),
+            t.gap(0, 14),
+            stats_title(t, s),
+            t.gap(0, 6),
+            grid(t, s, &mine.stats, PanelLayout::Compact),
+            t.gap(0, 12),
+            streak_row(t, s, &mine.streak),
+        ];
+        let left_col = t.add(Node::column(0).flex(1), left_parts);
+        let right_list = entry_list_landscape(t, s, &mine.entries, rows);
+        let right_col = t.add(Node::column(0).flex(1), [right_list]);
+        let columns = t.add(
+            Node::row(24).cross(Cross::Start).flex(1),
+            [left_col, right_col],
+        );
+        let gap = t.gap(0, 16);
+        let foot_node = foot(t, s);
+        let col = t.add(Node::column(0).flex(1), [columns, gap, foot_node]);
+        let col = t.pad(Insets::new(16, home_margin(), 16, home_margin()), col);
+        return t.add(Node::column(0).flex(1), [col]);
+    }
     let section_gap = if panel == PanelLayout::Compact { 8 } else { 28 };
     let mut parts = vec![
         account_card(t, s, &mine.account),
@@ -503,6 +531,43 @@ fn streak_row(t: &mut Tree, s: &Styles, streak: &Streak) -> NodeId {
     )
 }
 
+/// Compact single-column entry list for the right column in landscape layout.
+fn entry_list_landscape(
+    t: &mut Tree,
+    s: &Styles,
+    entries: &Entries,
+    rows: &mut Vec<NodeId>,
+) -> NodeId {
+    let marks = format!(
+        "{} · {}",
+        trn(Plural::MineHighlights, entries.highlights as usize),
+        trn(Plural::MineNotes, entries.notes as usize),
+    );
+    let quotes = trn(Plural::MineQuotes, QUOTES as usize);
+    let version = aristotle_i18n::tf!(Msg::MineVersion, version = entries.version);
+    let items = [
+        (tr(Msg::MineEntryCalendar), None, action::ENTRY_CALENDAR),
+        (tr(Msg::MineEntryMarks), Some(marks), action::ENTRY_MARKS),
+        (tr(Msg::MineEntryQuotes), Some(quotes), action::ENTRY_QUOTES),
+        (tr(Msg::SettingsTitle), None, action::SETTINGS),
+        (tr(Msg::MineAbout), Some(version), action::ABOUT),
+        (tr(Msg::OtaEntry), None, action::ENTRY_OTA),
+    ];
+    let mut list = Vec::new();
+    for (label, value, id) in items {
+        let row = entry_row(t, s, label, value.as_deref(), id, false);
+        rows.push(row);
+        list.push(t.fixed(None, Some(96), Some(row)));
+    }
+    let col = t.add(Node::column(0), list);
+    t.add(
+        Node::new(Kind::Padding(Insets::new(8, 24, 8, 24)))
+            .bg(CARD)
+            .border(0, CARD, 28),
+        [col],
+    )
+}
+
 /// The list of entries: the calendar, the notes, the quotations, the
 /// settings and the about page.
 fn entry_list(
@@ -744,5 +809,47 @@ mod tests {
         let s = Styles::new(crate::text::FamilyId(0));
         let (_tree, view) = MineUi::build(&mut text, &s, &mine());
         assert_eq!(view.rows.len(), 6);
+    }
+
+    #[test]
+    fn landscape_mine_keeps_settings_and_all_entries_visible_and_hittable() {
+        for (w, h) in [(1680u32, 1264u32), (1448, 1072)] {
+            let mut text = TextEngine::new(Fonts::embedded());
+            let s = Styles::new(crate::text::FamilyId(0));
+            let (tree, view) =
+                MineUi::build_for_size(&mut text, &s, &mine(), Size::new(w as i32, h as i32));
+            let mut ui = crate::ui::Ui::new(tree, text, w, h);
+            ui.render();
+            let bounds = ui.bounds();
+            assert_eq!(view.rows.len(), 6);
+            let mut found_settings = false;
+            for &row in &view.rows {
+                let r = ui.tree.rect(row);
+                assert!(r.w > 100 && r.h >= 64, "{w}x{h}: row rect too small: {r:?}");
+                assert!(
+                    r.x >= 0
+                        && r.y >= 0
+                        && r.right() <= bounds.right()
+                        && r.bottom() <= bounds.bottom(),
+                    "{w}x{h}: row out of screen bounds: {r:?} vs {bounds:?}"
+                );
+                let hit = ui.tree.hit(crate::geom::Point {
+                    x: r.x + r.w / 2,
+                    y: r.y + r.h / 2,
+                });
+                assert_eq!(
+                    hit,
+                    crate::tree::Hit::Target(row),
+                    "{w}x{h}: row not hittable"
+                );
+                if ui.tree.node(row).action == Some(action::SETTINGS) {
+                    found_settings = true;
+                }
+            }
+            assert!(
+                found_settings,
+                "{w}x{h}: Settings entry missing in landscape"
+            );
+        }
     }
 }

@@ -1144,6 +1144,26 @@ impl Framebuffer {
             height: self.geometry.height,
         }
     }
+
+    /// Verify the kernel framebuffer's `var.rotate` still matches `expected`
+    /// (the startup rotation bound to the touchscreen digitizer). If the
+    /// native Kindle accelerometer/powerd changed `var.rotate` (for example on
+    /// sleep wakeup), force it back via `FBIOPUT_VSCREENINFO` and return
+    /// `Ok(true)` so the caller can repaint cleanly.
+    pub fn ensure_rotate(&mut self, expected: u32) -> io::Result<bool> {
+        let mut var = VarScreenInfo::default();
+        ioctl(&self.file, FBIOGET_VSCREENINFO, &mut var)?;
+        if var.rotate == expected {
+            return Ok(false);
+        }
+        eprintln!(
+            "aristotle: kernel fb0 rotate drifted {} -> {}; forcing back to {}",
+            expected, var.rotate, expected
+        );
+        var.rotate = expected;
+        ioctl(&self.file, FBIOPUT_VSCREENINFO, &mut var)?;
+        Ok(true)
+    }
 }
 
 /// `dst[i] = 255 - src[i]`; a plain loop the compiler vectorizes (NEON on

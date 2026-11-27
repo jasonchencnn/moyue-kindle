@@ -28,6 +28,7 @@ pub mod book;
 mod book_tests;
 #[cfg(feature = "crengine")]
 pub mod crengine;
+pub mod fixed;
 pub mod formatting_progress;
 pub mod handoff;
 pub mod lang;

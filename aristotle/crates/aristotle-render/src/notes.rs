@@ -61,26 +61,224 @@ pub fn target(base: &str, href: &str) -> Option<Target> {
     Some(Target { path, fragment })
 }
 
-/// Reads members of an EPUB, keeping the last one parsed (a chapter's
-/// notes are usually all in one file).
+/// Publisher CSS locks detected inside an EPUB book's stylesheets.
+///
+/// When fine typesetting (`fine_typesetting = true`) is active, crengine
+/// honours the book's own CSS rules over default reader settings:
+/// - `has_embedded_fonts`: the book declares `@font-face` rules so when
+///   `embedded_fonts = true`, the book's built-in fonts override the reader's
+///   font picker.
+/// - `locks_line_height`: the book's CSS sets an explicit `line-height` on
+///   body/paragraph selectors, which overrides `setDefaultInterlineSpace`
+///   while fine typesetting is enabled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FineBookLocks {
+    pub has_embedded_fonts: bool,
+    pub locks_line_height: bool,
+}
+
+/// Strip `/* ... */` comments from CSS text before inspecting rules.
+fn strip_css_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let bytes = css.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else {
+            let ch = css[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Whether a CSS selector targets main body text (`body`, `html`, `p`, `*`,
+/// `p.class`, `.body`, `.content`, `.paragraph`, `.maintext`, etc.) rather
+/// than isolated headings/captions/footnotes.
+fn selector_targets_body(selector_list: &str) -> bool {
+    for sel in selector_list.split(',') {
+        let sel = sel.trim().to_ascii_lowercase();
+        if sel.is_empty() || sel.starts_with('@') {
+            continue;
+        }
+        // Take the last compound selector after combinators.
+        let last = sel
+            .split(|c: char| c.is_whitespace() || matches!(c, '>' | '+' | '~'))
+            .rfind(|s| !s.is_empty())
+            .unwrap_or("");
+        if matches!(last, "body" | "html" | "p" | "*") {
+            return true;
+        }
+        if last.starts_with("p.") || last.starts_with("body.") {
+            // Exclude obvious non-body paragraph classes like caption/title/footnote/quote.
+            let cls = last.split_once('.').map(|(_, c)| c).unwrap_or("");
+            if !cls.contains("title")
+                && !cls.contains("caption")
+                && !cls.contains("footnote")
+                && !cls.contains("note")
+                && !cls.contains("header")
+                && !cls.contains("footer")
+                && !cls.contains("copyright")
+                && !cls.contains("epigraph")
+                && !cls.contains("poem")
+                && !cls.contains("poetry")
+                && !cls.contains("quote")
+                && !cls.contains("pic")
+                && !cls.contains("img")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether a CSS declaration block sets an explicit (non-`normal`/`inherit`)
+/// `line-height` value.
+fn block_locks_line_height(block: &str) -> bool {
+    for decl in block.split(';') {
+        let Some((prop, val)) = decl.split_once(':') else {
+            continue;
+        };
+        if prop.trim().eq_ignore_ascii_case("line-height") {
+            let v = val
+                .split("!important")
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if !v.is_empty() && v != "normal" && v != "inherit" && v != "initial" && v != "unset" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Inspect CSS text for `@font-face` declarations and body `line-height` locks.
+pub fn inspect_css_fine_locks(css: &str) -> FineBookLocks {
+    let cleaned = strip_css_comments(css);
+    let lower = cleaned.to_ascii_lowercase();
+    let mut locks = FineBookLocks {
+        has_embedded_fonts: lower.contains("@font-face"),
+        locks_line_height: false,
+    };
+
+    // Walk top-level selector { declarations } blocks.
+    let mut rest = cleaned.as_str();
+    while let Some(open) = rest.find('{') {
+        let selector = rest[..open].trim();
+        let after_open = &rest[open + 1..];
+        // Handle nested braces (e.g. @media { ... }) by skipping to matching close.
+        let mut depth = 1usize;
+        let mut close_idx = None;
+        for (idx, ch) in after_open.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close_idx else {
+            break;
+        };
+        let body = &after_open[..close];
+        if !locks.locks_line_height
+            && selector_targets_body(selector)
+            && block_locks_line_height(body)
+        {
+            locks.locks_line_height = true;
+        }
+        rest = &after_open[close + 1..];
+        if locks.has_embedded_fonts && locks.locks_line_height {
+            break;
+        }
+    }
+    locks
+}
+
+/// Inspect an EPUB archive's stylesheets for publisher fine-typesetting locks
+/// (`@font-face` and body `line-height`). Returns defaults for non-EPUB files.
+pub fn inspect_fine_locks(epub: &Path) -> FineBookLocks {
+    let Ok(file) = File::open(epub) else {
+        return FineBookLocks::default();
+    };
+    let Ok(mut zip) = ZipArchive::new(file) else {
+        return FineBookLocks::default();
+    };
+    let mut locks = FineBookLocks::default();
+    let mut bytes_budget: usize = 512 * 1024;
+    for i in 0..zip.len() {
+        let Ok(mut entry) = zip.by_index(i) else {
+            continue;
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        let Ok(raw_name) = entry.name() else {
+            continue;
+        };
+        let name = raw_name.to_ascii_lowercase();
+        if !name.ends_with(".css") {
+            continue;
+        }
+        let size = entry.size() as usize;
+        if size == 0 || size > bytes_budget {
+            continue;
+        }
+        let mut css = String::new();
+        if entry.read_to_string(&mut css).is_ok() {
+            bytes_budget = bytes_budget.saturating_sub(css.len());
+            let part = inspect_css_fine_locks(&css);
+            locks.has_embedded_fonts |= part.has_embedded_fonts;
+            locks.locks_line_height |= part.locks_line_height;
+            if locks.has_embedded_fonts && locks.locks_line_height {
+                break;
+            }
+        }
+    }
+    locks
+}
+
+/// Reads members of an EPUB, keeping the last few files parsed (a chapter
+/// and its separate notes file can stay cached together).
 pub struct Source {
     zip: ZipArchive<File>,
-    cached: Option<(String, String)>,
+    cached: Vec<(String, String)>,
 }
 
 impl Source {
     pub fn open(epub: &Path) -> Option<Source> {
         let zip = ZipArchive::new(File::open(epub).ok()?).ok()?;
-        Some(Source { zip, cached: None })
+        Some(Source {
+            zip,
+            cached: Vec::new(),
+        })
     }
 
     fn text(&mut self, path: &str) -> Option<&str> {
-        if self.cached.as_ref().map(|c| c.0.as_str()) != Some(path) {
-            let mut s = String::new();
-            self.zip.by_name(path).ok()?.read_to_string(&mut s).ok()?;
-            self.cached = Some((path.to_string(), s));
+        if let Some(pos) = self.cached.iter().position(|(p, _)| p == path) {
+            return Some(self.cached[pos].1.as_str());
         }
-        self.cached.as_ref().map(|c| c.1.as_str())
+        let mut s = String::new();
+        self.zip.by_name(path).ok()?.read_to_string(&mut s).ok()?;
+        if self.cached.len() >= 4 {
+            self.cached.remove(0);
+        }
+        self.cached.push((path.to_string(), s));
+        self.cached.last().map(|(_, s)| s.as_str())
     }
 
     /// Byte offset of the element with id `id` in the file `path`, the way
@@ -95,9 +293,22 @@ impl Source {
     /// The footnote behind a link in spine item `base`: its text, if the
     /// link is a footnote. `link_text` is what the link shows (the marker).
     pub fn footnote(&mut self, base: &str, href: &str, link_text: &str) -> Option<RichText> {
+        self.footnote_with_marker(base, href, link_text)
+            .map(|(_, text)| text)
+    }
+
+    /// Like [`Source::footnote`], also returning the resolved marker text
+    /// (falling back to the `<a href>` text/alt in the source XHTML when
+    /// `link_text` is empty).
+    pub fn footnote_with_marker(
+        &mut self,
+        base: &str,
+        href: &str,
+        link_text: &str,
+    ) -> Option<(String, RichText)> {
         let t = target(base, href)?;
         let frag = t.fragment.as_deref()?;
-        self.footnote_target(Some(base), &t.path, frag, link_text)
+        self.footnote_target_with_marker(Some(base), &t.path, frag, link_text)
     }
 
     /// The footnote behind a link pointing to `target_path` with fragment `frag`.
@@ -108,7 +319,20 @@ impl Source {
         frag: &str,
         link_text: &str,
     ) -> Option<RichText> {
-        let link_semantics = source_base
+        self.footnote_target_with_marker(source_base, target_path, frag, link_text)
+            .map(|(_, text)| text)
+    }
+
+    /// Like [`Source::footnote_target`], also returning the resolved marker
+    /// text from `link_text` or the source `<a href>` element.
+    pub fn footnote_target_with_marker(
+        &mut self,
+        source_base: Option<&str>,
+        target_path: &str,
+        frag: &str,
+        link_text: &str,
+    ) -> Option<(String, RichText)> {
+        let (link_semantics, xml_marker) = source_base
             .and_then(|base| self.text(base))
             .map(|src| {
                 let tree = XmlParser::new(src).parse();
@@ -120,10 +344,27 @@ impl Source {
                             && n.attribute("href")
                                 .is_some_and(|h| h.ends_with(&format!("#{frag}")))
                     })
-                    .map(|a| noteref_markup(a));
-                found.unwrap_or(false)
+                    .map(|a| {
+                        let text = a.text().trim().to_string();
+                        let marker = if !text.is_empty() {
+                            text
+                        } else {
+                            a.descendants()
+                                .find(|c| c.tag_name() == Some("img"))
+                                .and_then(|img| img.attribute("alt"))
+                                .map(|alt| alt.trim().to_string())
+                                .unwrap_or_default()
+                        };
+                        (noteref_markup(a), marker)
+                    });
+                found.unwrap_or((false, String::new()))
             })
-            .unwrap_or(false);
+            .unwrap_or((false, String::new()));
+        let effective_marker = if link_text.trim().is_empty() {
+            xml_marker
+        } else {
+            link_text.trim().to_string()
+        };
         let src = self.text(target_path)?;
         let tree = XmlParser::new(src).parse();
         let node = tree.root().find_by_id(frag)?;
@@ -132,11 +373,11 @@ impl Source {
             return None;
         }
         let note_like = link_semantics
-            || is_marker(link_text)
+            || is_marker(&effective_marker)
             || note_markup(node)
             || note_id(frag)
             || node.ancestor_elements().any(note_markup);
-        note_like.then_some(text)
+        note_like.then_some((effective_marker, text))
     }
 }
 
@@ -487,5 +728,48 @@ mod tests {
             r#"<html><body><div><span id="fn1">1</span> Pierwsza. <span id="fn2">2</span> Druga. {filler}</div></body></html>"#
         );
         assert_eq!(note(&x, "fn1"), "1 Pierwsza.");
+    }
+
+    #[test]
+    fn inspect_css_fine_locks_detects_font_face_and_body_line_height() {
+        let locks = inspect_css_fine_locks(
+            r#"
+            /* line-height: 2.0; commented out */
+            @font-face {
+                font-family: "FZShuSong";
+                src: url("../Fonts/fz.ttf");
+            }
+            h1 { line-height: 1.2; }
+            p.caption { line-height: 1.3; }
+            "#,
+        );
+        assert!(locks.has_embedded_fonts);
+        assert!(
+            !locks.locks_line_height,
+            "heading/caption line-height should not lock body spacing"
+        );
+
+        let locks_body = inspect_css_fine_locks(
+            r#"
+            body { font-size: 1em; line-height: 1.65; }
+            "#,
+        );
+        assert!(!locks_body.has_embedded_fonts);
+        assert!(locks_body.locks_line_height);
+
+        let locks_p = inspect_css_fine_locks(
+            r#"
+            p { line-height: 1.8 !important; }
+            "#,
+        );
+        assert!(locks_p.locks_line_height);
+
+        let locks_normal = inspect_css_fine_locks(
+            r#"
+            body { line-height: normal; }
+            p { line-height: inherit; }
+            "#,
+        );
+        assert!(!locks_normal.locks_line_height);
     }
 }

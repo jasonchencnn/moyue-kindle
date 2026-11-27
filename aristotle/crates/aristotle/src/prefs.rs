@@ -10,10 +10,12 @@
 //! an older version keeps its values. The frontlight is not stored here: the
 //! LM3695 keeps its level, and the app reads it back.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use aristotle_render::style::{Style, Underline, UnderlineScope};
+use aristotle_render::style::{
+    FitMode, FixedLayout, PageDirection, Style, Underline, UnderlineScope,
+};
 use aristotle_ui::screens::library::{CoverMode, LibraryLayout, View};
 use aristotle_ui::screens::reader::Settings;
 use serde::{Deserialize, Serialize};
@@ -147,6 +149,37 @@ impl Layout {
     }
 }
 
+/// Per-book fixed-layout / comic preferences and screen orientation override.
+///
+/// Missing fields fall back to format defaults (e.g. CBZ defaults to
+/// fullscreen + spread splitting, and honours `ComicInfo.xml` `<Manga>` for
+/// right-to-left page turns).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BookFixedPrefs {
+    /// Fit mode index (`0`: FitPage, `1`: FitWidth, `2`: FitHeight).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit: Option<usize>,
+    /// Page-turn direction index (`0`: LTR, `1`: RTL manga).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<usize>,
+    /// Fullscreen toggle (hide header, footer and margins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fullscreen: Option<bool>,
+    /// Automatic white-margin cropping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_crop: Option<bool>,
+    /// Landscape two-page spread splitting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_spread: Option<bool>,
+    /// Keep fixed-layout artwork uninverted in night mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_images_in_night: Option<bool>,
+    /// Per-book screen orientation index (`0..=3`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<usize>,
+}
+
 fn default_latin_font() -> String {
     fonts::DEFAULT_LATIN.into()
 }
@@ -159,8 +192,24 @@ fn default_cjk_font() -> String {
 #[serde(default)]
 pub struct Prefs {
     pub size: usize,
+    /// Fine-grained body font size in half-points (`12..=38`, i.e. `6.0pt` to `19.0pt`,
+    /// step `0.5pt`). `None` preserves legacy `size` index (`FONT_PT[size]`).
+    #[serde(default)]
+    pub font_size_half_pt: Option<u16>,
     pub spacing: usize,
+    /// Legacy fine-grained line height in tenths of an em (`0..=30`, i.e. `0.0` to `3.0`).
+    /// `None` preserves legacy `spacing` index (`LINE_HEIGHT[spacing]`).
+    #[serde(default)]
+    pub line_height_tenths: Option<u8>,
+    /// Fine-grained line spacing in percent (`0..=300`, step `5%`, matching KOReader).
+    /// `None` falls back to `line_height_tenths`, then legacy `spacing`.
+    #[serde(default)]
+    pub line_spacing_pct: Option<u16>,
     pub margins: usize,
+    /// Fine-grained page margin in 300-DPI reference pixels (`0..=200`, step `5px`,
+    /// matching KOReader). `None` preserves legacy `margins` index (`MARGIN_MM[margins]`).
+    #[serde(default)]
+    pub margin_ref_px: Option<u16>,
     /// EPDC waveform mode for page turns.
     pub turn_mode: u32,
     pub night: bool,
@@ -272,9 +321,9 @@ pub struct Prefs {
     /// Whether the desk cat fishes from the reading card.
     #[serde(default = "yes")]
     pub home_pet: bool,
-    /// Page turn animation: 0: 关, 1: 开 · 慢, 2: 开 · 标准, 3: 开 · 快
-    #[serde(default)]
-    pub page_anim: u8,
+    /// Briefly dim the frontlight during flashing full refreshes in night mode.
+    #[serde(default = "yes")]
+    pub night_dim_refresh: bool,
     /// Full refresh interval: 0: 每页, 1: 每 10 页, 2: 每 30 页
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval: u8,
@@ -293,12 +342,20 @@ pub struct Prefs {
     /// CJK first-line indent: 0: 2 字, 1: 无
     #[serde(default)]
     pub cjk_indent: usize,
+    /// Fine-grained CJK first-line indent in tenths of an em (`0..=40`, step `0.5em`).
+    /// `None` preserves legacy `cjk_indent` index.
+    #[serde(default)]
+    pub cjk_indent_tenths: Option<u8>,
     /// CJK script conversion: 0: 简体, 1: 繁体
     #[serde(default)]
     pub cjk_script: usize,
     /// CJK paragraph gap: 0: 无, 1: 小, 2: 大
     #[serde(default = "default_cjk_gap")]
     pub cjk_gap: usize,
+    /// Fine-grained CJK paragraph gap in tenths of an em (`0..=20`, step `0.1em`).
+    /// `None` preserves legacy `cjk_gap` index.
+    #[serde(default)]
+    pub cjk_gap_tenths: Option<u8>,
     /// CJK punctuation trim: true: 开, false: 关
     #[serde(default = "yes")]
     pub cjk_trim: bool,
@@ -307,6 +364,11 @@ pub struct Prefs {
     /// folder. The folder is created only when a confirmed import runs.
     #[serde(default)]
     pub library_destination: Option<PathBuf>,
+    /// The designated folder for user reading fonts (`.ttf`, `.otf`, `.ttc`).
+    /// `None` means the platform default (`/mnt/us/fonts` on Kindle,
+    /// `/mnt/onboard/fonts` on Kobo, or `--fonts` from the CLI).
+    #[serde(default)]
+    pub fonts_destination: Option<PathBuf>,
     /// The guide under every line of body text: 0: 无, 1: 实线, 2: 虚线.
     ///
     /// A render option, not a typographic one: it never changes the layout
@@ -324,6 +386,10 @@ pub struct Prefs {
     /// the default, on: the modern layout is the one to read in.
     #[serde(default = "yes")]
     pub fine_typesetting: bool,
+    /// Whether fine-typeset books may use their own embedded `@font-face`
+    /// fonts. A `reader.json` from before it existed defaults to `true`.
+    #[serde(default = "yes")]
+    pub embedded_fonts: bool,
     /// Body text weight as a CSS `font-weight` number, 100 to 900; 400 is
     /// normal (TYPE-101). A file from before it existed gets 400.
     #[serde(default = "default_font_weight")]
@@ -335,6 +401,142 @@ pub struct Prefs {
     /// horizontally, the way it always did.
     #[serde(default)]
     pub writing_mode: usize,
+    /// Reader header and footer ("bars") configuration.
+    #[serde(default)]
+    pub reader_bars: ReaderBarPrefs,
+    /// Whether wall-clock times use 24-hour format (default: true).
+    #[serde(default = "yes")]
+    pub clock_24h: bool,
+    /// User-selected IANA timezone id (e.g. `"Asia/Shanghai"`).
+    #[serde(default)]
+    pub timezone: Option<String>,
+    /// Fallback clock offset in seconds when the device denies RTC writes.
+    #[serde(default)]
+    pub clock_offset_secs: i64,
+    /// Invert hardware page-turn buttons (forward <-> back).
+    #[serde(default)]
+    pub invert_page_keys: bool,
+    /// Index into [`aristotle_screen::KeyLongPressAction::ALL`].
+    #[serde(default)]
+    pub page_key_long_press: usize,
+    /// Disable touch page turns in the reader (anti-accidental-touch mode).
+    #[serde(default)]
+    pub disable_touch_turn: bool,
+    /// Index into [`aristotle_screen::TouchZoneLayout::ALL`].
+    #[serde(default)]
+    pub touch_zone_layout: usize,
+    /// Warm frontlight step `0..=24` on dual-tone hardware.
+    #[serde(default)]
+    pub warmth: u32,
+    /// Ambient-light auto-brightness toggle on ALS hardware.
+    #[serde(default)]
+    pub auto_brightness: bool,
+    /// Index into [`aristotle_screen::Orientation::ALL`].
+    #[serde(default)]
+    pub orientation: usize,
+    /// Turn Wi-Fi off automatically when entering sleep to save battery.
+    #[serde(default)]
+    pub sleep_wifi_off: bool,
+    /// Preferred StarDict dictionary name, if selected.
+    #[serde(default)]
+    pub default_dictionary: Option<String>,
+    /// Salted hash of the optional 4-digit app PIN lock.
+    #[serde(default)]
+    pub app_pin_hash: Option<String>,
+    /// Whether the global status bar displays the battery percentage number.
+    #[serde(default = "yes")]
+    pub show_battery_pct: bool,
+    /// Bluetooth AI audiobook (TTS) configuration.
+    #[serde(default)]
+    pub tts: crate::tts::TtsPrefs,
+    /// Per-book fixed-layout / comic settings and screen orientation, keyed by book id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub book_fixed: BTreeMap<String, BookFixedPrefs>,
+}
+
+/// Compute a deterministic salted hash for a local 4-digit app PIN.
+pub fn hash_pin(pin: &str) -> String {
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h2: u64 = 0x8422_2325_cbf2_9ce4;
+    for round in 0u8..16 {
+        for &b in b"moyue-pin-v1:"
+            .iter()
+            .chain(pin.as_bytes())
+            .chain(&[round])
+        {
+            h1 ^= b as u64;
+            h1 = h1.wrapping_mul(0x0000_0100_0000_01b3);
+            h2 = h2.wrapping_mul(0x0000_0100_0000_01b3) ^ (b as u64).rotate_left(7);
+        }
+    }
+    format!("{h1:016x}{h2:016x}")
+}
+
+/// Verify a candidate PIN against the stored hash.
+pub fn verify_pin(pin: &str, stored_hash: &str) -> bool {
+    hash_pin(pin) == stored_hash
+}
+
+/// Serde-serializable persistence wrapper for [`aristotle_screen::ReaderBarConfig`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReaderBarPrefs {
+    pub preset: String,
+    pub show_header: bool,
+    pub show_footer: bool,
+    pub header_slots: [String; 3],
+    pub footer_slots: [String; 3],
+    pub show_progress_bar: bool,
+    pub show_dividers: bool,
+    pub show_bookmark_ribbon: bool,
+    pub compact: bool,
+}
+
+impl Default for ReaderBarPrefs {
+    fn default() -> Self {
+        Self::from_config(aristotle_screen::ReaderBarConfig::default())
+    }
+}
+
+impl ReaderBarPrefs {
+    /// Convert from the canonical [`aristotle_screen::ReaderBarConfig`].
+    pub fn from_config(c: aristotle_screen::ReaderBarConfig) -> Self {
+        Self {
+            preset: c.preset.as_str().to_string(),
+            show_header: c.show_header,
+            show_footer: c.show_footer,
+            header_slots: c.header_slots.map(|i| i.as_str().to_string()),
+            footer_slots: c.footer_slots.map(|i| i.as_str().to_string()),
+            show_progress_bar: c.show_progress_bar,
+            show_dividers: c.show_dividers,
+            show_bookmark_ribbon: c.show_bookmark_ribbon,
+            compact: c.compact,
+        }
+    }
+
+    /// Convert into [`aristotle_screen::ReaderBarConfig`], defaulting unknown keys safely.
+    pub fn to_config(&self) -> aristotle_screen::ReaderBarConfig {
+        use aristotle_screen::{BarItem, ReaderBarConfig, ReaderBarPreset};
+        ReaderBarConfig {
+            preset: ReaderBarPreset::parse(&self.preset),
+            show_header: self.show_header,
+            show_footer: self.show_footer,
+            header_slots: [
+                BarItem::parse(&self.header_slots[0]),
+                BarItem::parse(&self.header_slots[1]),
+                BarItem::parse(&self.header_slots[2]),
+            ],
+            footer_slots: [
+                BarItem::parse(&self.footer_slots[0]),
+                BarItem::parse(&self.footer_slots[1]),
+                BarItem::parse(&self.footer_slots[2]),
+            ],
+            show_progress_bar: self.show_progress_bar,
+            show_dividers: self.show_dividers,
+            show_bookmark_ribbon: self.show_bookmark_ribbon,
+            compact: self.compact,
+        }
+    }
 }
 
 fn default_cjk_gap() -> usize {
@@ -345,11 +547,14 @@ fn default_refresh_interval() -> u8 {
     1
 }
 
-/// The page interval the setting index offers: every page, ten, thirty.
+/// The page interval the setting index offers: every page, ten, thirty, or
+/// off (`0`, manual full refresh only).
 pub fn refresh_interval_pages(index: u8) -> u32 {
     match index {
         0 => 1,
         1 => 10,
+        2 => 30,
+        3 => 0,
         _ => 30,
     }
 }
@@ -390,8 +595,12 @@ impl Default for Prefs {
     fn default() -> Self {
         Prefs {
             size: 3,
+            font_size_half_pt: None,
             spacing: 1,
+            line_height_tenths: None,
+            line_spacing_pct: None,
             margins: 1,
+            margin_ref_px: None,
             turn_mode: STOCK_TURN,
             night: false,
             night_method: NightMethod::Software,
@@ -421,22 +630,43 @@ impl Default for Prefs {
             home_stats: true,
             home_quote: true,
             home_pet: true,
-            page_anim: 0,
+            night_dim_refresh: true,
             refresh_interval: 1,
             quote_mode: QuoteMode::AllRandom,
             favorite_quotes: BTreeSet::new(),
             hidden_quotes: BTreeSet::new(),
             fixed_quote_id: None,
             cjk_indent: 0,
+            cjk_indent_tenths: None,
             cjk_script: 0,
             cjk_gap: 2,
+            cjk_gap_tenths: None,
             cjk_trim: true,
             library_destination: None,
+            fonts_destination: None,
             underline: 0,
             underline_scope: 0,
             fine_typesetting: true,
+            embedded_fonts: true,
             font_weight: aristotle_ui::screens::typeset::WEIGHT_NORMAL,
             writing_mode: 0,
+            reader_bars: ReaderBarPrefs::default(),
+            clock_24h: true,
+            timezone: None,
+            clock_offset_secs: 0,
+            invert_page_keys: false,
+            page_key_long_press: 0,
+            disable_touch_turn: false,
+            touch_zone_layout: 0,
+            warmth: 0,
+            auto_brightness: false,
+            orientation: 0,
+            sleep_wifi_off: false,
+            default_dictionary: None,
+            app_pin_hash: None,
+            show_battery_pct: true,
+            tts: crate::tts::TtsPrefs::default(),
+            book_fixed: BTreeMap::new(),
         }
     }
 }
@@ -487,8 +717,24 @@ impl Prefs {
 
     fn clamped(mut self) -> Prefs {
         self.size = self.size.min(FONT_PT.len() - 1);
+        if let Some(half_pt) = self.font_size_half_pt {
+            self.font_size_half_pt = Some(
+                aristotle_ui::screens::typeset::font_size_half_pt_clamped(half_pt),
+            );
+        }
         self.spacing = self.spacing.min(LINE_HEIGHT.len() - 1);
+        if let Some(tenths) = self.line_height_tenths {
+            self.line_height_tenths = Some(aristotle_ui::screens::typeset::spacing_tenths_clamped(
+                tenths,
+            ));
+        }
+        if let Some(pct) = self.line_spacing_pct {
+            self.line_spacing_pct = Some(aristotle_ui::screens::typeset::spacing_pct_clamped(pct));
+        }
         self.margins = self.margins.min(MARGIN_MM.len() - 1);
+        if let Some(px) = self.margin_ref_px {
+            self.margin_ref_px = Some(aristotle_ui::screens::typeset::margin_ref_px_clamped(px));
+        }
         self.library_view = self.library_view.min(View::ALL.len() - 1);
         self.sort = self.sort.min(crate::shelf::SORTS.len() - 1);
         self.daily_goal_minutes = self.daily_goal_minutes.clamp(1, 600);
@@ -502,8 +748,16 @@ impl Prefs {
             self.font_cjk = fonts::DEFAULT_CJK.into();
         }
         self.cjk_indent = self.cjk_indent.min(1);
+        if let Some(tenths) = self.cjk_indent_tenths {
+            self.cjk_indent_tenths = Some(aristotle_ui::screens::typeset::indent_tenths_clamped(
+                tenths,
+            ));
+        }
         self.cjk_script = self.cjk_script.min(1);
         self.cjk_gap = self.cjk_gap.min(2);
+        if let Some(tenths) = self.cjk_gap_tenths {
+            self.cjk_gap_tenths = Some(aristotle_ui::screens::typeset::gap_tenths_clamped(tenths));
+        }
         self.underline = self.underline.min(2);
         self.underline_scope = self.underline_scope.min(1);
         self.font_weight = aristotle_ui::screens::typeset::weight_clamped(self.font_weight);
@@ -511,6 +765,23 @@ impl Prefs {
         // as `WritingMode::from_index` does (VERT-101 S1).
         self.writing_mode =
             aristotle_render::style::WritingMode::from_index(self.writing_mode).index();
+        self.page_key_long_press =
+            aristotle_screen::KeyLongPressAction::from_index(self.page_key_long_press).index();
+        self.touch_zone_layout =
+            aristotle_screen::TouchZoneLayout::from_index(self.touch_zone_layout).index();
+        self.warmth = self.warmth.min(aristotle_hal::power::LIGHT_STEPS);
+        self.orientation = aristotle_screen::Orientation::from_index(self.orientation).index();
+        for entry in self.book_fixed.values_mut() {
+            if let Some(fit) = entry.fit {
+                entry.fit = Some(FitMode::from_index(fit).index());
+            }
+            if let Some(dir) = entry.direction {
+                entry.direction = Some(PageDirection::from_index(dir).index());
+            }
+            if let Some(orient) = entry.orientation {
+                entry.orientation = Some(aristotle_screen::Orientation::from_index(orient).index());
+            }
+        }
         if !aristotle_i18n::locales()
             .iter()
             .any(|l| l.code == self.language)
@@ -531,20 +802,136 @@ impl Prefs {
         UnderlineScope::from_index(self.underline_scope.min(1))
     }
 
+    /// Effective fixed-layout / comic settings for `book_id`, combining any
+    /// per-book overrides with sensible format defaults.
+    ///
+    /// CBZ comics default to fullscreen + landscape spread splitting and
+    /// respect `ComicInfo.xml` `<Manga>` for right-to-left page turns; PDFs
+    /// default to standard chrome and single-page LTR until toggled.
+    pub fn fixed_layout_for(
+        &self,
+        book_id: &str,
+        format: aristotle_library::Format,
+        manga_rtl: bool,
+    ) -> FixedLayout {
+        let is_cbz = format == aristotle_library::Format::Cbz;
+        let saved = self.book_fixed.get(book_id);
+        FixedLayout {
+            fit: saved
+                .and_then(|b| b.fit)
+                .map(FitMode::from_index)
+                .unwrap_or(FitMode::FitPage),
+            direction: saved
+                .and_then(|b| b.direction)
+                .map(PageDirection::from_index)
+                .unwrap_or(if is_cbz && manga_rtl {
+                    PageDirection::Rtl
+                } else {
+                    PageDirection::Ltr
+                }),
+            fullscreen: saved.and_then(|b| b.fullscreen).unwrap_or(is_cbz),
+            auto_crop: saved.and_then(|b| b.auto_crop).unwrap_or(false),
+            split_spread: saved.and_then(|b| b.split_spread).unwrap_or(is_cbz),
+            keep_images_in_night: saved.and_then(|b| b.keep_images_in_night).unwrap_or(true),
+        }
+    }
+
+    /// Effective screen orientation index (`0..=3`) for `book_id`, falling
+    /// back to the global orientation preference when the book has no override.
+    pub fn orientation_for_book(&self, book_id: &str) -> usize {
+        self.book_fixed
+            .get(book_id)
+            .and_then(|b| b.orientation)
+            .map(|i| aristotle_screen::Orientation::from_index(i).index())
+            .unwrap_or_else(|| aristotle_screen::Orientation::from_index(self.orientation).index())
+    }
+
+    /// Current body font size in half-points (`12..=38`, step `0.5pt`) for the typeset stepper.
+    pub fn font_size_half_pt(&self) -> u16 {
+        self.font_size_half_pt.unwrap_or_else(|| {
+            aristotle_ui::screens::typeset::font_size_half_pt_from_pt(
+                FONT_PT[self.size.min(FONT_PT.len() - 1)],
+            )
+        })
+    }
+
+    /// Current line spacing in tenths of an em (`0..=30`) for legacy callers.
+    pub fn spacing_tenths(&self) -> u8 {
+        self.line_height_tenths.unwrap_or_else(|| {
+            (aristotle_ui::screens::typeset::spacing_ratio(self.spacing) * 10.0).round() as u8
+        })
+    }
+
+    /// Current line spacing in percent (`0..=300`, step `5%`) for the typeset stepper.
+    pub fn spacing_pct(&self) -> u16 {
+        self.line_spacing_pct
+            .or_else(|| self.line_height_tenths.map(|t| u16::from(t) * 10))
+            .unwrap_or_else(|| {
+                (aristotle_ui::screens::typeset::spacing_ratio(self.spacing) * 100.0).round() as u16
+            })
+    }
+
+    /// Current page margin in 300-DPI reference pixels (`0..=200`, step `5px`) for the typeset stepper.
+    pub fn margin_ref_px(&self) -> u16 {
+        self.margin_ref_px.unwrap_or_else(|| {
+            let mm = MARGIN_MM[self.margins.min(MARGIN_MM.len() - 1)];
+            let snapped = ((mm as f32 * 300.0 / 25.4) / 5.0).round().max(0.0) as u16 * 5;
+            aristotle_ui::screens::typeset::margin_ref_px_clamped(snapped)
+        })
+    }
+
+    /// Current CJK first-line indent in tenths of an em (`0..=40`, step `0.5em`).
+    pub fn cjk_indent_tenths(&self) -> u8 {
+        self.cjk_indent_tenths.unwrap_or_else(|| {
+            (aristotle_ui::screens::typeset::indent_chars(self.cjk_indent) as u8) * 10
+        })
+    }
+
+    /// Current CJK paragraph gap in tenths of an em (`0..=20`, step `0.1em`).
+    pub fn cjk_gap_tenths(&self) -> u8 {
+        self.cjk_gap_tenths.unwrap_or_else(|| {
+            (aristotle_ui::screens::typeset::gap_ratio(self.cjk_gap) * 10.0).round() as u8
+        })
+    }
+
     /// The page style for these preferences.
     pub fn style(&self) -> Style {
         let p = self.clone().clamped();
         let mut s = Style::pw4();
-        s.font_size = FONT_PT[p.size];
-        s.line_height = LINE_HEIGHT[p.spacing];
-        s.margin_mm = MARGIN_MM[p.margins];
+        s.font_size = p
+            .font_size_half_pt
+            .map(aristotle_ui::screens::typeset::font_size_pt_from_half_pt)
+            .unwrap_or(FONT_PT[p.size]);
+        s.line_height = p
+            .line_spacing_pct
+            .map(aristotle_ui::screens::typeset::spacing_ratio_from_pct)
+            .or_else(|| {
+                p.line_height_tenths
+                    .map(aristotle_ui::screens::typeset::spacing_ratio_from_tenths)
+            })
+            .unwrap_or(LINE_HEIGHT[p.spacing]);
+        if let Some(ref_px) = p.margin_ref_px {
+            s.margin_px_override = Some(i32::from(ref_px));
+            s.margin_mm = (f32::from(ref_px) * 25.4 / 300.0).round() as i32;
+        } else {
+            s.margin_mm = MARGIN_MM[p.margins];
+            s.margin_px_override = None;
+        }
         s.font_family = p.font_latin.clone();
         s.cjk_font_family = p.font_cjk.clone();
         s.cjk_indent = aristotle_ui::screens::typeset::indent_chars(p.cjk_indent);
-        s.cjk_gap = aristotle_ui::screens::typeset::gap_ratio(p.cjk_gap);
+        s.cjk_indent_em = p
+            .cjk_indent_tenths
+            .map(aristotle_ui::screens::typeset::indent_em_from_tenths);
+        s.cjk_gap = p
+            .cjk_gap_tenths
+            .map(aristotle_ui::screens::typeset::gap_em_from_tenths)
+            .unwrap_or_else(|| aristotle_ui::screens::typeset::gap_ratio(p.cjk_gap));
         s.fine_typesetting = p.fine_typesetting;
+        s.embedded_fonts = p.embedded_fonts;
         s.font_weight = p.font_weight;
         s.writing_mode = aristotle_render::style::WritingMode::from_index(p.writing_mode);
+        s.apply_bar_config(p.reader_bars.to_config());
         if let Some(dir) = p.font_dir.filter(|_| p.font_latin != fonts::DEFAULT_LATIN) {
             s.font_dir = dir;
         }
@@ -710,22 +1097,27 @@ mod tests {
             home_stats: true,
             home_quote: true,
             home_pet: true,
-            page_anim: 0,
+            night_dim_refresh: true,
             refresh_interval: 1,
             quote_mode: QuoteMode::AllRandom,
             favorite_quotes: BTreeSet::new(),
             hidden_quotes: BTreeSet::new(),
             fixed_quote_id: None,
             cjk_indent: 0,
+            cjk_indent_tenths: None,
             cjk_script: 0,
             cjk_gap: 2,
+            cjk_gap_tenths: None,
             cjk_trim: true,
             library_destination: None,
+            fonts_destination: None,
             underline: 0,
             underline_scope: 0,
             fine_typesetting: true,
+            embedded_fonts: true,
             font_weight: 400,
             writing_mode: 0,
+            ..Prefs::default()
         };
         p.save(&dir).unwrap();
         assert_eq!(Prefs::load(&dir), p);
@@ -1031,12 +1423,15 @@ mod tests {
         assert_eq!(refresh_interval_pages(0), 1);
         assert_eq!(refresh_interval_pages(1), 10);
         assert_eq!(refresh_interval_pages(2), 30);
+        assert_eq!(refresh_interval_pages(3), 0);
         // Older files and unknown values fall back to the default interval.
         assert_eq!(refresh_interval_pages(9), 30);
         let mut p = Prefs::default();
         assert_eq!(p.refresh_pages(), 10);
         p.refresh_interval = 0;
         assert_eq!(p.refresh_pages(), 1);
+        p.refresh_interval = 3;
+        assert_eq!(p.refresh_pages(), 0);
     }
 
     #[test]
@@ -1162,5 +1557,51 @@ mod tests {
         p.cjk_gap = 1;
         let s = p.style();
         assert!((s.cjk_gap - 0.3).abs() < 1e-4);
+    }
+
+    #[test]
+    fn book_fixed_prefs_round_trip_and_defaults() {
+        // Older reader.json without book_fixed loads cleanly.
+        let old: Prefs = serde_json::from_str(r#"{"size":3}"#).unwrap();
+        assert!(old.book_fixed.is_empty());
+
+        // CBZ defaults: fullscreen + split_spread + Manga RTL auto-detected.
+        let cbz_rtl = old.fixed_layout_for("b1", aristotle_library::Format::Cbz, true);
+        assert!(cbz_rtl.fullscreen);
+        assert!(cbz_rtl.split_spread);
+        assert_eq!(cbz_rtl.direction, PageDirection::Rtl);
+        assert!(cbz_rtl.keep_images_in_night);
+
+        // PDF defaults: non-fullscreen, non-split, LTR.
+        let pdf_def = old.fixed_layout_for("b2", aristotle_library::Format::Pdf, false);
+        assert!(!pdf_def.fullscreen);
+        assert!(!pdf_def.split_spread);
+        assert_eq!(pdf_def.direction, PageDirection::Ltr);
+
+        // Per-book overrides round-trip and clamp out-of-range values.
+        let mut prefs = Prefs::default();
+        prefs.book_fixed.insert(
+            "b1".into(),
+            BookFixedPrefs {
+                fit: Some(1),
+                direction: Some(0),
+                fullscreen: Some(false),
+                auto_crop: Some(true),
+                split_spread: Some(false),
+                keep_images_in_night: Some(false),
+                orientation: Some(2),
+            },
+        );
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        let decoded: Prefs = serde_json::from_str(&encoded).unwrap();
+        let fl = decoded.fixed_layout_for("b1", aristotle_library::Format::Cbz, true);
+        assert_eq!(fl.fit, FitMode::FitWidth);
+        assert_eq!(fl.direction, PageDirection::Ltr);
+        assert!(!fl.fullscreen);
+        assert!(fl.auto_crop);
+        assert!(!fl.split_spread);
+        assert!(!fl.keep_images_in_night);
+        assert_eq!(decoded.orientation_for_book("b1"), 2);
+        assert_eq!(decoded.orientation_for_book("other"), 0);
     }
 }

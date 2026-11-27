@@ -23,9 +23,11 @@ use aristotle_ui::screens::library::{
 use aristotle_ui::screens::mine as mine_screen;
 use aristotle_ui::screens::ota as ota_screen;
 use aristotle_ui::screens::reader::{Reader, Settings};
+use aristotle_ui::screens::scan::{self as scan_screen, ScanScreen, ScanState};
 use aristotle_ui::screens::selection as selection_screen;
 use aristotle_ui::screens::settings::{self as settings_screen, BatteryInfo, SystemView, Usb};
 use aristotle_ui::screens::sheet::{self, Button};
+use aristotle_ui::screens::time_settings::{TimeSettingsUi, TimeSettingsView};
 use aristotle_ui::screens::toc as toc_screen;
 use aristotle_ui::screens::translate as translate_screen;
 use aristotle_ui::screens::typeset::{self as typeset_screen, TypesetView};
@@ -225,6 +227,7 @@ fn screens(screen: Screen) -> Vec<(String, Ui)> {
             weread_readtime: false,
             weread_readtime_note: None,
             weread_notes: Some((2, 12, 4)),
+            extra: Default::default(),
         };
         let (tree, _ids) = settings_screen::Settings::build(&mut text, &st, &view);
         let mut ui = Ui::with_screen(tree, text, screen);
@@ -420,6 +423,48 @@ fn screens(screen: Screen) -> Vec<(String, Ui)> {
         l.sync(&mut ui.tree);
         ui.layout();
         out.push(("toc".into(), ui));
+    }
+
+    // The empty library onboarding screen (with all cloud channels visible).
+    {
+        let mut text = engine();
+        let scan = ScanScreen {
+            status: status(),
+            state: ScanState::Empty,
+            local_books_count: 0,
+        };
+        let (tree, _ids) = scan_screen::ScanUi::build_with_channels_for_size(
+            &mut text,
+            &st,
+            &scan,
+            library_screen::ChannelVisibility {
+                readest: true,
+                weread: true,
+                jianguoyun: true,
+            },
+            size,
+        );
+        let mut ui = Ui::with_screen(tree, text, screen);
+        ui.layout();
+        out.push(("scan-empty".into(), ui));
+    }
+
+    // The time & timezone settings screen.
+    {
+        let mut text = engine();
+        let view = TimeSettingsView {
+            status: status(),
+            now_display: "2026-11-25  10:30",
+            clock_24h: true,
+            timezone_id: "Asia/Shanghai",
+            syncing: false,
+            message: None,
+        };
+        let (tree, ids) = TimeSettingsUi::build(&mut text, &st, &view);
+        let mut ui = Ui::with_screen(tree, text, screen);
+        ui.layout();
+        ids.sync_pager(&mut ui.tree);
+        out.push(("time-settings".into(), ui));
     }
 
     out
@@ -662,6 +707,94 @@ fn narrow_panels_have_no_overlapping_controls() {
     assert!(
         all.is_empty(),
         "{} finding(s):\n{}",
+        all.len(),
+        all.join("\n")
+    );
+}
+
+#[test]
+fn landscape_ko2_has_no_overlapping_or_offscreen_controls() {
+    let mut all = Vec::new();
+    aristotle_i18n::with_language("zh", || {
+        let screen = Screen::new(1680, 1264, 300).unwrap();
+        let size = Size::new(1680, 1264);
+        let st = styles(screen);
+        for (screen_name, ui) in screens(screen) {
+            for finding in findings(&ui, &format!("ko2-landscape/zh/{screen_name}")) {
+                all.push(finding);
+            }
+        }
+        // Also audit Home (with clock + reading + stats + recent + quote) and Library Grid.
+        {
+            let mut text = engine();
+            let books = library_screen::sample_books();
+            let quote = aristotle_ui::screens::home::quotes::QuoteItem {
+                id: 1,
+                text: "春江潮水连海平，海上明月共潮生。".into(),
+                author: "张若虚".into(),
+                source: "春江花月夜".into(),
+                category: aristotle_ui::screens::home::quotes::QuoteCategory::Reading,
+                is_original: false,
+            };
+            let home = aristotle_ui::screens::home::Home {
+                status: status(),
+                clock: aristotle_ui::screens::home::ClockStyle::default(),
+                clock_text: aristotle_ui::screens::home::ClockText {
+                    time: "19:35".into(),
+                    date: "2026年11月24日".into(),
+                    month_day: "11月24日".into(),
+                    weekday: "星期二".into(),
+                    lunar: "农历十月十五".into(),
+                    lunar_short: "十月十五".into(),
+                    term: None,
+                },
+                reading: books.first(),
+                stats: Some(aristotle_ui::screens::home::Stats {
+                    today_minutes: 15,
+                    streak_days: 3,
+                    week_hours: 2.5,
+                }),
+                recent: &books,
+                quote: Some(&quote),
+                pet: true,
+            };
+            let (tree, _ids) =
+                aristotle_ui::screens::home::HomeUi::build_for_size(&mut text, &st, &home, size);
+            let mut ui = Ui::with_screen(tree, text, screen);
+            ui.layout();
+            for finding in findings(&ui, "ko2-landscape/zh/home") {
+                all.push(finding);
+            }
+        }
+        {
+            let mut text = engine();
+            let books = library_screen::sample_books();
+            let items: Vec<Item> = books.iter().cloned().map(Item::Book).collect();
+            let shelf = Shelf {
+                place: Place::Home {
+                    view: View::Books,
+                    filter: Filter::All,
+                },
+                hero: None,
+                items: &items,
+                sort: "Recently opened",
+                status: status(),
+                covers: CoverMode::Cards,
+                layout: LibraryLayout::Grid,
+                local_books_count: books.len(),
+            };
+            let (tree, _ids) =
+                library_screen::Library::build_shelf_for_size(&mut text, &st, &shelf, size);
+            let mut ui = Ui::with_screen(tree, text, screen);
+            ui.layout();
+            for finding in findings(&ui, "ko2-landscape/zh/library-grid") {
+                all.push(finding);
+            }
+        }
+    });
+    assert!(
+        all.is_empty(),
+        "{} landscape finding(s):\n{}",
         all.len(),
         all.join("\n")
     );

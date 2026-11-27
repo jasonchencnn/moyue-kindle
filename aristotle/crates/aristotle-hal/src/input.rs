@@ -10,7 +10,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aristotle_screen::model::{self, KoboModel, KoboProtocol, Model, PageTurnKeys};
 
@@ -837,12 +837,115 @@ impl PageKeys {
     }
 }
 
-/// The device's input devices: the touchscreen and the page-turn buttons.
+/// Linux input bus IDs for Bluetooth (`BUS_BLUETOOTH`) and virtual/uinput HID (`BUS_VIRTUAL`).
+const BUS_BLUETOOTH: u16 = 0x0005;
+const BUS_VIRTUAL: u16 = 0x0006;
+/// Interval between lightweight `/proc/bus/input/devices` scans for newly
+/// connected Bluetooth HID page turners.
+const BT_RESCAN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Map a Linux `EV_KEY` code from an external Bluetooth HID page turner into a
+/// page-turn [`Key`].
+///
+/// Covers the common HID profiles shipped by commercial Bluetooth page turners,
+/// selfie shutters, and mini gamepads (8BitDo Micro, TikTok rings, Kindle clickers).
+pub fn map_bluetooth_key(code: u16) -> Option<Key> {
+    match code {
+        // PageDown, Down, Right, VolumeDown, Space, Enter, KpEnter, NextSong, J
+        109 | 108 | 106 | 114 | 57 | 28 | 96 | 163 | 36 => Some(Key::PageForward),
+        // PageUp, Up, Left, VolumeUp, Backspace, PreviousSong, K
+        104 | 103 | 105 | 115 | 14 | 165 | 37 => Some(Key::PageBack),
+        _ => None,
+    }
+}
+
+/// An opened external Bluetooth HID evdev node.
+pub struct BluetoothKeys {
+    file: File,
+    path: String,
+    name: String,
+}
+
+impl BluetoothKeys {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn read(&mut self) -> io::Result<Vec<Key>> {
+        let mut buf = [0u8; std::mem::size_of::<RawEvent>() * 16];
+        let len = self.file.read(&mut buf)?;
+        if len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "bluetooth input disconnected",
+            ));
+        }
+        let mut out = Vec::new();
+        let (events, _) = buf[..len].as_chunks::<{ std::mem::size_of::<RawEvent>() }>();
+        for chunk in events {
+            // SAFETY: chunk is exactly one RawEvent; read_unaligned handles alignment.
+            let ev: RawEvent = unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast()) };
+            if ev.kind != EV_KEY || ev.value != 1 {
+                continue;
+            }
+            if let Some(key) = map_bluetooth_key(ev.code) {
+                out.push(key);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Parse `/proc/bus/input/devices` and return `(name, /dev/input/eventN)` for
+/// Bluetooth (`Bus=0005`) or virtual HID (`Bus=0006`) event devices.
+fn parse_bluetooth_input_devices(proc_text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for block in proc_text.split("\n\n") {
+        let bus = block
+            .lines()
+            .find_map(|l| l.strip_prefix("I: "))
+            .and_then(|rest| {
+                rest.split_whitespace()
+                    .find_map(|tok| tok.strip_prefix("Bus="))
+            })
+            .and_then(|hex| u16::from_str_radix(hex, 16).ok());
+        if !matches!(bus, Some(BUS_BLUETOOTH | BUS_VIRTUAL)) {
+            continue;
+        }
+        let name = block
+            .lines()
+            .find_map(|l| l.strip_prefix("N: Name=\""))
+            .map(|n| n.trim_end_matches('"').to_string());
+        let handler = block
+            .lines()
+            .find_map(|l| l.strip_prefix("H: Handlers="))
+            .and_then(|h| {
+                h.split_whitespace()
+                    .find(|t| t.starts_with("event"))
+                    .map(str::to_string)
+            });
+        if let (Some(name), Some(handler)) = (name, handler) {
+            out.push((name, format!("/dev/input/{handler}")));
+        }
+    }
+    out
+}
+
+/// The device's input devices: the touchscreen, built-in page-turn buttons,
+/// and any hot-plugged Bluetooth HID page turners.
 pub struct Input {
     touch: TouchScreen,
     keys: Option<PageKeys>,
     /// Why the page-turn buttons are missing, when they are.
     keys_error: Option<String>,
+    /// Hot-plugged Bluetooth HID input nodes.
+    bt_keys: Vec<BluetoothKeys>,
+    /// Last time `/proc/bus/input/devices` was checked for Bluetooth HID nodes.
+    last_bt_scan: Instant,
 }
 
 /// What the input devices produced.
@@ -876,11 +979,15 @@ impl Input {
                 Err(e) => (None, Some(e.to_string())),
             },
         };
-        Ok(Self {
+        let mut input = Self {
             touch,
             keys,
             keys_error,
-        })
+            bt_keys: Vec::new(),
+            last_bt_scan: Instant::now() - BT_RESCAN_INTERVAL,
+        };
+        input.refresh_bluetooth_inputs();
+        Ok(input)
     }
 
     /// Open the touchscreen and page-turn buttons of a Kobo `model`.
@@ -903,11 +1010,48 @@ impl Input {
                 Err(e) => (None, Some(e.to_string())),
             },
         };
-        Ok(Self {
+        let mut input = Self {
             touch,
             keys,
             keys_error,
-        })
+            bt_keys: Vec::new(),
+            last_bt_scan: Instant::now() - BT_RESCAN_INTERVAL,
+        };
+        input.refresh_bluetooth_inputs();
+        Ok(input)
+    }
+
+    /// Currently opened Bluetooth HID page-turner devices.
+    pub fn bluetooth_keys(&self) -> &[BluetoothKeys] {
+        &self.bt_keys
+    }
+
+    /// Scan `/proc/bus/input/devices` for newly connected Bluetooth HID
+    /// page turners and drop any that have vanished.
+    pub fn refresh_bluetooth_inputs(&mut self) {
+        self.last_bt_scan = Instant::now();
+        let Ok(proc_text) = fs::read_to_string("/proc/bus/input/devices") else {
+            return;
+        };
+        let candidates = parse_bluetooth_input_devices(&proc_text);
+        let touch_path = self.touch.path().to_string();
+        let keys_path = self.keys.as_ref().map(|k| k.path().to_string());
+
+        // Drop devices that are no longer listed in /proc/bus/input/devices.
+        self.bt_keys
+            .retain(|opened| candidates.iter().any(|(_, path)| path == &opened.path));
+
+        for (name, path) in candidates {
+            if path == touch_path || keys_path.as_deref() == Some(path.as_str()) {
+                continue;
+            }
+            if self.bt_keys.iter().any(|opened| opened.path == path) {
+                continue;
+            }
+            if let Ok(file) = File::open(&path) {
+                self.bt_keys.push(BluetoothKeys { file, path, name });
+            }
+        }
     }
 
     pub fn touch(&self) -> &TouchScreen {
@@ -928,44 +1072,55 @@ impl Input {
         self.keys_error.as_deref()
     }
 
-    /// Reopen all input file descriptors (touchscreen and keys).
+    /// Reopen all input file descriptors (touchscreen, built-in keys, and Bluetooth HID).
     pub fn reopen(&mut self) -> io::Result<()> {
         self.touch.reopen()?;
         if let Some(keys) = &mut self.keys {
             let _ = keys.reopen();
         }
+        self.bt_keys.clear();
+        self.refresh_bluetooth_inputs();
         Ok(())
     }
 
-    /// Poll touch, buttons, power events and worker completions in one wait.
+    /// Poll touch, buttons, Bluetooth HID devices, power events and worker completions in one wait.
     pub fn poll_with_worker(
         &mut self,
         timeout: Duration,
         other: Option<RawFd>,
         worker: Option<RawFd>,
     ) -> io::Result<Events> {
-        let mut fds = [
-            libc::pollfd {
-                fd: self.touch.file.as_raw_fd(),
+        if self.last_bt_scan.elapsed() >= BT_RESCAN_INTERVAL {
+            self.refresh_bluetooth_inputs();
+        }
+        let mut fds = Vec::with_capacity(4 + self.bt_keys.len());
+        fds.push(libc::pollfd {
+            fd: self.touch.file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        fds.push(libc::pollfd {
+            fd: other.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        fds.push(libc::pollfd {
+            fd: worker.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        fds.push(libc::pollfd {
+            fd: self.keys.as_ref().map_or(-1, |k| k.file.as_raw_fd()),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        for bt in &self.bt_keys {
+            fds.push(libc::pollfd {
+                fd: bt.file.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
-            },
-            libc::pollfd {
-                fd: other.unwrap_or(-1),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: worker.unwrap_or(-1),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: self.keys.as_ref().map_or(-1, |k| k.file.as_raw_fd()),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
+            });
+        }
         let count = fds.len() as libc::nfds_t;
         // SAFETY: `count` valid pollfds for the duration of the call.
         let n = unsafe {
@@ -1012,7 +1167,7 @@ impl Input {
         if fds[3].revents & libc::POLLIN != 0 {
             if let Some(keys) = self.keys.as_mut() {
                 match keys.read() {
-                    Ok(k) => events.keys = k,
+                    Ok(k) => events.keys.extend(k),
                     Err(e) => {
                         eprintln!("aristotle: reading key events failed ({e}), reopening");
                         std::thread::sleep(Duration::from_millis(50));
@@ -1020,6 +1175,21 @@ impl Input {
                     }
                 }
             }
+        }
+        let mut disconnected = Vec::new();
+        for (idx, bt) in self.bt_keys.iter_mut().enumerate() {
+            let revents = fds[4 + idx].revents;
+            if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                disconnected.push(idx);
+            } else if revents & libc::POLLIN != 0 {
+                match bt.read() {
+                    Ok(k) => events.keys.extend(k),
+                    Err(_) => disconnected.push(idx),
+                }
+            }
+        }
+        for idx in disconnected.into_iter().rev() {
+            self.bt_keys.remove(idx);
         }
         Ok(events)
     }
@@ -1190,6 +1360,49 @@ mod tests {
                 forward: 194,
                 back: 193,
             })
+        );
+    }
+
+    #[test]
+    fn maps_common_bluetooth_page_turner_keycodes() {
+        assert_eq!(map_bluetooth_key(109), Some(Key::PageForward)); // KEY_PAGEDOWN
+        assert_eq!(map_bluetooth_key(114), Some(Key::PageForward)); // KEY_VOLUMEDOWN
+        assert_eq!(map_bluetooth_key(106), Some(Key::PageForward)); // KEY_RIGHT
+        assert_eq!(map_bluetooth_key(28), Some(Key::PageForward)); // KEY_ENTER
+        assert_eq!(map_bluetooth_key(104), Some(Key::PageBack)); // KEY_PAGEUP
+        assert_eq!(map_bluetooth_key(115), Some(Key::PageBack)); // KEY_VOLUMEUP
+        assert_eq!(map_bluetooth_key(105), Some(Key::PageBack)); // KEY_LEFT
+        assert_eq!(map_bluetooth_key(1), None); // KEY_ESC
+    }
+
+    #[test]
+    fn parses_only_bluetooth_and_virtual_hid_devices() {
+        let sample = "\
+I: Bus=0019 Vendor=0001 Product=0001 Version=0100
+N: Name=\"gpio-keys\"
+H: Handlers=kbd event0
+
+I: Bus=0005 Vendor=2dc8 Product=9020 Version=0100
+N: Name=\"8BitDo Micro Keyboard\"
+H: Handlers=sysrq kbd event3
+
+I: Bus=0006 Vendor=0000 Product=0000 Version=0000
+N: Name=\"bt-uinput-turner\"
+H: Handlers=kbd event4
+";
+        let found = parse_bluetooth_input_devices(sample);
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "8BitDo Micro Keyboard".to_string(),
+                    "/dev/input/event3".to_string()
+                ),
+                (
+                    "bt-uinput-turner".to_string(),
+                    "/dev/input/event4".to_string()
+                ),
+            ]
         );
     }
 }

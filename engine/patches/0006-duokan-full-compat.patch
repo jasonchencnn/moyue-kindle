@@ -1,0 +1,725 @@
+diff --git a/crengine/include/cssdef.h b/crengine/include/cssdef.h
+index 93fe932..5a7cf06 100644
+--- a/crengine/include/cssdef.h
++++ b/crengine/include/cssdef.h
+@@ -485,12 +485,25 @@ enum css_generic_value_t {
+ // (see `-cr-hint: footnote-inpage` above)
+ #define CSS_CR_HINT_EXTEND_FOOTNOTE_INPAGE  0x10000000 // -cr-hint: extend-footnote-inpage
+ 
++// Duokan (多看) bleed directions & lightweight border-radius (stored in unused positive cr_hint bits
++// so css_style_rec_t memory layout and cache serialization format remain 100% backward-compatible).
++#define CSS_CR_HINT_DUOKAN_BLEED_LEFT       0x20000000
++#define CSS_CR_HINT_DUOKAN_BLEED_RIGHT      0x40000000
++#define CSS_CR_HINT_DUOKAN_BLEED_TOP        0x00080000
++#define CSS_CR_HINT_BORDER_RADIUS_B0        0x00000040
++#define CSS_CR_HINT_BORDER_RADIUS_B1        0x00000080
++#define CSS_CR_HINT_BORDER_RADIUS_B2        0x00008000
++
+ // A few of them are inheritable, most are not.
+ #define CSS_CR_HINT_INHERITABLE_MASK        0x0000000E
+ #define CSS_CR_HINT_INHERITABLE_EARLY_MASK  0x00800000 // inherited before stylesheets are applied
+ 
+ // Macro for easier checking
+ #define STYLE_HAS_CR_HINT(s, h)     ( (bool)(s->cr_hint.value & CSS_CR_HINT_##h) )
++#define STYLE_GET_BORDER_RADIUS_STEP(s) ( \
++    (((s)->cr_hint.value & CSS_CR_HINT_BORDER_RADIUS_B0) ? 1 : 0) | \
++    (((s)->cr_hint.value & CSS_CR_HINT_BORDER_RADIUS_B1) ? 2 : 0) | \
++    (((s)->cr_hint.value & CSS_CR_HINT_BORDER_RADIUS_B2) ? 4 : 0) )
+ 
+ /// css length value
+ typedef struct css_length_tag {
+diff --git a/crengine/include/lvtextfm.h b/crengine/include/lvtextfm.h
+index d045084..a420695 100644
+--- a/crengine/include/lvtextfm.h
++++ b/crengine/include/lvtextfm.h
+@@ -93,6 +93,7 @@ extern "C" {
+                                                   //                              as it is also an inlineBox wrapping node)
+ #define LTEXT_OBJECT_IS_FLOAT             0x0010  // float:'ing node
+ #define LTEXT_OBJECT_IS_FLOAT_DONE        0x0020  // float:'ing node (already dealt with)
++#define LTEXT_OBJECT_NO_WRAP_BEFORE       0x0040  // disallow line break before inline object (e.g. footnote icon)
+ 
+ #define LTEXT_OBJECT_IS_PAD               0x0100  // inline pad (accounting for margin/border/padding of inline element)
+ #define LTEXT_OBJECT_IS_PAD_RIGHT         0x0200  // inline pad is right pad (otherwise, left pad)
+diff --git a/crengine/src/lvdocview.cpp b/crengine/src/lvdocview.cpp
+index 0deb8c0..3b46718 100644
+--- a/crengine/src/lvdocview.cpp
++++ b/crengine/src/lvdocview.cpp
+@@ -1979,6 +1979,84 @@ void LVDocView::drawPageHeader(LVDrawBuf * drawbuf, const lvRect & headerRc,
+ 	drawbuf->SetTextColor(getTextColor());
+ }
+ 
++namespace {
++
++// Locate a single dominant image inside a Duokan fullscreen/fitwindow DocFragment
++// (OPF spine properties="duokan-page-fullscreen" / "duokan-page-fitwindow").
++// Returns NULL if the fragment has significant body text or no image.
++static ldomNode * findDuokanFullscreenImageNode(ldomNode * node, int & text_chars, int & img_count) {
++    if (!node)
++        return NULL;
++    if (node->isText()) {
++        lString32 t = node->getText();
++        t.trim();
++        text_chars += t.length();
++        return NULL;
++    }
++    if (node->isElement()) {
++        lUInt16 id = node->getNodeId();
++        if (id == el_img || id == el_image || id == el_svg) {
++            img_count++;
++            return node;
++        }
++        ldomNode * found = NULL;
++        for (int i = 0; i < node->getChildCount(); i++) {
++            ldomNode * child_img = findDuokanFullscreenImageNode(node->getChildNode(i), text_chars, img_count);
++            if (child_img && !found)
++                found = child_img;
++        }
++        return found;
++    }
++    return NULL;
++}
++
++static ldomNode * findDuokanFullscreenFragmentAt(ldomDocument * doc, int page_start, int page_height) {
++    if (!doc || page_height <= 0)
++        return NULL;
++    ldomNode * root = doc->getRootNode();
++    if (!root)
++        return NULL;
++    // Traverse top-level DocFragments under body/fictionbook/root
++    lvRect page_rc(0, page_start, 0x3FFFFFFF, page_start + page_height);
++    ldomNode * body = root->findChildElement(LXML_NS_ANY, el_body, -1);
++    ldomNode * container = body ? body : root;
++    for (int i = 0; i < container->getChildCount(); i++) {
++        ldomNode * frag = container->getChildNode(i);
++        if (!frag || !frag->isElement() || frag->getNodeId() != el_DocFragment)
++            continue;
++        lvRect frc;
++        frag->getAbsRect(frc);
++        if (frc.bottom <= page_rc.top || frc.top >= page_rc.bottom)
++            continue;
++        lString32 tprop = frag->getAttributeValue(LXML_NS_ANY, attr_T);
++        if (tprop.pos(U"duokan-page-fullscreen") >= 0 || tprop.pos(U"duokan-page-fitwindow") >= 0) {
++            return frag;
++        }
++    }
++    return NULL;
++}
++
++// Check if the first rendered block at the top of this page carries CSS_CR_HINT_DUOKAN_BLEED_TOP.
++static bool pageHasTopBleedBlock(ldomNode * node, int page_start, int tolerance) {
++    if (!node || !node->isElement())
++        return false;
++    lvRect rc;
++    node->getAbsRect(rc);
++    if (rc.bottom <= page_start || rc.top > page_start + tolerance)
++        return false;
++    css_style_ref_t st = node->getStyle();
++    if (!st.isNull() && STYLE_HAS_CR_HINT(st, DUOKAN_BLEED_TOP) && rc.top >= page_start - tolerance) {
++        return true;
++    }
++    for (int i = 0; i < node->getChildCount(); i++) {
++        if (pageHasTopBleedBlock(node->getChildNode(i), page_start, tolerance))
++            return true;
++    }
++    return false;
++}
++
++} // namespace
++
+ void LVDocView::drawPageTo(LVDrawBuf * drawbuf, LVRendPageInfo & page,
+ 		lvRect * pageRect, int pageCount, int basePage, bool hasTwoVisiblePages, bool isRightPage, bool isLastPage) {
+ 	int start = page.start;
+@@ -2150,20 +2228,69 @@ void LVDocView::drawPageTo(LVDrawBuf * drawbuf, LVRendPageInfo & page,
+ 				draw_extra_info.content_overflow_clip.bottom = fullRect.bottom - m_pageMargins.bottom - footnotes_height - footnote_margin/2;
+ 			}
+ 
++			// Duokan true zero-margin fullscreen page (OPF properties="duokan-page-fullscreen"):
++			// render dominant image edge-to-edge across full pageRect with aspect ratio preserved.
++			bool drew_duokan_fullscreen = false;
++			if (page.height > 0 && !hasTwoVisiblePages) {
++				ldomNode * fs_frag = findDuokanFullscreenFragmentAt(m_doc, start, height);
++				if (fs_frag) {
++					int text_chars = 0;
++					int img_count = 0;
++					ldomNode * img_node = findDuokanFullscreenImageNode(fs_frag, text_chars, img_count);
++					if (img_node && img_count == 1 && text_chars == 0) {
++						LVImageSourceRef img = img_node->getObjectImageSource();
++						if (!img.isNull() && img->GetWidth() > 0 && img->GetHeight() > 0) {
++							lvRect fs_rc = *pageRect;
++							drawbuf->SetClipRect(&fs_rc);
++							int iw = img->GetWidth();
++							int ih = img->GetHeight();
++							int avail_w = fs_rc.width();
++							int avail_h = fs_rc.height();
++							int draw_w = avail_w;
++							int draw_h = (int)((lInt64)ih * avail_w / iw);
++							if (draw_h > avail_h) {
++								draw_h = avail_h;
++								draw_w = (int)((lInt64)iw * avail_h / ih);
++							}
++							int dx_off = fs_rc.left + (avail_w - draw_w) / 2;
++							int dy_off = fs_rc.top + (avail_h - draw_h) / 2;
++							LVImageSourceRef scaled = LVCreateStretchFilledTransform(
++									img, draw_w, draw_h, IMG_TRANSFORM_STRETCH, IMG_TRANSFORM_STRETCH, 0, 0);
++							drawbuf->Draw(scaled.isNull() ? img : scaled, dx_off, dy_off, draw_w, draw_h, true);
++							drew_duokan_fullscreen = true;
++						}
++					}
++				}
++			}
++
+ 			// draw main page text
+-			if ( m_markRanges.length() )
+-				CRLog::trace("Entering DrawDocument() : %d ranges", m_markRanges.length());
+-			//CRLog::trace("Entering DrawDocument()");
+-			if (page.height)
+-				DrawDocument(*drawbuf, m_doc->getRootNode(),
+-						pageRect->left + m_pageMargins.left, // x0
+-						clip.top,                            // y0
+-						pageRect->width() - m_pageMargins.left - m_pageMargins.right, // dx
+-						height,  // dy
+-						0,       // doc_x
+-						-start,  // doc_y
+-						m_dy,    // page_height
+-						&m_markRanges, &m_bmkRanges);
++			if ( !drew_duokan_fullscreen ) {
++				if ( m_markRanges.length() )
++					CRLog::trace("Entering DrawDocument() : %d ranges", m_markRanges.length());
++				//CRLog::trace("Entering DrawDocument()");
++				int draw_y0 = clip.top;
++				int draw_dy = height;
++				if (page.height > 0 && m_pageMargins.top > 0 && !hasTwoVisiblePages
++						&& pageHasTopBleedBlock(m_doc->getRootNode(), start, 8)) {
++					// Duokan top bleed (duokan-bleed: top / lefttopright):
++					// shift page origin to top edge so top banner bleeds flush to screen top.
++					lvRect bleed_clip = clip;
++					bleed_clip.top = pageRect->top + headerHeight;
++					bleed_clip.bottom = bleed_clip.top + height;
++					drawbuf->SetClipRect(&bleed_clip);
++					draw_y0 = bleed_clip.top;
++				}
++				if (page.height)
++					DrawDocument(*drawbuf, m_doc->getRootNode(),
++							pageRect->left + m_pageMargins.left, // x0
++							draw_y0,                             // y0
++							pageRect->width() - m_pageMargins.left - m_pageMargins.right, // dx
++							draw_dy, // dy
++							0,       // doc_x
++							-start,  // doc_y
++							m_dy,    // page_height
++							&m_markRanges, &m_bmkRanges);
++			}
+ 			//CRLog::trace("Done DrawDocument() for main text");
+ 			if ( m_doc->getPartialRerenderingsCount() != prev_partial_rerenderings_count ) {
+ 				return; // this page may have been deleted/replaced, and footnotes would be invalid
+diff --git a/crengine/src/lvfntman.cpp b/crengine/src/lvfntman.cpp
+index 123b2b6..f183a37 100644
+--- a/crengine/src/lvfntman.cpp
++++ b/crengine/src/lvfntman.cpp
+@@ -7353,12 +7353,110 @@ public:
+         return ref;
+     }
+ 
++    lString8 findRegisteredFamilyByKeywords(const char * const * keywords, css_font_family_t preferred_css_family) const
++    {
++        for (int k = 0; keywords[k] != NULL; k++) {
++            lString8 kw(keywords[k]);
++            kw.lowercase();
++            for (int i = 0; i < _registry.familyCount(); i++) {
++                const LVFontFamily * fam = _registry.familyAt(i);
++                if (!fam || fam->faceCount() <= 0)
++                    continue;
++                lString8 name = fam->getName();
++                name.lowercase();
++                if (name.pos(kw) >= 0) {
++                    return fam->faceAt(0).typeface;
++                }
++            }
++        }
++        if (preferred_css_family != css_ff_inherit) {
++            for (int i = 0; i < _registry.familyCount(); i++) {
++                const LVFontFamily * fam = _registry.familyAt(i);
++                if (fam && fam->faceCount() > 0 && fam->faceAt(0).css_family == preferred_css_family) {
++                    return fam->faceAt(0).typeface;
++                }
++            }
++        }
++        return lString8::empty_str;
++    }
++
++    // Expand Duokan (多看) built-in font aliases ("DK-SONGTI", "DK-HEITI", "DK-KAITI",
++    // "DK-FANGSONG", "DK-XIAOBIAOSONG", "DK-XIHEITI", "DK-CODE", "DK-SERIF") to
++    // matching registered families on the host/device.
++    lString8 resolveDuokanTypeface(const lString8 & typeface, css_font_family_t & css_family) const
++    {
++        if (typeface.empty() || (typeface.pos("DK-") < 0 && typeface.pos("dk-") < 0)) {
++            return typeface;
++        }
++        static const char * const kSongKeywords[] = {
++            "xiaobiaosong", "song", "ming", "serif", "宋体", "小标宋", "书宋", NULL
++        };
++        static const char * const kHeiKeywords[] = {
++            "hei", "noto sans", "pingfang", "sans", "gothic", "黑体", NULL
++        };
++        static const char * const kKaiKeywords[] = {
++            "kai", "wenkai", "lxgw", "楷", NULL
++        };
++        static const char * const kFangKeywords[] = {
++            "fangsong", "fang", "仿宋", NULL
++        };
++        static const char * const kCodeKeywords[] = {
++            "mono", "courier", "consolas", "menlo", "code", "dejavu sans mono", NULL
++        };
++
++        lString8 out;
++        int start = 0;
++        const int len = typeface.length();
++        while (start <= len) {
++            int comma = typeface.pos(",", start);
++            lString8 token = (comma < 0) ? typeface.substr(start) : typeface.substr(start, comma - start);
++            token.trim();
++            // Strip surrounding quotes if present
++            if (token.length() >= 2 &&
++                ((token[0] == '"' && token[token.length() - 1] == '"') ||
++                 (token[0] == '\'' && token[token.length() - 1] == '\''))) {
++                token = token.substr(1, token.length() - 2);
++                token.trim();
++            }
++            lString8 upper = token;
++            upper.uppercase();
++            lString8 mapped;
++            if (upper == "DK-SONGTI" || upper == "DK-XIAOBIAOSONG" || upper == "DK-SERIF") {
++                mapped = findRegisteredFamilyByKeywords(kSongKeywords, css_ff_serif);
++                if (css_family == css_ff_inherit) css_family = css_ff_serif;
++            } else if (upper == "DK-HEITI" || upper == "DK-XIHEITI") {
++                mapped = findRegisteredFamilyByKeywords(kHeiKeywords, css_ff_sans_serif);
++                if (css_family == css_ff_inherit) css_family = css_ff_sans_serif;
++            } else if (upper == "DK-KAITI") {
++                mapped = findRegisteredFamilyByKeywords(kKaiKeywords, css_ff_cursive);
++                if (mapped.empty()) mapped = findRegisteredFamilyByKeywords(kSongKeywords, css_ff_serif);
++            } else if (upper == "DK-FANGSONG") {
++                mapped = findRegisteredFamilyByKeywords(kFangKeywords, css_ff_serif);
++                if (mapped.empty()) mapped = findRegisteredFamilyByKeywords(kSongKeywords, css_ff_serif);
++            } else if (upper == "DK-CODE") {
++                mapped = findRegisteredFamilyByKeywords(kCodeKeywords, css_ff_monospace);
++                css_family = css_ff_monospace;
++            }
++            const lString8 & chosen = mapped.empty() ? token : mapped;
++            if (!chosen.empty()) {
++                if (!out.empty()) out << ", ";
++                out << chosen;
++            }
++            if (comma < 0) break;
++            start = comma + 1;
++        }
++        return out.empty() ? typeface : out;
++    }
++
+     virtual LVFontRef GetFont(int size, int weight, bool italic, css_font_family_t css_family, lString8 typeface,
+                                 int features, int documentId, bool useBias=false,
+                                 const LVFontVariations* variations=NULL)
+     {
+         FONT_MAN_GUARD
+ 
++        // 0. Expand Duokan built-in font aliases ("DK-*") to registered local families.
++        typeface = resolveDuokanTypeface(typeface, css_family);
++
+         // 1. Select face + synthesis via LVFontSelector.
+         LVFontVariations requested = variations ? *variations : LVFontVariations();
+         lString8 preferred;
+diff --git a/crengine/src/lvrend.cpp b/crengine/src/lvrend.cpp
+index 265f237..99cbc3b 100644
+--- a/crengine/src/lvrend.cpp
++++ b/crengine/src/lvrend.cpp
+@@ -2782,6 +2782,18 @@ bool getStyledImageSize( ldomNode * enode, int & img_width, int & img_height, in
+         // For widths, we would also need to get surrounded image added width, but we usually
+         // get container_width that has this computed accurately: so trust it
+         int enforced_max_width = enode->getDocument()->getPageWidth();
++        // Allow images inside a Duokan bleed container (duokan-bleed: left/right/leftright/lefttopright)
++        // to expand across the full bled container_width rather than being capped to page text width.
++        if ( container_width > enforced_max_width ) {
++            ldomNode * p = enode;
++            for ( int depth = 0; p && depth < 4; depth++, p = p->getParentNode() ) {
++                css_style_ref_t pst = p->getStyle();
++                if ( !pst.isNull() && (STYLE_HAS_CR_HINT(pst, DUOKAN_BLEED_LEFT) || STYLE_HAS_CR_HINT(pst, DUOKAN_BLEED_RIGHT)) ) {
++                    enforced_max_width = container_width;
++                    break;
++                }
++            }
++        }
+         if ( container_width >= 0 && container_width < enforced_max_width ) {
+             enforced_max_width = container_width;
+         }
+@@ -4072,7 +4084,18 @@ void renderFinalBlock( ldomNode * enode, LFormattedText * txform, RenderRectAcce
+                 // We use the flags computed previously (and not baseflags) as they
+                 // carry vertical alignment
+                 flags |= linkflags;
+-                txform->AddSourceObject(flags, LTEXT_OBJECT_IS_IMAGE, line_h, valign_dy, indent, enode->getEffectiveNode(), lang_cfg );
++                lUInt32 objflags = LTEXT_OBJECT_IS_IMAGE;
++                // Keep inline footnote icons glued to the preceding glyph so they never
++                // wrap orphaned to the start of the next line (Duokan / CLReq kinsoku).
++                bool is_noteref_icon = STYLE_HAS_CR_HINT(style, NOTEREF);
++                if (!is_noteref_icon) {
++                    ldomNode * p = enode->getParentNode();
++                    if (p && !p->getStyle().isNull() && STYLE_HAS_CR_HINT(p->getStyle(), NOTEREF))
++                        is_noteref_icon = true;
++                }
++                if (is_noteref_icon)
++                    objflags |= LTEXT_OBJECT_NO_WRAP_BEFORE;
++                txform->AddSourceObject(flags, objflags, line_h, valign_dy, indent, enode->getEffectiveNode(), lang_cfg );
+                 flags &= ~LTEXT_FLAG_NEWLINE & ~LTEXT_SRC_IS_CLEAR_BOTH; // clear newline flag
+             }
+         }
+@@ -7597,6 +7620,18 @@ void renderBlockElementEnhanced( FlowState * flow, ldomNode * enode, int x, int
+         if (margin_top < 0) margin_top = 0;
+         if (margin_bottom < 0) margin_bottom = 0;
+     }
++    // Duokan bleed (duokan-bleed: left / right / leftright / lefttopright):
++    // extend block edges into page margins so full-bleed banners reach screen edges.
++    if ( STYLE_HAS_CR_HINT(style, DUOKAN_BLEED_LEFT) ) {
++        int bleed_l = flow->getUsableLeftOverflow();
++        if ( bleed_l > 0 )
++            margin_left = -bleed_l;
++    }
++    if ( STYLE_HAS_CR_HINT(style, DUOKAN_BLEED_RIGHT) ) {
++        int bleed_r = flow->getUsableRightOverflow();
++        if ( bleed_r > 0 )
++            margin_right = -bleed_r;
++    }
+     bool margin_left_auto = css_margin_left.type == css_val_unspecified && css_margin_left.value == css_generic_auto;
+     bool margin_right_auto = css_margin_right.type == css_val_unspecified && css_margin_right.value == css_generic_auto;
+ 
+@@ -9288,6 +9323,130 @@ int renderBlockElement( LVRendPageContext & context, ldomNode * enode, int x, in
+                                         direction, baseline, enode->getDocument()->getRenderBlockRenderingFlags() );
+ }
+ 
++static int resolveBorderRadiusPx(const css_style_ref_t & style, int box_w, int box_h)
++{
++    int step = STYLE_GET_BORDER_RADIUS_STEP(style);
++    if ( step <= 0 || box_w <= 2 || box_h <= 2 )
++        return 0;
++    // step 1..7 -> 2..14 CSS px, scaled moderately by DPI relative to 96
++    int r = (step * 2 * (gRenderDPI > 0 ? gRenderDPI : 96) + 48) / 96;
++    int max_r = (box_w < box_h ? box_w : box_h) / 2;
++    if ( r > max_r )
++        r = max_r;
++    return r;
++}
++
++static int roundedCornerInset(int r, int dy_from_edge)
++{
++    // dy_from_edge in [0, r-1]: distance from outer edge to scanline center
++    if ( r <= 0 || dy_from_edge >= r )
++        return 0;
++    double cy = (double)r - ((double)dy_from_edge + 0.5);
++    double r2 = (double)r * (double)r;
++    double dx2 = r2 - cy * cy;
++    if ( dx2 <= 0.0 )
++        return r;
++    int inset = (int)( (double)r - sqrt(dx2) + 0.5 );
++    if ( inset < 0 ) inset = 0;
++    if ( inset > r ) inset = r;
++    return inset;
++}
++
++static void FillRoundedRect(LVDrawBuf & drawbuf, int x0, int y0, int x1, int y1, int r, lUInt32 color)
++{
++    if ( x1 <= x0 || y1 <= y0 )
++        return;
++    if ( r <= 1 ) {
++        drawbuf.FillRect(x0, y0, x1, y1, color);
++        return;
++    }
++    int max_r = ((x1 - x0) < (y1 - y0) ? (x1 - x0) : (y1 - y0)) / 2;
++    if ( r > max_r )
++        r = max_r;
++    for ( int i = 0; i < r; i++ ) {
++        int inset = roundedCornerInset(r, i);
++        int lx = x0 + inset;
++        int rx = x1 - inset;
++        if ( rx > lx ) {
++            drawbuf.FillRect(lx, y0 + i, rx, y0 + i + 1, color);
++            drawbuf.FillRect(lx, y1 - 1 - i, rx, y1 - i, color);
++        }
++    }
++    if ( y1 - r > y0 + r ) {
++        drawbuf.FillRect(x0, y0 + r, x1, y1 - r, color);
++    }
++}
++
++static void DrawRoundedBorderRing(LVDrawBuf & drawbuf, int x0, int y0, int x1, int y1, int r,
++                                  int tbw, int rbw, int bbw, int lbw,
++                                  lUInt32 topColor, lUInt32 rightColor, lUInt32 bottomColor, lUInt32 leftColor)
++{
++    if ( x1 <= x0 || y1 <= y0 || r <= 1 )
++        return;
++    int max_r = ((x1 - x0) < (y1 - y0) ? (x1 - x0) : (y1 - y0)) / 2;
++    if ( r > max_r )
++        r = max_r;
++    int h = y1 - y0;
++    for ( int row = 0; row < h; row++ ) {
++        int y = y0 + row;
++        int outer_inset = 0;
++        bool is_top_cap = (row < r);
++        bool is_bot_cap = (row >= h - r);
++        if ( is_top_cap )
++            outer_inset = roundedCornerInset(r, row);
++        else if ( is_bot_cap )
++            outer_inset = roundedCornerInset(r, h - 1 - row);
++
++        int lx_out = x0 + outer_inset;
++        int rx_out = x1 - outer_inset;
++        if ( rx_out <= lx_out )
++            continue;
++
++        if ( row < tbw && tbw > 0 ) {
++            drawbuf.FillRect(lx_out, y, rx_out, y + 1, topColor);
++            continue;
++        }
++        if ( row >= h - bbw && bbw > 0 ) {
++            drawbuf.FillRect(lx_out, y, rx_out, y + 1, bottomColor);
++            continue;
++        }
++
++        // Compute inner rounded cutout for left/right stroke thickness
++        int inner_inset_l = 0;
++        int inner_inset_r = 0;
++        if ( is_top_cap ) {
++            int rl = r - lbw;
++            int rr = r - rbw;
++            int dy_in = row - tbw;
++            if ( dy_in >= 0 && rl > 0 && dy_in < rl )
++                inner_inset_l = roundedCornerInset(rl, dy_in);
++            if ( dy_in >= 0 && rr > 0 && dy_in < rr )
++                inner_inset_r = roundedCornerInset(rr, dy_in);
++        } else if ( is_bot_cap ) {
++            int rl = r - lbw;
++            int rr = r - rbw;
++            int dy_in = (h - 1 - row) - bbw;
++            if ( dy_in >= 0 && rl > 0 && dy_in < rl )
++                inner_inset_l = roundedCornerInset(rl, dy_in);
++            if ( dy_in >= 0 && rr > 0 && dy_in < rr )
++                inner_inset_r = roundedCornerInset(rr, dy_in);
++        }
++
++        if ( lbw > 0 ) {
++            int lx_in = x0 + lbw + inner_inset_l;
++            if ( lx_in > rx_out ) lx_in = rx_out;
++            if ( lx_in > lx_out )
++                drawbuf.FillRect(lx_out, y, lx_in, y + 1, leftColor);
++        }
++        if ( rbw > 0 ) {
++            int rx_in = x1 - rbw - inner_inset_r;
++            if ( rx_in < lx_out ) rx_in = lx_out;
++            if ( rx_out > rx_in )
++                drawbuf.FillRect(rx_in, y, rx_out, y + 1, rightColor);
++        }
++    }
++}
++
+ //draw border lines,support color,width,all styles, not support border-collapse
+ void DrawBorder(ldomNode *enode,LVDrawBuf & drawbuf,int x0,int y0,int doc_x,int doc_y,RenderRectAccessor fmt)
+ {
+@@ -9333,6 +9492,25 @@ void DrawBorder(ldomNode *enode,LVDrawBuf & drawbuf,int x0,int y0,int doc_x,int
+         int leftBorderwidth = lengthToPx(enode, style->border_width[3],width);
+         leftBorderwidth = leftBorderwidth!=0 ? leftBorderwidth : DEFAULT_BORDER_WIDTH;
+         int tbw=topBorderwidth,rbw=rightBorderwidth,bbw=bottomBorderwidth,lbw=leftBorderwidth;
++        int radius_px = resolveBorderRadiusPx(style, fmt.getWidth(), fmt.getHeight());
++        if ( radius_px > 1 ) {
++            lUInt32 tc = invert_colors ? invertNonGrayscaleColor(topBordercolor) : topBordercolor;
++            lUInt32 rc = invert_colors ? invertNonGrayscaleColor(rightBordercolor) : rightBordercolor;
++            lUInt32 bc = invert_colors ? invertNonGrayscaleColor(bottomBordercolor) : bottomBordercolor;
++            lUInt32 lc = invert_colors ? invertNonGrayscaleColor(leftBordercolor) : leftBordercolor;
++            DrawRoundedBorderRing(
++                drawbuf,
++                x0 + doc_x, y0 + doc_y,
++                x0 + doc_x + fmt.getWidth(), y0 + doc_y + fmt.getHeight(),
++                radius_px,
++                hastopBorder ? tbw : 0,
++                hasrightBorder ? rbw : 0,
++                hasbottomBorder ? bbw : 0,
++                hasleftBorder ? lbw : 0,
++                tc, rc, bc, lc
++            );
++            return;
++        }
+         if (hastopBorder) {
+             int dot=1,interval=0;//default style
+             topBorderwidth=tbw;
+@@ -10298,8 +10476,13 @@ void DrawDocument( LVDrawBuf & drawbuf, ldomNode * enode, int x0, int y0, int dx
+                 }
+                 else {
+                     // Regular element: draw bgcolor or image inside its border box
+-                    if ( draw_bg_color )
+-                        drawbuf.FillRect( x0 + doc_x, y0 + doc_y, x0 + doc_x+fmt.getWidth(), y0+doc_y+fmt.getHeight(), bg_color );
++                    if ( draw_bg_color ) {
++                        int bg_r = resolveBorderRadiusPx(style, fmt.getWidth(), fmt.getHeight());
++                        if ( bg_r > 1 )
++                            FillRoundedRect( drawbuf, x0 + doc_x, y0 + doc_y, x0 + doc_x+fmt.getWidth(), y0+doc_y+fmt.getHeight(), bg_r, bg_color );
++                        else
++                            drawbuf.FillRect( x0 + doc_x, y0 + doc_y, x0 + doc_x+fmt.getWidth(), y0+doc_y+fmt.getHeight(), bg_color );
++                    }
+                     if ( draw_bg_image )
+                         DrawBackgroundImage(enode, drawbuf, x0, y0, doc_x, doc_y, fmt.getWidth(), fmt.getHeight());
+                         // (Commented identical calls below as they seem redundant with what was just done here)
+diff --git a/crengine/src/lvstsheet.cpp b/crengine/src/lvstsheet.cpp
+index c392016..558b9f0 100644
+--- a/crengine/src/lvstsheet.cpp
++++ b/crengine/src/lvstsheet.cpp
+@@ -74,6 +74,10 @@ enum css_decl_code {
+     cssd_font_variant_east_asian,
+     cssd_font_variant_alternates,
+     cssd_text_indent,
++    cssd_duokan_text_indent,      // duokan-text-indent (alias for text-indent)
++    cssd_duokan_bleed,            // duokan-bleed (left/right/top/leftright/lefttopright)
++    cssd_border_radius,           // border-radius
++    cssd_border_radius2,          // -webkit-border-radius
+     cssd_initial_letter,
+     cssd_initial_letter2, // -webkit-initial-letter
+     cssd_line_height,
+@@ -188,6 +192,10 @@ static const char * css_decl_name[] = {
+     "font-variant-east-asian",
+     "font-variant-alternates",
+     "text-indent",
++    "duokan-text-indent",
++    "duokan-bleed",
++    "border-radius",
++    "-webkit-border-radius",
+     "initial-letter",
+     "-webkit-initial-letter",
+     "line-height",
+@@ -4061,6 +4069,7 @@ bool LVCssDeclaration::parse( const char * &decl, bool higher_importance, lxmlDo
+                 }
+                 break;
+             case cssd_text_indent:
++            case cssd_duokan_text_indent:
+                 IF_g_PUSH_LENGTH_AND_break(1, true, css_val_screen_px, 0);
+                 {
+                     // read length
+@@ -4090,7 +4099,7 @@ bool LVCssDeclaration::parse( const char * &decl, bool higher_importance, lxmlDo
+                         // Note: if needed, we could parse the "each-line" keyword to be able
+                         // to bring back the legacy behaviour (where indent was applied after
+                         // a <br>) with CSS, and put this fact in the 2nd lowest bit.
+-                        buf<<(lUInt32) (prop_code | importance | parse_important(decl));
++                        buf<<(lUInt32) (cssd_text_indent | importance | parse_important(decl));
+                         buf<<(lUInt32) len.type;
+                         buf<<(lUInt32) len.value;
+                     }
+@@ -4099,6 +4108,77 @@ bool LVCssDeclaration::parse( const char * &decl, bool higher_importance, lxmlDo
+                     }
+                 }
+                 break;
++            case cssd_duokan_bleed:
++                {
++                    // Duokan bleed directions: left, right, top, leftright, lefttop, topright, lefttopright.
++                    // Stored in unused positive cr_hint bits so css_style_rec_t serialization stays untouched.
++                    int hints = 0;
++                    lString8 val;
++                    while ( *decl && *decl != ';' && *decl != stop_char && *decl != '!' ) {
++                        char c = *decl;
++                        if ( c >= 'A' && c <= 'Z' )
++                            c = (char)(c - 'A' + 'a');
++                        if ( c >= 'a' && c <= 'z' )
++                            val << c;
++                        decl++;
++                    }
++                    if ( val.pos("left") >= 0 )
++                        hints |= CSS_CR_HINT_DUOKAN_BLEED_LEFT;
++                    if ( val.pos("right") >= 0 )
++                        hints |= CSS_CR_HINT_DUOKAN_BLEED_RIGHT;
++                    if ( val.pos("top") >= 0 )
++                        hints |= CSS_CR_HINT_DUOKAN_BLEED_TOP;
++                    if ( hints != 0 ) {
++                        buf<<(lUInt32) (cssd_cr_hint | importance | parse_important(decl));
++                        buf<<(lUInt32) css_val_unspecified;
++                        buf<<(lUInt32) hints;
++                    }
++                }
++                break;
++            case cssd_border_radius:
++            case cssd_border_radius2:
++                {
++                    // Lightweight border-radius: quantize first radius value into 1..7 steps (~2px per step)
++                    // and pack into 3 unused positive bits of cr_hint.
++                    css_length_t len;
++                    const char * orig_pos = decl;
++                    if ( parse_number_value( decl, len, true, false ) ) {
++                        int px_approx = 0;
++                        if ( len.value > 0 ) {
++                            int whole = (len.value + 128) >> 8;
++                            if ( len.type == css_val_em || len.type == css_val_rem )
++                                px_approx = (len.value * 16 + 128) >> 8;
++                            else if ( len.type == css_val_percent )
++                                px_approx = whole >= 25 ? 14 : (whole / 2);
++                            else if ( len.type == css_val_pt )
++                                px_approx = (whole * 4) / 3;
++                            else
++                                px_approx = whole;
++                        }
++                        int step = 0;
++                        if ( px_approx > 0 ) {
++                            step = (px_approx + 1) / 2;
++                            if ( step < 1 ) step = 1;
++                            if ( step > 7 ) step = 7;
++                        }
++                        // Skip any remaining corner radii or '/' before checking !important
++                        while ( *decl && *decl != ';' && *decl != stop_char && *decl != '!' )
++                            decl++;
++                        if ( step > 0 ) {
++                            int hints = 0;
++                            if ( step & 1 ) hints |= CSS_CR_HINT_BORDER_RADIUS_B0;
++                            if ( step & 2 ) hints |= CSS_CR_HINT_BORDER_RADIUS_B1;
++                            if ( step & 4 ) hints |= CSS_CR_HINT_BORDER_RADIUS_B2;
++                            buf<<(lUInt32) (cssd_cr_hint | importance | parse_important(decl));
++                            buf<<(lUInt32) css_val_unspecified;
++                            buf<<(lUInt32) hints;
++                        }
++                    }
++                    else {
++                        decl = orig_pos;
++                    }
++                }
++                break;
+             case cssd_initial_letter:
+             case cssd_initial_letter2:
+                 {
+diff --git a/crengine/src/lvtextfm.cpp b/crengine/src/lvtextfm.cpp
+index 05931aa..23235cb 100644
+--- a/crengine/src/lvtextfm.cpp
++++ b/crengine/src/lvtextfm.cpp
+@@ -1351,12 +1351,16 @@ public:
+                         }
+                         int brk = lb_process_next_char(&lbCtx, (utf32_t)surrogate);
+                         if (pos > 0) {
+-                            if (brk == LINEBREAK_ALLOWBREAK)
++                            if ( (src->o.objflags & LTEXT_OBJECT_NO_WRAP_BEFORE) )
++                                m_flags[pos-1] &= ~LCHAR_ALLOW_WRAP_AFTER;
++                            else if (brk == LINEBREAK_ALLOWBREAK)
+                                 m_flags[pos-1] |= LCHAR_ALLOW_WRAP_AFTER;
+                             else
+                                 m_flags[pos-1] &= ~LCHAR_ALLOW_WRAP_AFTER;
+                         }
+                     #else
++                        if (pos > 0 && (src->o.objflags & LTEXT_OBJECT_NO_WRAP_BEFORE))
++                            m_flags[pos-1] &= ~LCHAR_ALLOW_WRAP_AFTER;
+                         m_flags[pos] |= LCHAR_ALLOW_WRAP_AFTER;
+                     #endif
+                     last_non_space_pos = pos;
+@@ -1374,12 +1378,16 @@ public:
+                         // Let libunibreak know there was an object
+                         int brk = lb_process_next_char(&lbCtx, (utf32_t)0xFFFC); // OBJECT REPLACEMENT CHARACTER
+                         if (pos > 0) {
+-                            if (brk == LINEBREAK_ALLOWBREAK)
++                            if ( (src->o.objflags & LTEXT_OBJECT_NO_WRAP_BEFORE) )
++                                m_flags[pos-1] &= ~LCHAR_ALLOW_WRAP_AFTER;
++                            else if (brk == LINEBREAK_ALLOWBREAK)
+                                 m_flags[pos-1] |= LCHAR_ALLOW_WRAP_AFTER;
+                             else
+                                 m_flags[pos-1] &= ~LCHAR_ALLOW_WRAP_AFTER;
+                         }
+                     #else
++                        if (pos > 0 && (src->o.objflags & LTEXT_OBJECT_NO_WRAP_BEFORE))
++                            m_flags[pos-1] &= ~LCHAR_ALLOW_WRAP_AFTER;
+                         m_flags[pos] |= LCHAR_ALLOW_WRAP_AFTER;
+                     #endif
+                     last_non_space_pos = pos;

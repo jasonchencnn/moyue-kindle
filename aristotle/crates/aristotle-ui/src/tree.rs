@@ -98,6 +98,9 @@ pub enum Refresh {
     /// A page turn. Usually GL16, but every n-th one becomes a full-screen
     /// GC16 to clear accumulated ghosting.
     Page,
+    /// A non-flashing full-screen GLKW16 refresh (clean like a book page,
+    /// without the black inversion flash of GC16).
+    Clean,
     /// A flashing GC16 refresh of the node.
     Full,
 }

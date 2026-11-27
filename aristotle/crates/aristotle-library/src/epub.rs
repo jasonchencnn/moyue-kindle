@@ -612,6 +612,12 @@ pub fn extract_cbz(path: &Path, want_cover: bool) -> Result<Extracted> {
             ex.meta.description = get("Summary");
             ex.meta.language = get("LanguageISO");
             ex.meta.publisher = get("Publisher");
+            if let Some(manga) = get("Manga") {
+                ex.meta.manga_rtl = matches!(
+                    manga.trim().to_ascii_lowercase().as_str(),
+                    "yes" | "yesandrighttoleft"
+                );
+            }
         }
     }
     if want_cover {
@@ -754,5 +760,38 @@ mod tests {
         );
         assert_eq!(m.description.as_deref(), Some("Bez encji"));
         assert_eq!(pkg.items["ci"].2, "cover-image");
+    }
+
+    #[test]
+    fn cbz_comic_info_manga_direction() {
+        let dir = crate::testdir("cbz-manga");
+        let rtl_path = dir.join("manga.cbz");
+        let xml_rtl =
+            br#"<ComicInfo><Title>Slam Dunk</Title><Manga>YesAndRightToLeft</Manga></ComicInfo>"#;
+        std::fs::write(
+            &rtl_path,
+            crate::zip::testutil::build(&[
+                ("01.png", b"img", false),
+                ("ComicInfo.xml", xml_rtl, false),
+            ]),
+        )
+        .unwrap();
+        let ex = extract_cbz(&rtl_path, false).unwrap();
+        assert_eq!(ex.meta.title, "Slam Dunk");
+        assert!(ex.meta.manga_rtl);
+
+        let ltr_path = dir.join("western.cbz");
+        let xml_ltr = br#"<ComicInfo><Title>Tintin</Title><Manga>No</Manga></ComicInfo>"#;
+        std::fs::write(
+            &ltr_path,
+            crate::zip::testutil::build(&[
+                ("01.png", b"img", false),
+                ("ComicInfo.xml", xml_ltr, false),
+            ]),
+        )
+        .unwrap();
+        let ex = extract_cbz(&ltr_path, false).unwrap();
+        assert_eq!(ex.meta.title, "Tintin");
+        assert!(!ex.meta.manga_rtl);
     }
 }

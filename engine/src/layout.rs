@@ -32,8 +32,10 @@ pub const DEFAULT_MARGIN_VERTICAL_PX: u32 = 64;
 
 /// 正文最小字号（像素）。
 ///
-/// 来源：`docs/design/README.md` §3「用户可调，范围 32–80 px」。
-pub const MIN_FONT_SIZE_PX: u32 = 32;
+/// 300 DPI 下最小档 7.5pt ≈ 31px，212 DPI（PW2）下 7.5pt ≈ 22px，
+/// 167 DPI（Basic 3 / KT3）下 7.5pt ≈ 17px。下限放宽到 16px，避免低 DPI
+/// 机型的前几档字号全部被钳到同一像素值导致调字号无效。
+pub const MIN_FONT_SIZE_PX: u32 = 16;
 
 /// 正文最大字号（像素）。
 ///
@@ -42,13 +44,12 @@ pub const MAX_FONT_SIZE_PX: u32 = 80;
 
 /// 最小行高（百分比）。
 ///
-/// 来源：`docs/design/README.md` §8.2「可调 1.4~2.0」。
-pub const MIN_LINE_SPACING_PERCENT: u32 = 140;
+/// 放开下限至 0%（0.0 倍行距），将行距数值完全交由用户自由调节；
+/// crengine 原生允许 `line_h == 0` 且安全不崩溃。
+pub const MIN_LINE_SPACING_PERCENT: u32 = 0;
 
 /// 最大行高（百分比）。
-///
-/// 来源：`docs/design/README.md` §8.2「可调 1.4~2.0」。
-pub const MAX_LINE_SPACING_PERCENT: u32 = 200;
+pub const MAX_LINE_SPACING_PERCENT: u32 = 300;
 
 /// 单边页边距上限（像素）。
 ///
@@ -186,6 +187,14 @@ pub struct LayoutSettings {
     ///
     /// 对应 crengine 的 `PROP_EMBEDDED_STYLES`（ADR-010）。
     pub embedded_styles: bool,
+    /// 精排模式下是否允许书内 `@font-face` 自带字体生效。
+    ///
+    /// `true`（默认）= 允许精排书籍使用内嵌字体；`false` = 保留精排样式
+    /// （缩进、居中、图注等），但忽略书内嵌字体、统一使用阅读器选定的字体。
+    ///
+    /// 对应 crengine 的 `PROP_EMBEDDED_FONTS`。仅在 `fine_typesetting` 与
+    /// `embedded_styles` 均开启时生效。
+    pub embedded_fonts: bool,
     /// 是否启用 crengine 的现代精排特性。
     ///
     /// `true`（默认）：Web 盒模型与完整的 block rendering 标志、HarfBuzz
@@ -227,6 +236,7 @@ impl Default for LayoutSettings {
             font_face: String::new(),
             fallback_font_faces: Vec::new(),
             embedded_styles: true,
+            embedded_fonts: true,
             fine_typesetting: true,
             font_weight: DEFAULT_FONT_WEIGHT,
             dpi: DEFAULT_DPI,
@@ -404,15 +414,20 @@ mod tests {
 
     #[test]
     fn line_spacing_out_of_range_is_rejected() {
-        for spacing in [MIN_LINE_SPACING_PERCENT - 1, MAX_LINE_SPACING_PERCENT + 1] {
+        for spacing in [MIN_LINE_SPACING_PERCENT, 100, MAX_LINE_SPACING_PERCENT] {
             let layout = LayoutSettings {
                 line_spacing_percent: spacing,
                 ..LayoutSettings::default()
             };
-            let err = layout.validate().unwrap_err();
-            assert!(matches!(err, Error::InvalidLayout(_)));
-            assert!(err.to_string().contains("行高"));
+            assert!(layout.validate().is_ok(), "{spacing}% 应当合法");
         }
+        let layout = LayoutSettings {
+            line_spacing_percent: MAX_LINE_SPACING_PERCENT + 1,
+            ..LayoutSettings::default()
+        };
+        let err = layout.validate().unwrap_err();
+        assert!(matches!(err, Error::InvalidLayout(_)));
+        assert!(err.to_string().contains("行高"));
     }
 
     #[test]

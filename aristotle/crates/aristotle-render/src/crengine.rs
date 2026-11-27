@@ -337,7 +337,7 @@ pub fn register_fonts<P: AsRef<Path>>(paths: &[P]) -> Result<(), Error> {
         .map_err(|e| format_err!("crengine register fonts: {e}"))
 }
 
-/// Register all TTF and OTF fonts found directly in `dir` with crengine.
+/// Register all TTF, OTF and TTC fonts found directly in `dir` with crengine.
 pub fn register_font_dir(dir: &Path) -> Result<(), Error> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -346,9 +346,19 @@ pub fn register_font_dir(dir: &Path) -> Result<(), Error> {
     let mut files = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'))
+        {
+            continue;
+        }
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("ttf") || ext.eq_ignore_ascii_case("otf") {
+                if ext.eq_ignore_ascii_case("ttf")
+                    || ext.eq_ignore_ascii_case("otf")
+                    || ext.eq_ignore_ascii_case("ttc")
+                {
                     files.push(path);
                 }
             }
@@ -377,10 +387,8 @@ fn engine() -> Result<CrengineEngine, Error> {
     CrengineEngine::new(fonts).map_err(|e| format_err!("crengine: {e}"))
 }
 
-/// The registered face names, for tests that pick a face by what the font
-/// file calls itself rather than by a hard-coded name.
-#[cfg(test)]
-pub(crate) fn registered_faces() -> Vec<String> {
+/// The face names currently registered in crengine's font manager.
+pub fn registered_faces() -> Vec<String> {
     engine().map(|e| e.font_faces()).unwrap_or_default()
 }
 
@@ -477,6 +485,26 @@ pub fn build_typeset_css(
     fine_typesetting: bool,
     chapter_anchors: &[ChapterAnchor],
 ) -> String {
+    build_typeset_css_em(
+        indent_chars as f32,
+        gap_em,
+        fine_typesetting,
+        chapter_anchors,
+    )
+}
+
+/// Generate the user stylesheet for crengine with fractional `indent_em` support.
+pub fn build_typeset_css_em(
+    indent_em: f32,
+    gap_em: f32,
+    fine_typesetting: bool,
+    chapter_anchors: &[ChapterAnchor],
+) -> String {
+    let indent_str = if (indent_em - indent_em.round()).abs() <= 0.001 {
+        format!("{}em", indent_em.round().max(0.0) as i32)
+    } else {
+        format!("{:.1}em", indent_em.max(0.0))
+    };
     let gap_str = if gap_em <= 0.001 {
         "0em".to_string()
     } else {
@@ -484,11 +512,11 @@ pub fn build_typeset_css(
     };
     let mut css = if fine_typesetting {
         format!(
-            "body {{\n    text-indent: {indent_chars}em;\n    page-break-before: always;\n}}\np {{\n    text-indent: {indent_chars}em;\n    margin-bottom: {gap_str};\n}}"
+            "body {{\n    text-indent: {indent_str};\n    page-break-before: always;\n}}\np {{\n    text-indent: {indent_str};\n    margin-bottom: {gap_str};\n}}"
         )
     } else {
         format!(
-            "body {{\n    text-indent: {indent_chars}em !important;\n    page-break-before: always !important;\n}}\np {{\n    text-indent: {indent_chars}em !important;\n    margin-top: 0em !important;\n    margin-bottom: {gap_str} !important;\n}}"
+            "body {{\n    text-indent: {indent_str} !important;\n    page-break-before: always !important;\n}}\np {{\n    text-indent: {indent_str} !important;\n    margin-top: 0em !important;\n    margin-bottom: {gap_str} !important;\n}}"
         )
     };
     for anchor in chapter_anchors {
@@ -580,8 +608,8 @@ fn layout_for(
     let line_spacing_percent = ((style.line_height * 100.0).round() as u32)
         .clamp(MIN_LINE_SPACING_PERCENT, MAX_LINE_SPACING_PERCENT);
     let margin = style.margin_px().clamp(0, MAX_MARGIN_PX as i32) as u32;
-    let user_css = Some(build_typeset_css(
-        style.cjk_indent,
+    let user_css = Some(build_typeset_css_em(
+        style.cjk_indent_em(),
         style.cjk_gap,
         style.fine_typesetting,
         chapter_anchors,
@@ -603,6 +631,7 @@ fn layout_for(
         // it off strips publisher styles so the reader's uniform typography
         // takes full control.
         embedded_styles: style.fine_typesetting,
+        embedded_fonts: style.fine_typesetting && style.embedded_fonts,
         fine_typesetting: style.fine_typesetting,
         // The engine treats this as a base weight and shifts the book's own
         // weights relative to it (see `LayoutSettings::font_weight`).
@@ -884,5 +913,25 @@ mod tests {
         assert!(layout.embedded_styles);
         assert_eq!(layout.font_weight, FONT_WEIGHT_BOLD);
         assert_eq!(layout.dpi, 300);
+    }
+
+    #[test]
+    fn font_size_steps_are_strictly_increasing_across_device_dpis() {
+        const STEPS_PT: [f32; 9] = [7.5, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
+        for dpi in [167u16, 212, 300] {
+            let mut prev = 0u32;
+            for pt in STEPS_PT {
+                let mut style = Style::pw4();
+                style.dpi = dpi;
+                style.font_size = pt;
+                let layout = layout_for(&style, "Literata", &[], &[]);
+                assert!(
+                    layout.font_size_px > prev,
+                    "dpi={dpi} pt={pt} collapsed to {}px (prev {prev}px)",
+                    layout.font_size_px
+                );
+                prev = layout.font_size_px;
+            }
+        }
     }
 }

@@ -1051,7 +1051,7 @@ impl VerticalStyle {
             margin_bottom,
             em,
             pitch,
-            indent: (style.cjk_indent as i32 * em).clamp(0, block / 2),
+            indent: ((style.cjk_indent_em() * em as f32).round() as i32).clamp(0, block / 2),
             font_weight: style.font_weight,
             font_family: style.cjk_font_family.clone(),
             font_dir: style.font_dir.clone(),

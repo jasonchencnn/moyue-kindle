@@ -109,6 +109,7 @@ pub fn spawn_partial(
                         .filter_map(|p| book.location_of(p))
                         .collect(),
                     secs_per_page,
+                    status: Default::default(),
                 };
                 let page = render_page(book, &mut chrome, &deco, current, None, true)?;
                 let book = book_slot.take().unwrap();
@@ -391,9 +392,15 @@ impl App {
     pub(crate) fn request_restyle(&mut self, settings: Settings) -> Result<(), Error> {
         let mut new_prefs = self.prefs.clone();
         new_prefs.apply(&settings);
-        let new_style = new_prefs
+        let mut new_style = new_prefs
             .style()
             .with_screen(self.ui.profile(), self.panel.stride());
+        if let Screen::Reader(r) = &self.screen {
+            if let Some(rec) = self.lib.book(&r.session.id) {
+                new_style.fixed_layout =
+                    new_prefs.fixed_layout_for(&rec.id, rec.format, rec.meta.manga_rtl);
+            }
+        }
         let (anchor, slow, can_partial) = {
             let Screen::Reader(r) = &mut self.screen else {
                 return Ok(());
@@ -406,7 +413,7 @@ impl App {
             // turns the horizontal way (VERT-101 M1). The book being laid
             // out now is only swapped in when the layout is ready, and the
             // adopt step sets the gestures from it then.
-            r.gestures.set_vertical(r.session.is_vertical());
+            r.gestures.set_vertical(r.session.is_rtl_turns());
             r.settings = settings;
             update_menu_labels(&mut self.ui, r, self.readest.manual_message.as_deref());
             self.ui.tree.invalidate(r.menu.size_steps, Refresh::Auto);
@@ -420,7 +427,10 @@ impl App {
             // and changing fine_typesetting toggles DOM-level style flags, so
             // both must take the full restyle path.
             let needs_full = new_style.writing_mode != r.session.style.writing_mode
-                || new_style.fine_typesetting != r.session.style.fine_typesetting;
+                || new_style.fine_typesetting != r.session.style.fine_typesetting
+                || new_style.embedded_fonts != r.session.style.embedded_fonts
+                || new_style.width != r.session.style.width
+                || new_style.height != r.session.style.height;
             let can_partial = !needs_full
                 && match r.session.book_ref() {
                     Some(book) => book.can_partial_rerender(),
@@ -432,7 +442,7 @@ impl App {
         if let Err(e) = self.prefs.save(self.lib.data_dir()) {
             eprintln!("aristotle: can't save preferences: {e}");
         }
-        let style = self.page_style();
+        let style = self.page_style_for_current();
         self.restyler.set_slow(slow);
         self.restyler
             .request(style, anchor, can_partial, Instant::now());
@@ -716,7 +726,7 @@ impl App {
         // The pages now come from the engine the book just laid out with:
         // the turns follow it, not what the preference asked for (VERT-101
         // M1).
-        r.gestures.set_vertical(r.session.is_vertical());
+        r.gestures.set_vertical(r.session.is_rtl_turns());
         let underline = self.prefs.underline();
         let scope = self.prefs.underline_scope();
         let book = r.session.book();
@@ -785,7 +795,7 @@ impl App {
         };
         r.session.restore_book(ready.book);
         // The turns follow the engine the book really runs on (VERT-101 M1).
-        r.gestures.set_vertical(r.session.is_vertical());
+        r.gestures.set_vertical(r.session.is_rtl_turns());
         let underline = self.prefs.underline();
         let scope = self.prefs.underline_scope();
         let book = r.session.book();
@@ -864,7 +874,7 @@ impl App {
         // The full layout may have switched engines: the turns follow the
         // one the new book runs, not the style that asked for it (VERT-101
         // M1).
-        r.gestures.set_vertical(r.session.is_vertical());
+        r.gestures.set_vertical(r.session.is_rtl_turns());
         let new_style = r.session.style.clone();
         let (tree, menu, page_node, nav, progress) = crate::reader_tree_for_sync_channels(
             &self.styles,

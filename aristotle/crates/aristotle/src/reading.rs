@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use aristotle_i18n::{tf, tr, Msg};
 use aristotle_library::index::AnnotationKind;
 use aristotle_net::translate::Translation;
-use aristotle_render::book::{Bounds, Engine, Link, Position, Word};
+use aristotle_render::book::{Bounds, Engine, Link, PageFootnote, Position, Word};
 use aristotle_render::plato_core::anyhow::Error;
 use aristotle_render::richtext::{Block, RichText, Run};
 use aristotle_ui::geom::{min_target, Point, Rect};
@@ -107,7 +107,7 @@ pub enum Overlay {
     },
     Note {
         text: RichText,
-        link: Link,
+        link: Option<Link>,
         page: usize,
     },
     /// The table of contents: the book's chapters as an outline that can
@@ -754,18 +754,23 @@ impl App {
     }
 
     /// After the page on the panel changed: quiet zones for the gestures
-    /// (links, the bookmark corner).
+    /// (links, the footnote button when present, and the bookmark corner).
     pub(crate) fn page_changed(&mut self) {
-        let target = min_target(self.ui.profile().density) * 2 / 3;
+        let screen = self.ui.bounds();
+        let density = self.ui.profile().density;
+        let target = min_target(density) * 2 / 3;
         let Some(r) = self.reading() else {
             return;
         };
         let loc = r.session.current;
         let links = r.session.links(loc);
-        let zones = links
+        let mut zones: Vec<Rect> = links
             .iter()
             .map(|l| rect(&l.rect).expand_to(target))
             .collect();
+        if !r.session.footnotes(loc).is_empty() {
+            zones.push(crate::turns::footnote_button_at(screen, density));
+        }
         r.gestures.set_quiet(zones);
     }
 
@@ -975,7 +980,7 @@ impl App {
         Ok(())
     }
 
-    /// A tap in a quiet zone: the bookmark corner or a link.
+    /// A tap in a quiet zone: the bookmark corner, the footnote button, or a link.
     pub(crate) fn quiet_tap(&mut self, p: Point) -> Result<(), Error> {
         if self.restyler.running() {
             return Ok(());
@@ -984,6 +989,28 @@ impl App {
         let density = self.ui.profile().density;
         if crate::turns::bookmark_corner_at(screen, density).contains(p) {
             return self.toggle_bookmark();
+        }
+        if crate::turns::footnote_button_at(screen, density).contains(p) {
+            let notes = self
+                .reading()
+                .map(|r| {
+                    let loc = r.session.current;
+                    r.session.footnotes(loc)
+                })
+                .unwrap_or_default();
+            if !notes.is_empty() {
+                let (text, link) = format_page_footnotes(&notes);
+                if let Some(r) = self.reading() {
+                    r.overlay = Overlay::Note {
+                        text,
+                        link,
+                        page: 0,
+                    };
+                }
+                self.ui.reset_gestures();
+                self.rebuild_reader(Refresh::Auto)?;
+                return self.present_full();
+            }
         }
         let Some(r) = self.reading() else {
             return Ok(());
@@ -1025,9 +1052,10 @@ impl App {
             Some(text) => {
                 r.overlay = Overlay::Note {
                     text,
-                    link,
+                    link: Some(link),
                     page: 0,
                 };
+                self.ui.reset_gestures();
                 self.rebuild_reader(Refresh::Auto)?;
                 self.present_full()
             }
@@ -1549,14 +1577,25 @@ impl App {
 
     /// The typeset bottom sheet: gathers installed fonts and current typography settings.
     pub(crate) fn open_typeset(&mut self) -> Result<(), Error> {
-        let (menu_root, title, author, settings) = {
+        let (menu_root, book_id, is_fixed, current_fixed, title, author, settings) = {
             let Screen::Reader(r) = &mut self.screen else {
                 return Ok(());
             };
             r.menu_open = false;
+            let book_id = r.session.id.clone();
+            let is_fixed = r.session.is_fixed();
+            let current_fixed = r.session.style.fixed_layout;
             let title = r.session.book().title().unwrap_or("").to_string();
             let author = r.session.book().author().unwrap_or_default();
-            (r.menu.root, title, author, r.settings)
+            (
+                r.menu.root,
+                book_id,
+                is_fixed,
+                current_fixed,
+                title,
+                author,
+                r.settings,
+            )
         };
         self.ui.tree.set_hidden(menu_root, true);
 
@@ -1568,40 +1607,24 @@ impl App {
             name: crate::fonts::DEFAULT_CJK.into(),
             sample_font: FamilyId(0),
         }];
-        for f in &user_families {
-            if f.name != crate::fonts::DEFAULT_CJK && f.name != crate::fonts::DEFAULT_LATIN {
-                let is_cjk = f.name.contains("SC")
-                    || f.name.contains("TC")
-                    || f.name.contains("CJK")
-                    || f.name.chars().any(crate::selection::is_cjk);
-                if is_cjk {
-                    let ui = self.ui_family(f);
-                    cjk_fonts.push(aristotle_ui::screens::typeset::FontOption {
-                        name: f.name.clone(),
-                        sample_font: ui,
-                    });
-                }
-            }
-        }
-
-        // Gather Latin fonts: default Literata first, then user Latin fonts
         let mut latin_fonts = vec![aristotle_ui::screens::typeset::FontOption {
             name: crate::fonts::DEFAULT_LATIN.into(),
             sample_font: FamilyId(0),
         }];
         for f in &user_families {
-            if f.name != crate::fonts::DEFAULT_CJK && f.name != crate::fonts::DEFAULT_LATIN {
-                let is_cjk = f.name.contains("SC")
-                    || f.name.contains("TC")
-                    || f.name.contains("CJK")
-                    || f.name.chars().any(crate::selection::is_cjk);
-                if !is_cjk {
-                    let ui = self.ui_family(f);
-                    latin_fonts.push(aristotle_ui::screens::typeset::FontOption {
-                        name: f.name.clone(),
-                        sample_font: ui,
-                    });
-                }
+            if f.name == crate::fonts::DEFAULT_CJK || f.name == crate::fonts::DEFAULT_LATIN {
+                continue;
+            }
+            let is_cjk = crate::fonts::classify_family(f) == crate::fonts::FontScript::Cjk;
+            let ui = self.ui_family(f);
+            let option = aristotle_ui::screens::typeset::FontOption {
+                name: f.name.clone(),
+                sample_font: ui,
+            };
+            if is_cjk {
+                cjk_fonts.push(option);
+            } else {
+                latin_fonts.push(option);
             }
         }
 
@@ -1616,6 +1639,11 @@ impl App {
 
         let margin_idx = 2usize.saturating_sub(settings.margins);
 
+        let orientation_idx = if is_fixed {
+            self.prefs.orientation_for_book(&book_id)
+        } else {
+            self.prefs.orientation.min(3)
+        };
         let view = aristotle_ui::screens::typeset::TypesetView {
             title,
             author,
@@ -1628,21 +1656,38 @@ impl App {
             size_index: settings
                 .size
                 .min(aristotle_ui::screens::typeset::SIZES_PX.len() - 1),
+            font_size_half_pt: self.prefs.font_size_half_pt(),
             spacing_index: settings
                 .spacing
                 .min(aristotle_ui::screens::typeset::SPACING_RATIO.len() - 1),
+            spacing_tenths: self.prefs.spacing_tenths(),
+            spacing_pct: self.prefs.spacing_pct(),
             margin_index: margin_idx.min(aristotle_ui::screens::typeset::MARGINS_PX.len() - 1),
+            margin_ref_px: self.prefs.margin_ref_px(),
             indent_index: self.prefs.cjk_indent.min(1),
+            indent_tenths: self.prefs.cjk_indent_tenths(),
             // READER-001 C.4: script conversion, punctuation trim and page
             // animation are not offered; old reader.json fields are still
             // read, but they no longer shape the preview.
             script_index: 0,
             gap_index: self.prefs.cjk_gap.min(2),
+            gap_tenths: self.prefs.cjk_gap_tenths(),
             underline_index: self.prefs.underline.min(2),
             underline_scope: self.prefs.underline_scope.min(1),
             fine_typesetting: self.prefs.fine_typesetting,
+            embedded_fonts: self.prefs.embedded_fonts,
+            fine_locks_fonts: false,
+            fine_locks_spacing: false,
             font_weight: self.prefs.font_weight,
             writing_mode: self.prefs.writing_mode.min(1),
+            orientation: orientation_idx,
+            fixed_layout: is_fixed,
+            fit_mode: current_fixed.fit.index(),
+            page_direction: current_fixed.direction.index(),
+            fullscreen: current_fixed.fullscreen,
+            auto_crop: current_fixed.auto_crop,
+            split_spread: current_fixed.split_spread,
+            keep_images_in_night: current_fixed.keep_images_in_night,
             trim_index: 0,
             anim_enabled: false,
             anim_speed: 1,
@@ -1668,6 +1713,9 @@ impl App {
         }
 
         let mut prefs_changed = false;
+        let mut orientation_changed = false;
+        let mut fixed_changed = false;
+        let mut applied_orientation = self.prefs.orientation;
         // The guide is a render option: the book needs no new layout, only a
         // new render of the page.
         let mut underline_changed = false;
@@ -1682,9 +1730,16 @@ impl App {
                 };
                 match id {
                     a::PREV_CJK_PAGE => view.cjk_page = view.cjk_page.saturating_sub(1),
-                    a::NEXT_CJK_PAGE => view.cjk_page += 1,
+                    a::NEXT_CJK_PAGE => {
+                        let last = view.cjk_fonts.len().saturating_sub(1) / typeset::FONTS_PER_PAGE;
+                        view.cjk_page = (view.cjk_page + 1).min(last);
+                    }
                     a::PREV_LATIN_PAGE => view.latin_page = view.latin_page.saturating_sub(1),
-                    a::NEXT_LATIN_PAGE => view.latin_page += 1,
+                    a::NEXT_LATIN_PAGE => {
+                        let last =
+                            view.latin_fonts.len().saturating_sub(1) / typeset::FONTS_PER_PAGE;
+                        view.latin_page = (view.latin_page + 1).min(last);
+                    }
                     _ => {}
                 }
             }
@@ -1721,7 +1776,7 @@ impl App {
                 }
                 prefs_changed = true;
             }
-            i if (a::LATIN_FONT_BASE..a::SIZE_BASE).contains(&i) => {
+            i if (a::LATIN_FONT_BASE..a::SIZE_DOWN).contains(&i) => {
                 let idx = (i - a::LATIN_FONT_BASE) as usize;
                 let font_name = {
                     let Screen::Reader(r) = &mut self.screen else {
@@ -1754,63 +1809,61 @@ impl App {
                 }
                 prefs_changed = true;
             }
-            i if (a::SIZE_BASE..a::SPACING_BASE).contains(&i) => {
-                let idx = (i - a::SIZE_BASE) as usize;
+            a::SIZE_DOWN | a::SIZE_UP => {
                 let Screen::Reader(r) = &mut self.screen else {
                     return Ok(());
                 };
                 let Overlay::Typeset { view } = &mut r.overlay else {
                     return Ok(());
                 };
-                if idx < typeset::SIZES_PX.len() && idx != view.size_index {
-                    view.size_index = idx;
-                    r.settings.size = idx;
-                    self.prefs.size = idx;
+                let next =
+                    typeset::font_size_half_pt_stepped(view.font_size_half_pt, id == a::SIZE_UP);
+                if next != view.font_size_half_pt {
+                    view.font_size_half_pt = next;
+                    self.prefs.font_size_half_pt = Some(next);
                     prefs_changed = true;
                 }
             }
-            i if (a::SPACING_BASE..a::MARGIN_BASE).contains(&i) => {
-                let idx = (i - a::SPACING_BASE) as usize;
+            a::SPACING_DOWN | a::SPACING_UP => {
                 let Screen::Reader(r) = &mut self.screen else {
                     return Ok(());
                 };
                 let Overlay::Typeset { view } = &mut r.overlay else {
                     return Ok(());
                 };
-                if idx < typeset::SPACING_RATIO.len() && idx != view.spacing_index {
-                    view.spacing_index = idx;
-                    r.settings.spacing = idx;
-                    self.prefs.spacing = idx;
+                let next = typeset::spacing_pct_stepped(view.spacing_pct, id == a::SPACING_UP);
+                if next != view.spacing_pct {
+                    view.spacing_pct = next;
+                    view.spacing_tenths = (next / 10).min(typeset::SPACING_MAX_TENTHS as u16) as u8;
+                    self.prefs.line_spacing_pct = Some(next);
                     prefs_changed = true;
                 }
             }
-            i if (a::MARGIN_BASE..a::INDENT_BASE).contains(&i) => {
-                let idx = (i - a::MARGIN_BASE) as usize;
+            a::MARGIN_DOWN | a::MARGIN_UP => {
                 let Screen::Reader(r) = &mut self.screen else {
                     return Ok(());
                 };
                 let Overlay::Typeset { view } = &mut r.overlay else {
                     return Ok(());
                 };
-                if idx < typeset::MARGINS_PX.len() && idx != view.margin_index {
-                    view.margin_index = idx;
-                    let setting_margin = 2usize.saturating_sub(idx);
-                    r.settings.margins = setting_margin;
-                    self.prefs.margins = setting_margin;
+                let next = typeset::margin_ref_px_stepped(view.margin_ref_px, id == a::MARGIN_UP);
+                if next != view.margin_ref_px {
+                    view.margin_ref_px = next;
+                    self.prefs.margin_ref_px = Some(next);
                     prefs_changed = true;
                 }
             }
-            i if (a::INDENT_BASE..a::SCRIPT_BASE).contains(&i) => {
-                let idx = (i - a::INDENT_BASE) as usize;
+            a::INDENT_DOWN | a::INDENT_UP => {
                 let Screen::Reader(r) = &mut self.screen else {
                     return Ok(());
                 };
                 let Overlay::Typeset { view } = &mut r.overlay else {
                     return Ok(());
                 };
-                if idx <= 1 && idx != view.indent_index {
-                    view.indent_index = idx;
-                    self.prefs.cjk_indent = idx;
+                let next = typeset::indent_tenths_stepped(view.indent_tenths, id == a::INDENT_UP);
+                if next != view.indent_tenths {
+                    view.indent_tenths = next;
+                    self.prefs.cjk_indent_tenths = Some(next);
                     prefs_changed = true;
                 }
             }
@@ -1828,17 +1881,17 @@ impl App {
                     prefs_changed = true;
                 }
             }
-            i if (a::GAP_BASE..a::TRIM_BASE).contains(&i) => {
-                let idx = (i - a::GAP_BASE) as usize;
+            a::GAP_DOWN | a::GAP_UP => {
                 let Screen::Reader(r) = &mut self.screen else {
                     return Ok(());
                 };
                 let Overlay::Typeset { view } = &mut r.overlay else {
                     return Ok(());
                 };
-                if idx <= 2 && idx != view.gap_index {
-                    view.gap_index = idx;
-                    self.prefs.cjk_gap = idx;
+                let next = typeset::gap_tenths_stepped(view.gap_tenths, id == a::GAP_UP);
+                if next != view.gap_tenths {
+                    view.gap_tenths = next;
+                    self.prefs.cjk_gap_tenths = Some(next);
                     prefs_changed = true;
                 }
             }
@@ -1853,37 +1906,6 @@ impl App {
                 if idx <= 1 && idx != view.trim_index {
                     view.trim_index = idx;
                     self.prefs.cjk_trim = typeset::trim_is_on(idx);
-                    prefs_changed = true;
-                }
-            }
-            i if (a::ANIM_BASE..a::ANIM_SPEED_BASE).contains(&i) => {
-                let idx = (i - a::ANIM_BASE) as usize;
-                let Screen::Reader(r) = &mut self.screen else {
-                    return Ok(());
-                };
-                let Overlay::Typeset { view } = &mut r.overlay else {
-                    return Ok(());
-                };
-                let enabled = idx == 1;
-                if enabled != view.anim_enabled {
-                    view.anim_enabled = enabled;
-                    self.prefs.page_anim =
-                        typeset::typeset_to_page_anim(view.anim_enabled, view.anim_speed);
-                    prefs_changed = true;
-                }
-            }
-            i if (a::ANIM_SPEED_BASE..a::ANIM_SPEED_BASE + 3).contains(&i) => {
-                let idx = (i - a::ANIM_SPEED_BASE) as usize;
-                let Screen::Reader(r) = &mut self.screen else {
-                    return Ok(());
-                };
-                let Overlay::Typeset { view } = &mut r.overlay else {
-                    return Ok(());
-                };
-                if idx <= 2 && idx != view.anim_speed {
-                    view.anim_speed = idx;
-                    self.prefs.page_anim =
-                        typeset::typeset_to_page_anim(view.anim_enabled, view.anim_speed);
                     prefs_changed = true;
                 }
             }
@@ -1953,6 +1975,20 @@ impl App {
                     prefs_changed = true;
                 }
             }
+            i if (a::EMBEDDED_FONTS_BASE..a::EMBEDDED_FONTS_BASE + 2).contains(&i) => {
+                let on = i == a::EMBEDDED_FONTS_BASE;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if on != view.embedded_fonts {
+                    view.embedded_fonts = on;
+                    self.prefs.embedded_fonts = on;
+                    prefs_changed = true;
+                }
+            }
             // The three quick buttons, then the stepper on either side of
             // them. The weight is a typographic setting: it is laid out
             // again when the sheet closes.
@@ -1988,11 +2024,176 @@ impl App {
                     prefs_changed = true;
                 }
             }
+            i if (a::ORIENTATION_BASE..a::ORIENTATION_BASE + 4).contains(&i) => {
+                let idx = (i - a::ORIENTATION_BASE) as usize;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let book_id = r.session.id.clone();
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if idx != view.orientation {
+                    view.orientation = idx;
+                    applied_orientation = idx;
+                    if view.fixed_layout {
+                        self.prefs
+                            .book_fixed
+                            .entry(book_id)
+                            .or_default()
+                            .orientation = Some(idx);
+                        fixed_changed = true;
+                    } else {
+                        self.prefs.orientation = idx;
+                    }
+                    prefs_changed = true;
+                    orientation_changed = true;
+                }
+            }
+            i if (a::FIT_MODE_BASE..a::FIT_MODE_BASE + 3).contains(&i) => {
+                let idx = (i - a::FIT_MODE_BASE) as usize;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let book_id = r.session.id.clone();
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if idx != view.fit_mode {
+                    view.fit_mode = idx;
+                    self.prefs.book_fixed.entry(book_id).or_default().fit = Some(idx);
+                    prefs_changed = true;
+                    fixed_changed = true;
+                }
+            }
+            i if (a::PAGE_DIR_BASE..a::PAGE_DIR_BASE + 2).contains(&i) => {
+                let idx = (i - a::PAGE_DIR_BASE) as usize;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let book_id = r.session.id.clone();
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if idx != view.page_direction {
+                    view.page_direction = idx;
+                    self.prefs.book_fixed.entry(book_id).or_default().direction = Some(idx);
+                    prefs_changed = true;
+                    fixed_changed = true;
+                }
+            }
+            i if (a::FULLSCREEN_BASE..a::FULLSCREEN_BASE + 2).contains(&i) => {
+                let on = i == a::FULLSCREEN_BASE;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let book_id = r.session.id.clone();
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if on != view.fullscreen {
+                    view.fullscreen = on;
+                    self.prefs.book_fixed.entry(book_id).or_default().fullscreen = Some(on);
+                    prefs_changed = true;
+                    fixed_changed = true;
+                }
+            }
+            i if (a::AUTO_CROP_BASE..a::AUTO_CROP_BASE + 2).contains(&i) => {
+                let on = i == a::AUTO_CROP_BASE;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let book_id = r.session.id.clone();
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if on != view.auto_crop {
+                    view.auto_crop = on;
+                    self.prefs.book_fixed.entry(book_id).or_default().auto_crop = Some(on);
+                    prefs_changed = true;
+                    fixed_changed = true;
+                }
+            }
+            i if (a::SPLIT_SPREAD_BASE..a::SPLIT_SPREAD_BASE + 2).contains(&i) => {
+                let on = i == a::SPLIT_SPREAD_BASE;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let book_id = r.session.id.clone();
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if on != view.split_spread {
+                    view.split_spread = on;
+                    self.prefs
+                        .book_fixed
+                        .entry(book_id)
+                        .or_default()
+                        .split_spread = Some(on);
+                    prefs_changed = true;
+                    fixed_changed = true;
+                }
+            }
+            i if (a::NIGHT_KEEP_IMG_BASE..a::NIGHT_KEEP_IMG_BASE + 2).contains(&i) => {
+                let on = i == a::NIGHT_KEEP_IMG_BASE;
+                let Screen::Reader(r) = &mut self.screen else {
+                    return Ok(());
+                };
+                let book_id = r.session.id.clone();
+                let Overlay::Typeset { view } = &mut r.overlay else {
+                    return Ok(());
+                };
+                if on != view.keep_images_in_night {
+                    view.keep_images_in_night = on;
+                    self.prefs
+                        .book_fixed
+                        .entry(book_id)
+                        .or_default()
+                        .keep_images_in_night = Some(on);
+                    prefs_changed = true;
+                    fixed_changed = true;
+                }
+            }
             _ => return Ok(()),
         }
 
         if prefs_changed {
             let _ = self.prefs.save(self.lib.data_dir());
+        }
+        if orientation_changed {
+            let orient = aristotle_screen::Orientation::from_index(applied_orientation);
+            self.apply_orientation(orient);
+        }
+        if fixed_changed {
+            let new_style = self.page_style_for_current();
+            if let Screen::Reader(r) = &mut self.screen {
+                if r.session.has_book() && r.session.is_fixed() {
+                    let old_cur = r.session.current;
+                    let anchor_pos = r.session.book().position_at(old_cur);
+                    if r.session.book().set_layout(&new_style).is_ok() {
+                        r.session.style = new_style.clone();
+                        r.session.current = r.session.book().location_of(&anchor_pos).unwrap_or(0);
+                        r.session.clear_pages();
+                    }
+                    r.gestures.set_vertical(r.session.is_rtl_turns());
+                }
+            }
+            self.restyler.set_applied(&new_style);
+        }
+        if orientation_changed {
+            let bounds = self.ui.bounds();
+            let density = self.ui.profile().density;
+            if let Screen::Reader(r) = &mut self.screen {
+                let rtl = r.session.is_rtl_turns();
+                r.gestures = crate::TurnGestures::with_density(bounds, density);
+                r.gestures.set_vertical(rtl);
+                r.gestures.set_touch_prefs(
+                    aristotle_screen::TouchZoneLayout::from_index(self.prefs.touch_zone_layout),
+                    self.prefs.disable_touch_turn,
+                );
+            }
+            self.rebuild_reader(Refresh::Full)?;
+            return self.present_full();
         }
         if underline_changed {
             let Screen::Reader(r) = &mut self.screen else {
@@ -2157,7 +2358,9 @@ impl App {
                     return Ok(());
                 };
                 let target = match &r.overlay {
-                    Overlay::Note { link, .. } => {
+                    Overlay::Note {
+                        link: Some(link), ..
+                    } => {
                         let (loc, uri) = (r.session.current, link.uri.clone());
                         r.session.book().link_page(loc, &uri)
                     }
@@ -2442,10 +2645,14 @@ impl App {
                     (tr(Msg::ReaderHighlight), act::HIGHLIGHT),
                     (tr(Msg::CommonClose), act::CANCEL),
                 ],
-                Overlay::Note { .. } => vec![
-                    (tr(Msg::ReaderGoToNote), act::GO_NOTE),
-                    (tr(Msg::CommonClose), act::CANCEL),
-                ],
+                Overlay::Note { link, .. } => {
+                    let mut actions = Vec::new();
+                    if link.is_some() {
+                        actions.push((tr(Msg::ReaderGoToNote), act::GO_NOTE));
+                    }
+                    actions.push((tr(Msg::CommonClose), act::CANCEL));
+                    actions
+                }
                 Overlay::Annotation { target, .. } | Overlay::WereadThought { target, .. } => {
                     let mut actions = Vec::new();
                     if target.is_some() {
@@ -2734,4 +2941,44 @@ fn popup_height(
         Place::Top => w.rect.y1 + 1,
     }
     .clamp(max, max + density.px(80))
+}
+
+/// Build the popup body and optional jump target for the current page's
+/// footnotes (opened from the top-right magnifying-glass button).
+///
+/// A single footnote keeps its original rich text and jump link; multiple
+/// footnotes on the same page are combined in order with bold marker prefixes
+/// so the reader can browse every note on the page in one popup.
+fn format_page_footnotes(notes: &[PageFootnote]) -> (RichText, Option<Link>) {
+    if notes.len() == 1 {
+        let first = &notes[0];
+        return (first.text.clone(), Some(first.link.clone()));
+    }
+    let mut blocks = Vec::new();
+    for (idx, note) in notes.iter().enumerate() {
+        let marker = note.marker.trim();
+        let label = if marker.is_empty() {
+            format!("[{}]", idx + 1)
+        } else {
+            marker.to_string()
+        };
+        let mut note_blocks = note.text.blocks.clone();
+        if let Some(first_block) = note_blocks.first_mut() {
+            let trimmed_body = first_block.text();
+            let already_prefixed =
+                !marker.is_empty() && trimmed_body.trim_start().starts_with(marker);
+            if !already_prefixed {
+                first_block.runs.insert(
+                    0,
+                    Run {
+                        text: format!("{label} "),
+                        italic: false,
+                        bold: true,
+                    },
+                );
+            }
+        }
+        blocks.extend(note_blocks);
+    }
+    (RichText { blocks }, None)
 }

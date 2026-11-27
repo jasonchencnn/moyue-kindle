@@ -77,6 +77,25 @@ pub struct Battery {
     dir: PathBuf,
 }
 
+/// Normalize a raw sysfs `power_supply/*/temp` reading into whole degrees
+/// Celsius.
+///
+/// The Linux `power_supply` ABI reports temperature in tenths of a degree
+/// Celsius (e.g. `266` for `26.6 °C` on Kindle Oasis 2 / Zelda). Some PMIC
+/// drivers report whole degrees directly (e.g. `26` on PW4 `bd71827_bat`), and
+/// thermal-zone style drivers report millidegrees (`26600`).
+pub fn normalize_temp_c(raw: i64) -> i32 {
+    let abs = raw.abs();
+    let sign = if raw >= 0 { 1 } else { -1 };
+    if abs >= 10_000 {
+        ((abs + 500) / 1000 * sign) as i32
+    } else if abs >= 100 {
+        ((abs + 5) / 10 * sign) as i32
+    } else {
+        raw as i32
+    }
+}
+
 impl Battery {
     pub fn open() -> io::Result<Self> {
         Ok(Self {
@@ -105,7 +124,7 @@ impl Battery {
             capacity: level.capacity,
             state: level.state,
             voltage_mv: (read_num(&self.dir.join("voltage_now"))? / 1000) as u32,
-            temperature_c: read_num(&self.dir.join("temp")).unwrap_or(0) as i32,
+            temperature_c: normalize_temp_c(read_num(&self.dir.join("temp")).unwrap_or(0)),
         })
     }
 }
@@ -302,5 +321,22 @@ mod tests {
         assert_eq!(light_step(1, MAX), 1, "a lit LED is never shown as off");
         assert_eq!(light_step(5000, MAX), LIGHT_STEPS);
         assert_eq!(light_step(0, MAX), 0);
+    }
+
+    #[test]
+    fn normalizes_tenths_millidegrees_and_whole_celsius_temperatures() {
+        // Linux power_supply ABI (tenths of °C): Kindle Oasis 2 reported 266.
+        assert_eq!(normalize_temp_c(266), 27);
+        assert_eq!(normalize_temp_c(264), 26);
+        assert_eq!(normalize_temp_c(310), 31);
+        assert_eq!(normalize_temp_c(-150), -15);
+        // Millidegrees (thermal_zone style).
+        assert_eq!(normalize_temp_c(26_600), 27);
+        assert_eq!(normalize_temp_c(25_400), 25);
+        assert_eq!(normalize_temp_c(-12_300), -12);
+        // Whole degrees (e.g. PW4 bd71827_bat).
+        assert_eq!(normalize_temp_c(26), 26);
+        assert_eq!(normalize_temp_c(0), 0);
+        assert_eq!(normalize_temp_c(-5), -5);
     }
 }

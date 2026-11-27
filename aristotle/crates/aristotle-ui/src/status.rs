@@ -9,6 +9,8 @@
 //! tree. The area is empty while nothing loads, and the slogan and the
 //! battery never move: the area stands in the room they leave.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::geom::{Rect, Size};
 use crate::icons::Icon;
 use crate::text::{Align, Paragraph, TextStyle};
@@ -17,6 +19,20 @@ use crate::tree::{Constraints, Cross, Kind, Node, NodeId, PaintCx, Refresh, Tree
 use crate::widgets::{Battery, ProgressBar};
 
 use aristotle_i18n::{tr, Msg};
+
+static SHOW_BATTERY_PCT: AtomicBool = AtomicBool::new(true);
+
+/// Set whether the global top status bar displays the numeric battery
+/// percentage alongside the battery icon.
+pub fn set_show_battery_pct(show: bool) {
+    SHOW_BATTERY_PCT.store(show, Ordering::Relaxed);
+}
+
+/// Whether the global top status bar currently displays the numeric battery
+/// percentage.
+pub fn show_battery_pct() -> bool {
+    SHOW_BATTERY_PCT.load(Ordering::Relaxed)
+}
 
 /// The height of the status bar, in reference pixels: the prototype's
 /// 88 px band, with the slogan, the loading area and the battery in it.
@@ -228,6 +244,18 @@ pub struct StatusBar {
 /// and the charge. The home screen has its own type scale and passes its
 /// own; the other screens pass the theme's.
 pub fn status_bar(t: &mut Tree, small: &TextStyle, line: &StatusLine<'_>, left: Left) -> StatusBar {
+    status_bar_with_pct(t, small, line, left, show_battery_pct())
+}
+
+/// Like [`status_bar`], with an explicit `show_pct` flag (useful in tests and
+/// previews so concurrent tests never depend on global state).
+pub fn status_bar_with_pct(
+    t: &mut Tree,
+    small: &TextStyle,
+    line: &StatusLine<'_>,
+    left: Left,
+    show_pct: bool,
+) -> StatusBar {
     // The left: the slogan, and the time before it when the bar shows one.
     let left_text = left_text(left, line.clock);
     let mut time = None;
@@ -245,18 +273,22 @@ pub fn status_bar(t: &mut Tree, small: &TextStyle, line: &StatusLine<'_>, left: 
     // The middle: the loading area, empty while nothing loads.
     let loading = loading_area(t, small);
 
-    // The right: the wireless link, the charge and the battery.
+    // The right: the wireless link, optional percentage label, and battery icon.
     let mut right_nodes = Vec::new();
     if let Some(level) = line.battery {
         let wifi = t.icon(Icon::Wifi, 32, INK);
-        let pct = t.label(&format!("{:.0}%", level * 100.0), small.clone());
         let bat = t.custom(Battery {
             level,
             charging: line.charging,
         });
         let g1 = t.gap(18, 1);
-        let g2 = t.gap(18, 1);
-        right_nodes.extend([wifi, g1, pct, g2, bat]);
+        if show_pct {
+            let pct = t.label(&format!("{:.0}%", level * 100.0), small.clone());
+            let g2 = t.gap(18, 1);
+            right_nodes.extend([wifi, g1, pct, g2, bat]);
+        } else {
+            right_nodes.extend([wifi, g1, bat]);
+        }
     }
     let right = t.add(Node::row(0).cross(Cross::Center), right_nodes);
 
@@ -539,5 +571,59 @@ mod tests {
         assert!(track.w > 0 && track.h > 0, "the bar is there");
         // The words stand above the bar, in the same column.
         assert!(line.bottom() <= track.y, "the words are above the bar");
+    }
+
+    #[test]
+    fn battery_percentage_toggle_shows_or_hides_numeric_label_while_keeping_icon() {
+        let style = Styles::new(FamilyId(0)).font_xs();
+        let l = line();
+
+        let mut t_on = Tree::new();
+        let b_on = status_bar_with_pct(&mut t_on, &style, &l, Left::Slogan, true);
+        let root_on = t_on.add(
+            Node::column(0)
+                .cross(Cross::Stretch)
+                .bg(crate::theme::PAPER),
+            [b_on.root],
+        );
+        t_on.set_root(root_on);
+        let mut ui_on = crate::ui::Ui::new(t_on, TextEngine::new(fonts()), 1072, 1448);
+        ui_on.render();
+
+        let mut t_off = Tree::new();
+        let b_off = status_bar_with_pct(&mut t_off, &style, &l, Left::Slogan, false);
+        let root_off = t_off.add(
+            Node::column(0)
+                .cross(Cross::Stretch)
+                .bg(crate::theme::PAPER),
+            [b_off.root],
+        );
+        t_off.set_root(root_off);
+        let mut ui_off = crate::ui::Ui::new(t_off, TextEngine::new(fonts()), 1072, 1448);
+        ui_off.render();
+
+        assert!(ui_off.tree.len() < ui_on.tree.len());
+        let mut diff_px = 0usize;
+        let mut right_ink_off = 0usize;
+        for y in 0..STATUS_H as usize {
+            for x in 700..1072 {
+                let p_on = ui_on.screen().pixels[y * ui_on.screen().stride as usize + x];
+                let p_off = ui_off.screen().pixels[y * ui_off.screen().stride as usize + x];
+                if p_on != p_off {
+                    diff_px += 1;
+                }
+                if x > 980 && p_off < 200 {
+                    right_ink_off += 1;
+                }
+            }
+        }
+        assert!(
+            diff_px > 50,
+            "hiding percentage must change status bar pixels, got diff_px={diff_px}"
+        );
+        assert!(
+            right_ink_off > 40,
+            "battery icon must remain drawn when percentage text is hidden, got right_ink_off={right_ink_off}"
+        );
     }
 }

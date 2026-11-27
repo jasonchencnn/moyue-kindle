@@ -342,6 +342,7 @@ pub fn script_lang(word: &str) -> Option<&'static str> {
         match c as u32 {
             0x0370..=0x03FF | 0x1F00..=0x1FFF => return Some("grc"),
             0x0400..=0x04FF => return Some("ru"),
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => return Some("zh"),
             _ => {}
         }
     }
@@ -455,7 +456,7 @@ impl Dictionaries {
     /// (grc-en before grc-pl in English, grc-pl first in Polish), unless one
     /// was picked in the switcher for `lang` before.
     pub fn order_for(&self, lang: &str, ui: &str) -> Vec<usize> {
-        let latin = |l: &str| !matches!(l, "grc" | "el" | "ru");
+        let latin = |l: &str| !matches!(l, "grc" | "el" | "ru" | "zh");
         let ui = base_lang(ui);
         let pref_target = |d: &Dictionary| match d.target.as_deref() {
             Some(t) if t == ui => 0,

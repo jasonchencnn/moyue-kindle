@@ -1,0 +1,176 @@
+diff --git a/crengine/src/lvimg.cpp b/crengine/src/lvimg.cpp
+index 708c3bb..82376c3 100644
+--- a/crengine/src/lvimg.cpp
++++ b/crengine/src/lvimg.cpp
+@@ -2077,9 +2088,25 @@ static bool lunasvgDrawImageHelper(lunasvg::external_context_t * xcontext, const
+     ldomDocument * doc = ((LVNodeImageSource *)xcontext->external_object)->GetSourceDocument();
+     if ( doc ) {
+         ldomNode * node = ((LVNodeImageSource *)xcontext->external_object)->GetSourceNode();
+-        img = doc->getObjectImageSource(Utf8ToUnicode(url), node);
++        lString32 url32 = Utf8ToUnicode(url);
++        img = doc->getObjectImageSource(url32, node);
+         if (img.isNull()) { // url may be url-encoded
+-            img = doc->getObjectImageSource(DecodeHTMLUrlString(Utf8ToUnicode(url)), node);
++            img = doc->getObjectImageSource(DecodeHTMLUrlString(url32), node);
++        }
++        // When an external .svg is embedded via <img src="../Images/foo.svg"/>,
++        // relative <image href="bar.png"/> inside that SVG is relative to the
++        // .svg file's directory rather than the XHTML document's directory.
++        if (img.isNull() && node) {
++            lString32 svgRef = node->getObjectImageRefName();
++            if (!svgRef.empty()) {
++                lString32 svgDir = LVExtractPath(svgRef);
++                lString32 combined = LVCombinePaths(svgDir, url32);
++                img = doc->getObjectImageSource(combined, node);
++                if (img.isNull()) {
++                    combined = LVCombinePaths(svgDir, DecodeHTMLUrlString(url32));
++                    img = doc->getObjectImageSource(combined, node);
++                }
++            }
+         }
+     }
+     else {
+diff --git a/crengine/src/lvtinydom.cpp b/crengine/src/lvtinydom.cpp
+index 0ef7ac2..f2ed5be 100644
+--- a/crengine/src/lvtinydom.cpp
++++ b/crengine/src/lvtinydom.cpp
+@@ -4291,17 +4291,139 @@ static void writeSVGNode( LVStream * stream, ldomNode * node, bool forward_node_
+                 *stream << " lang=\"" << UnicodeToUtf8(lang_cfg->getLangTag()) << "\"";
+             }
+         }
++        const bool is_svg_image = (node->getNodeId() == el_image);
++        bool has_attr_width = false;
++        bool has_attr_height = false;
++        lString8 explicit_width;
++        lString8 explicit_height;
+         for (int i=0; i<(int)node->getAttrCount(); i++) {
+             const lxmlAttribute * attr = node->getAttribute(i);
+             if (attr) {
+                 lString8 attrName( UnicodeToUtf8(node->getDocument()->getAttrName(attr->id)) );
+                 lString8 attrValue( UnicodeToUtf8(node->getDocument()->getAttrValue(attr->index)) );
++                if ( is_svg_image ) {
++                    if ( attrName == "width" ) {
++                        lString8 trimmed = attrValue;
++                        trimmed.trim();
++                        if ( trimmed.empty() || trimmed.lowercase() == "auto" ) {
++                            continue;
++                        }
++                        has_attr_width = true;
++                        explicit_width = trimmed;
++                    } else if ( attrName == "height" ) {
++                        lString8 trimmed = attrValue;
++                        trimmed.trim();
++                        if ( trimmed.empty() || trimmed.lowercase() == "auto" ) {
++                            continue;
++                        }
++                        has_attr_height = true;
++                        explicit_height = trimmed;
++                    }
++                }
+                 *stream << " ";
+                 if ( attrName == "space" && node->getDocument()->getNsName(attr->nsid) == U"xml" )
+                     *stream << "xml:"; // explicitely only expected as xml:space=
+                 *stream << attrName << "=\"" << attrValue << "\"";
+             }
+         }
++        // SVG2 allows <image> to omit width/height (or set them via CSS / "auto"),
++        // whereas LunaSVG's ImageElement::layout() drops any <image> whose width or
++        // height attribute evaluates to zero. Fill missing dimensions from CSS style
++        // or the referenced image's intrinsic size so SVG covers/headers never vanish.
++        if ( is_svg_image && (!has_attr_width || !has_attr_height) ) {
++            lString8 resolved_w;
++            lString8 resolved_h;
++            css_style_ref_t img_style = node->getStyle();
++            auto css_len_to_svg_attr = [&](const css_length_t & len) -> lString8 {
++                if ( len.type == css_val_unspecified || len.type == css_val_inherited || len.value <= 0 ) {
++                    return lString8::empty_str;
++                }
++                if ( len.type == css_val_percent ) {
++                    int pct = (len.value + 128) >> 8;
++                    if ( pct > 0 ) {
++                        lString8 out;
++                        out << fmt::decimal(pct) << "%";
++                        return out;
++                    }
++                    return lString8::empty_str;
++                }
++                if ( len.type == css_val_px ) {
++                    int px = (len.value + 128) >> 8;
++                    if ( px > 0 ) {
++                        lString8 out;
++                        out << fmt::decimal(px);
++                        return out;
++                    }
++                    return lString8::empty_str;
++                }
++                int px = lengthToPx(node, len, 0, 0);
++                if ( px > 0 ) {
++                    lString8 out;
++                    out << fmt::decimal(px);
++                    return out;
++                }
++                return lString8::empty_str;
++            };
++            if ( !img_style.isNull() ) {
++                if ( !has_attr_width ) {
++                    resolved_w = css_len_to_svg_attr(img_style->width);
++                }
++                if ( !has_attr_height ) {
++                    resolved_h = css_len_to_svg_attr(img_style->height);
++                }
++            }
++            if ( (!has_attr_width && resolved_w.empty()) || (!has_attr_height && resolved_h.empty()) ) {
++                LVImageSourceRef img = node->getObjectImageSource();
++                int nat_w = (!img.isNull()) ? img->GetWidth() : 0;
++                int nat_h = (!img.isNull()) ? img->GetHeight() : 0;
++                if ( nat_w > 0 && nat_h > 0 ) {
++                    if ( !has_attr_width && resolved_w.empty() ) {
++                        if ( has_attr_height ) {
++                            if ( explicit_height.endsWith("%") ) {
++                                resolved_w = explicit_height;
++                            } else {
++                                char * endp = NULL;
++                                double hv = strtod(explicit_height.c_str(), &endp);
++                                if ( endp != explicit_height.c_str() && hv > 0.0 ) {
++                                    int wv = (int)(hv * (double)nat_w / (double)nat_h + 0.5);
++                                    if ( wv < 1 ) wv = 1;
++                                    resolved_w << fmt::decimal(wv);
++                                } else {
++                                    resolved_w << fmt::decimal(nat_w);
++                                }
++                            }
++                        } else {
++                            resolved_w << fmt::decimal(nat_w);
++                        }
++                    }
++                    if ( !has_attr_height && resolved_h.empty() ) {
++                        if ( has_attr_width ) {
++                            if ( explicit_width.endsWith("%") ) {
++                                resolved_h = explicit_width;
++                            } else {
++                                char * endp = NULL;
++                                double wv = strtod(explicit_width.c_str(), &endp);
++                                if ( endp != explicit_width.c_str() && wv > 0.0 ) {
++                                    int hv = (int)(wv * (double)nat_h / (double)nat_w + 0.5);
++                                    if ( hv < 1 ) hv = 1;
++                                    resolved_h << fmt::decimal(hv);
++                                } else {
++                                    resolved_h << fmt::decimal(nat_h);
++                                }
++                            }
++                        } else {
++                            resolved_h << fmt::decimal(nat_h);
++                        }
++                    }
++                }
++            }
++            if ( !has_attr_width && !resolved_w.empty() ) {
++                *stream << " width=\"" << resolved_w << "\"";
++            }
++            if ( !has_attr_height && !resolved_h.empty() ) {
++                *stream << " height=\"" << resolved_h << "\"";
++            }
++        }
+         if ( node->getChildCount() == 0 ) {
+             if (!elemName.empty()) {
+                 if ( elemName[0] == '?' )

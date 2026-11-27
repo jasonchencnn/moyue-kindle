@@ -227,3 +227,94 @@ fn cbz_unicode_names_use_unsigned_utf8_bytes_on_every_target() {
     assert!(center(&mut book, 0).abs_diff(32) <= 1);
     assert!(center(&mut book, 1).abs_diff(224) <= 1);
 }
+
+/// Build an 8-bit grayscale PNG of arbitrary dimensions from raw pixels.
+fn png_rect(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+    assert_eq!(pixels.len(), (width * height) as usize);
+    let mut out = Vec::new();
+    {
+        let mut encoder = Encoder::new(&mut out, width, height);
+        encoder.set_color(ColorType::Grayscale);
+        encoder.set_depth(BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(pixels)
+            .unwrap();
+    }
+    out
+}
+
+#[test]
+fn cbz_fixed_layout_fullscreen_autocrop_spread_split_and_night_images() {
+    let Some(scratch) = scratch() else {
+        return;
+    };
+    // Page 0: landscape two-page spread (160x80), left half gray=40, right half gray=180.
+    let mut spread = vec![0u8; 160 * 80];
+    for y in 0..80 {
+        for x in 0..160 {
+            spread[y * 160 + x] = if x < 80 { 40 } else { 180 };
+        }
+    }
+    // Page 1: portrait page (100x140) with wide white margins around a dark center box (gray=24).
+    let mut margined = vec![255u8; 100 * 140];
+    for y in 35..105 {
+        for x in 25..75 {
+            margined[y * 100 + x] = 24;
+        }
+    }
+    let path = scratch.0.join("manga-features.cbz");
+    let p0 = png_rect(160, 80, &spread);
+    let p1 = png_rect(100, 140, &margined);
+    {
+        let mut archive = ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        archive.start_file("01.png", options).unwrap();
+        archive.write_all(&p0).unwrap();
+        archive.start_file("02.png", options).unwrap();
+        archive.write_all(&p1).unwrap();
+        archive.finish().unwrap();
+    }
+
+    // 1. RTL spread split: page 0 splits into right (180) then left (40), page 1 stays whole.
+    let mut style = Style::pw4();
+    style.fixed_layout.fullscreen = true;
+    style.fixed_layout.split_spread = true;
+    style.fixed_layout.direction = aristotle_render::style::PageDirection::Rtl;
+    style.fixed_layout.keep_images_in_night = true;
+
+    let mut book = Book::open(&path, &style, None).unwrap();
+    assert_eq!(book.len(), 3, "spread + portrait = 3 virtual pages");
+    assert!(
+        center(&mut book, 0).abs_diff(180) <= 2,
+        "RTL shows right half first"
+    );
+    assert!(
+        center(&mut book, 1).abs_diff(40) <= 2,
+        "RTL shows left half second"
+    );
+    assert_eq!(book.position_at(0), Position::Page(0));
+    assert_eq!(book.position_at(1), Position::Page(0));
+    assert_eq!(book.position_at(2), Position::Page(1));
+
+    // Night mode artwork protection records the rendered image bounds.
+    let mut chrome = aristotle_render::page::Chrome::load(&style).unwrap();
+    let rendered = book.render_page(0, &mut chrome).unwrap();
+    assert!(
+        !rendered.images.is_empty(),
+        "keep_images_in_night populates page.images"
+    );
+
+    // 2. Auto-crop trims the wide white margins on page 1 so the dark box fills more of the page.
+    let uncropped = book.render_body(2).unwrap();
+    let dark_before = uncropped.data.iter().filter(|&&p| p < 128).count();
+    style.fixed_layout.auto_crop = true;
+    book.set_layout(&style).unwrap();
+    let cropped = book.render_body(2).unwrap();
+    let dark_after = cropped.data.iter().filter(|&&p| p < 128).count();
+    assert!(
+        dark_after > dark_before * 2,
+        "auto-crop should enlarge the dark content area: before={dark_before}, after={dark_after}"
+    );
+}

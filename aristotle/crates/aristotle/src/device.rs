@@ -6,7 +6,7 @@ use std::path::Path;
 
 use aristotle_hal::power::{Battery, BatteryLevel, BatteryStatus, ChargeState};
 use aristotle_hal::system::{self, UsbMode};
-use aristotle_i18n::{fmt_time, tr, Msg};
+use aristotle_i18n::{tr, Msg};
 use aristotle_ui::screens::library::StatusLine;
 use aristotle_ui::screens::settings::{free_of, BatteryInfo, Usb};
 
@@ -30,10 +30,10 @@ fn state_label(s: ChargeState) -> &'static str {
     })
 }
 
-/// The time ("21:38") in the UI language, from the local time.
+/// The time ("21:38" or "9:38 PM") from the process-wide local clock.
 pub fn clock_text() -> String {
     system::local_time()
-        .map(|t| fmt_time(t.hour, t.minute))
+        .map(|t| aristotle_screen::format_clock_hm(t.hour, t.minute, system::clock_24h()))
         .unwrap_or_default()
 }
 

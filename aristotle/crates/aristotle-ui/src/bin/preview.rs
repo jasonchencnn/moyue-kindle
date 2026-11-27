@@ -2146,6 +2146,7 @@ fn settings_screens(profile: Screen, out: &Path) {
         weread_readtime: true,
         weread_readtime_note: Some((tr(Msg::SettingsWereadReadtimePaused), true)),
         weread_notes: Some((2, 12, 4)),
+        extra: Default::default(),
     };
     let mut text = TextEngine::new(fonts());
     let styles = Styles::new(FamilyId(0)).with_density(profile.density);
@@ -2942,20 +2943,31 @@ fn typeset_screens(profile: Screen, out: &Path, fonts_dir: &Path) {
         ],
         selected_latin_font: 0,
         latin_page: 0,
-        size_index: 3,      // 44 px (prototype default)
-        spacing_index: 1,   // 标准 (1.7)
-        margin_index: 1,    // 标准 (88 px)
-        indent_index: 0,    // 2 字
-        script_index: 0,    // 简体
-        gap_index: 2,       // 大 (0.6)
+        size_index: 3, // 44 px (prototype default)
+        font_size_half_pt: typeset::FONT_SIZE_DEFAULT_HALF_PT,
+        spacing_index: 1, // 标准 (1.7)
+        spacing_tenths: typeset::SPACING_DEFAULT_TENTHS,
+        spacing_pct: typeset::SPACING_DEFAULT_PCT,
+        margin_index: 1, // 标准 (88 px)
+        margin_ref_px: typeset::MARGIN_DEFAULT_PX,
+        indent_index: 0, // 2 字
+        indent_tenths: typeset::INDENT_DEFAULT_TENTHS,
+        script_index: 0, // 简体
+        gap_index: 2,    // 大 (0.6)
+        gap_tenths: typeset::GAP_DEFAULT_TENTHS,
         underline_index: 0, // 无
         underline_scope: 0, // 文字划线
         fine_typesetting: true,
+        embedded_fonts: true,
+        fine_locks_fonts: false,
+        fine_locks_spacing: false,
         font_weight: 400, // 正常
         trim_index: 0,    // 开
         anim_enabled: false,
         anim_speed: 1,   // 标准
         writing_mode: 0, // 横排
+        orientation: 0,
+        ..TypesetView::default()
     };
 
     let mut tree = Tree::new();
@@ -3097,6 +3109,7 @@ fn targets(profile: Screen, out: &Path) {
         weread_readtime: false,
         weread_readtime_note: None,
         weread_notes: None,
+        extra: Default::default(),
     };
     let mut text = TextEngine::new(fonts());
     let (tree, ids) = settings_screen::Settings::build(
@@ -3518,6 +3531,7 @@ fn scan_screens(profile: Screen, out: &Path) {
             },
             whole: false,
             destination: destination.into(),
+            fonts_destination: "/mnt/us/fonts".into(),
         },
     };
     let mut text = TextEngine::new(fonts());
@@ -3539,6 +3553,7 @@ fn scan_screens(profile: Screen, out: &Path) {
             selected: Vec::new(),
             whole: false,
             destination: destination.into(),
+            fonts_destination: "/mnt/us/fonts".into(),
         },
     };
     let mut text = TextEngine::new(fonts());
@@ -3557,6 +3572,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                 format: "TXT".into(),
                 id: None,
                 in_destination: false,
+                is_font: false,
+                font_migratable: false,
+                status_badge: None,
             },
             scan_screen::ReviewBook {
                 title: "浮生六记".into(),
@@ -3564,6 +3582,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                 format: "EPUB".into(),
                 id: None,
                 in_destination: false,
+                is_font: false,
+                font_migratable: false,
+                status_badge: None,
             },
             scan_screen::ReviewBook {
                 title: "聊斋志异".into(),
@@ -3571,6 +3592,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                 format: "TXT".into(),
                 id: Some("indexed".into()),
                 in_destination: false,
+                is_font: false,
+                font_migratable: false,
+                status_badge: None,
             },
             scan_screen::ReviewBook {
                 title: "世说新语".into(),
@@ -3578,6 +3602,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                 format: "EPUB".into(),
                 id: Some("indexed-in-place".into()),
                 in_destination: true,
+                is_font: false,
+                font_migratable: false,
+                status_badge: None,
             },
             scan_screen::ReviewBook {
                 title: "老残游记".into(),
@@ -3585,6 +3612,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                 format: "PDF".into(),
                 id: None,
                 in_destination: false,
+                is_font: false,
+                font_migratable: false,
+                status_badge: None,
             },
         ]
     } else {
@@ -3595,6 +3625,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                 format: "TXT".into(),
                 id: None,
                 in_destination: false,
+                is_font: false,
+                font_migratable: false,
+                status_badge: None,
             },
             scan_screen::ReviewBook {
                 title: "Moby Dick".into(),
@@ -3602,6 +3635,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                 format: "EPUB".into(),
                 id: None,
                 in_destination: false,
+                is_font: false,
+                font_migratable: false,
+                status_badge: None,
             },
             scan_screen::ReviewBook {
                 title: "Frankenstein".into(),
@@ -3609,6 +3645,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                 format: "TXT".into(),
                 id: Some("indexed".into()),
                 in_destination: false,
+                is_font: false,
+                font_migratable: false,
+                status_badge: None,
             },
             scan_screen::ReviewBook {
                 title: "Dracula".into(),
@@ -3616,6 +3655,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                 format: "EPUB".into(),
                 id: Some("indexed-in-place".into()),
                 in_destination: true,
+                is_font: false,
+                font_migratable: false,
+                status_badge: None,
             },
             scan_screen::ReviewBook {
                 title: "The Time Machine".into(),
@@ -3623,6 +3665,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                 format: "PDF".into(),
                 id: None,
                 in_destination: false,
+                is_font: false,
+                font_migratable: false,
+                status_badge: None,
             },
         ]
     };
@@ -3667,6 +3712,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                         format: "TXT".into(),
                         id: None,
                         in_destination: false,
+                        is_font: false,
+                        font_migratable: false,
+                        status_badge: None,
                     },
                     scan_screen::ReviewBook {
                         title: "浮生六记".into(),
@@ -3674,6 +3722,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                         format: "EPUB".into(),
                         id: None,
                         in_destination: false,
+                        is_font: false,
+                        font_migratable: false,
+                        status_badge: None,
                     },
                 ]
             } else {
@@ -3684,6 +3735,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                         format: "TXT".into(),
                         id: None,
                         in_destination: false,
+                        is_font: false,
+                        font_migratable: false,
+                        status_badge: None,
                     },
                     scan_screen::ReviewBook {
                         title: "Moby Dick".into(),
@@ -3691,6 +3745,9 @@ fn scan_screens(profile: Screen, out: &Path) {
                         format: "EPUB".into(),
                         id: None,
                         in_destination: false,
+                        is_font: false,
+                        font_migratable: false,
+                        status_badge: None,
                     },
                 ]
             },

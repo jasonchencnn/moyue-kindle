@@ -1798,7 +1798,7 @@ impl App {
 /// Redacted summary of a `SyncError` for stderr diagnostics: includes the
 /// error kind (plus HTTP status code or brief transport/limit class), while
 /// never logging response bodies, tokens, URLs, or emails.
-fn redacted_sync_error(e: &inkread_core::sync::SyncError) -> String {
+pub(crate) fn redacted_sync_error(e: &inkread_core::sync::SyncError) -> String {
     use inkread_core::sync::SyncError as E;
     match e {
         E::HttpStatus(code, _) => format!("{:?}(HTTP {code})", e.kind()),

@@ -43,6 +43,8 @@ pub mod action {
     pub const WEREAD_LIBRARY: ActionId = 12;
     /// Switch to the Nutstore shelf from the empty-library guide.
     pub const JIANGUOYUN_LIBRARY: ActionId = 27;
+    /// Open the font destination picker (single-destination mode for fonts).
+    pub const FONT_DEST_CHOOSE: ActionId = 28;
     /// Open the source picker, where the folders to scan are chosen.
     pub const CHOOSE_SCOPE: ActionId = 9;
     /// Scan the chosen sources (the source picker's primary button).
@@ -111,7 +113,7 @@ pub struct ScannedBook {
     pub format: String,
 }
 
-/// One row of the combined review list.
+/// One row of the combined review list (a book or a font file).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewBook {
     pub title: String,
@@ -120,15 +122,28 @@ pub struct ReviewBook {
     pub format: String,
     /// The index record, when the library already knows the file.
     pub id: Option<String>,
-    /// The book already sits inside the physical library folder.
+    /// The item already sits inside its designated destination folder.
     pub in_destination: bool,
+    /// True when this row represents a font file (`.ttf`, `.otf`, `.ttc`)
+    /// rather than a book.
+    pub is_font: bool,
+    /// Whether a font file is valid and eligible to migrate into the fonts
+    /// destination folder. Ignored for books.
+    pub font_migratable: bool,
+    /// Optional status line (e.g. `字体 · 已生效`, `字体 · 待迁移`,
+    /// `字体 · 无法解析`), shown in place of the book-specific status label.
+    pub status_badge: Option<String>,
 }
 
 impl ReviewBook {
     /// Whether the row can be checked. A book already in the destination is
     /// listed for information only; a new or indexed book elsewhere can be
-    /// imported or moved.
+    /// imported or moved. A font is selectable when it is valid and outside
+    /// the designated fonts folder.
     pub fn selectable(&self) -> bool {
+        if self.is_font {
+            return self.font_migratable && !self.in_destination;
+        }
         // A new file already in the folder is still worth importing (it gets
         // an index entry); an indexed book there has nothing left to do.
         !(self.id.is_some() && self.in_destination)
@@ -143,6 +158,8 @@ pub enum PickerMode {
     Sources,
     /// The physical library folder; one choice only.
     Destination,
+    /// The designated fonts folder; one choice only.
+    FontDestination,
 }
 
 /// A newly added book previewed in the done summary.
@@ -244,6 +261,8 @@ pub enum ScanState {
         whole: bool,
         /// The physical library folder, as a path to show.
         destination: String,
+        /// The designated fonts folder, as a path to show.
+        fonts_destination: String,
     },
     /// The combined list of found books. Nothing is imported until the
     /// reader checks rows and confirms.
@@ -327,31 +346,63 @@ pub struct ScanUi {
 pub struct EmptyLibraryIllustration;
 
 impl Widget for EmptyLibraryIllustration {
-    fn measure(&mut self, c: Constraints, _text: &mut TextEngine) -> Size {
-        c.constrain(Size::new(322, 280))
+    fn measure(&mut self, c: Constraints, text: &mut TextEngine) -> Size {
+        let d = text.density();
+        c.constrain(Size::new(d.px(322), d.px(280)))
     }
 
     fn paint(&self, r: Rect, cx: &mut PaintCx) {
+        if r.is_empty() {
+            return;
+        }
         let p = &mut *cx.painter;
-        let x = r.x;
-        let y = r.y;
+        let scale = (r.w as f32 / 322.0).min(r.h as f32 / 280.0);
+        if scale <= 0.0 {
+            return;
+        }
+        let draw_w = (322.0 * scale).round() as i32;
+        let draw_h = (280.0 * scale).round() as i32;
+        let x = r.x + (r.w - draw_w) / 2;
+        let y = r.y + (r.h - draw_h) / 2;
+        let stroke_w = (2.0 * scale).max(1.0);
+
         // Fishing line from tip of rod to hook
-        p.fill_rect(Rect::new(x + 284, y + 11, 2, 189), INK);
-        // Desk cat mask
-        p.blend_mask(x, y, 287, 280, CAT_MASK, INK);
+        let line_x = x + (284.0 * scale).round() as i32;
+        let line_y = y + (11.0 * scale).round() as i32;
+        let line_w = (2.0 * scale).round().max(1.0) as i32;
+        let line_h = (189.0 * scale).round().max(1.0) as i32;
+        p.fill_rect(Rect::new(line_x, line_y, line_w, line_h), INK);
+
+        // Desk cat mask (scaled to fit the allocated rect)
+        let cat_w = (287.0 * scale).round().max(1.0) as u32;
+        let cat_h = (280.0 * scale).round().max(1.0) as u32;
+        if cat_w == 287 && cat_h == 280 {
+            p.blend_mask(x, y, 287, 280, CAT_MASK, INK);
+        } else {
+            let scaled =
+                crate::status::scale_mask(CAT_MASK, 287, 280, cat_w as usize, cat_h as usize);
+            p.blend_mask(x, y, cat_w, cat_h, &scaled, INK);
+        }
+
         // Empty hook
         p.stroke_path(
             "M 13 8 L 13 19 C 13 26 5 26 5 20 L 2 16",
-            2.0,
-            Some(Transform::translation(x as f32 + 272.0, y as f32 + 192.0)),
+            stroke_w,
+            Some(
+                Transform::scale(scale, scale)
+                    .then_translate(x as f32 + 272.0 * scale, y as f32 + 192.0 * scale),
+            ),
             INK,
         );
         // Water ripples (cubic beziers matching quadratic prototype curves)
         p.stroke_path(
             "M 2 10 C 8 5.33 14 5.33 20 10 C 26 14.67 32 14.67 38 10 C 44 5.33 50 5.33 56 10 C 62 14.67 67 14.67 72 10 \
              M 12 32 C 18 27.33 24 27.33 30 32 C 36 36.67 42 36.67 48 32 C 54 27.33 60 27.33 66 32",
-            2.0,
-            Some(Transform::translation(x as f32 + 248.0, y as f32 + 228.0)),
+            stroke_w,
+            Some(
+                Transform::scale(scale, scale)
+                    .then_translate(x as f32 + 248.0 * scale, y as f32 + 228.0 * scale),
+            ),
             INK,
         );
     }
@@ -462,7 +513,7 @@ impl ScanUi {
     /// Builds the scan screen for a panel of `size` native pixels, showing
     /// Local plus whichever cloud libraries are enabled in Settings.
     pub fn build_with_sources_for_size(
-        _text: &mut TextEngine,
+        text: &mut TextEngine,
         s: &Styles,
         screen: &ScanScreen,
         show_cloud: bool,
@@ -470,7 +521,7 @@ impl ScanUi {
         size: Size,
     ) -> (Tree, Self) {
         Self::build_with_channels_for_size(
-            _text,
+            text,
             s,
             screen,
             ChannelVisibility::readest_and_weread(show_cloud, show_weread),
@@ -481,7 +532,7 @@ impl ScanUi {
     /// Builds the scan screen for a panel of `size` native pixels, showing
     /// Local plus whichever cloud libraries Settings turns on.
     pub fn build_with_channels_for_size(
-        _text: &mut TextEngine,
+        text: &mut TextEngine,
         s: &Styles,
         screen: &ScanScreen,
         channels: ChannelVisibility,
@@ -507,6 +558,10 @@ impl ScanUi {
                     mode: PickerMode::Destination,
                     ..
                 } => tr(Msg::LibraryScanDestinationTitle),
+                ScanState::Sources {
+                    mode: PickerMode::FontDestination,
+                    ..
+                } => tr(Msg::LibraryScanFontDestinationTitle),
                 ScanState::Sources { .. } => tr(Msg::LibraryScanSourceTitle),
                 ScanState::Review { .. } => tr(Msg::LibraryScanReviewTitle),
                 ScanState::Importing { .. } => tr(Msg::LibraryScanImportingTitle),
@@ -546,7 +601,9 @@ impl ScanUi {
         let mut review_list = None;
         let mut review_pager = None;
         let content_node = match &screen.state {
-            ScanState::Empty => Self::build_empty(&mut t, s, compact),
+            ScanState::Empty => {
+                Self::build_empty(&mut t, text, s, size, compact, channels.count() > 0)
+            }
             ScanState::Scanning {
                 path,
                 subdirs,
@@ -579,6 +636,7 @@ impl ScanUi {
                 selected,
                 whole,
                 destination,
+                fonts_destination,
             } => {
                 let (node, list, pager) = Self::build_sources(
                     &mut t,
@@ -590,6 +648,7 @@ impl ScanUi {
                     selected,
                     *whole,
                     destination,
+                    fonts_destination,
                 );
                 folder_list = Some(list);
                 folder_pager = Some(pager);
@@ -667,28 +726,45 @@ impl ScanUi {
     }
 
     /// Build State 1: Empty library onboarding guide.
-    fn build_empty(t: &mut Tree, s: &Styles, compact: bool) -> NodeId {
+    fn build_empty(
+        t: &mut Tree,
+        text: &mut TextEngine,
+        s: &Styles,
+        size: Size,
+        compact: bool,
+        has_channels: bool,
+    ) -> NodeId {
+        let ref_w = (size.w as f32 * 300.0 / s.density.dpi() as f32).round() as i32;
+        let ref_h = (size.h as f32 * 300.0 / s.density.dpi() as f32).round() as i32;
+        let avail_w = (ref_w - 2 * home_margin()).max(1);
+        let very_tight_h = ref_h <= 1300;
+        let tight_h = compact || ref_h <= 1480 || (has_channels && ref_h <= 1560);
+
         let ill = t.custom(EmptyLibraryIllustration);
-        let ill = if compact {
-            t.fixed(Some(200), Some(174), Some(ill))
+        let ill = if very_tight_h {
+            t.fixed(Some(140), Some(122), Some(ill))
+        } else if tight_h {
+            t.fixed(Some(190), Some(165), Some(ill))
         } else {
-            t.fixed(Some(322), Some(280), Some(ill))
+            t.fixed(Some(276), Some(240), Some(ill))
         };
 
         // The body is a centered column, so the labels centre themselves:
         // an Align child here would take the column's remaining height and
         // squeeze its siblings to zero (QA-101 P1-1).
-        let title = t.label(
+        let title = t.text(Paragraph::plain(
             tr(Msg::LibraryScanEmptyTitle),
-            s.font_lg().bold().line_height(1.3),
-        );
+            s.font_lg().bold().line_height(1.25),
+            Align::Center,
+        ));
 
-        let desc = t.label(
+        let desc = t.text(Paragraph::plain(
             tr(Msg::LibraryScanEmptyDesc),
             s.font_sm()
                 .gray(INK_MID)
-                .line_height(if compact { 1.35 } else { 1.5 }),
-        );
+                .line_height(if tight_h || very_tight_h { 1.3 } else { 1.45 }),
+            Align::Center,
+        ));
 
         // Black primary button "扫描本地书籍"
         let btn_text = t.label(
@@ -696,10 +772,17 @@ impl ScanUi {
             s.font_base().bold().gray(PAPER),
         );
         let btn_align = t.align(0.5, 0.5, btn_text);
+        let btn_h = if very_tight_h {
+            72
+        } else if tight_h {
+            80
+        } else {
+            92
+        };
         let btn = t.add(
             Node::new(Kind::Fixed {
                 w: None,
-                h: Some(if compact { 80 } else { 96 }),
+                h: Some(btn_h),
             })
             .bg(INK)
             .border(0, INK, 20)
@@ -709,122 +792,187 @@ impl ScanUi {
         );
 
         // Two side-by-side cards: Wi-Fi Transfer & USB Connection
-        let wifi_icon = t.icon(Icon::Upload, 36, INK);
+        let icon_box_sz = if very_tight_h || tight_h { 52 } else { 64 };
+        let icon_px = if very_tight_h || tight_h { 30 } else { 36 };
+        let card_pad = if very_tight_h {
+            Insets::new(12, 16, 12, 16)
+        } else if tight_h {
+            Insets::new(14, 18, 14, 18)
+        } else {
+            Insets::new(22, 24, 22, 24)
+        };
+
+        let wifi_icon = t.icon(Icon::Upload, icon_px, INK);
         let wifi_icon_align = t.align(0.5, 0.5, wifi_icon);
         let wifi_icon_box = t.add(
             Node::new(Kind::Fixed {
-                w: Some(64),
-                h: Some(64),
+                w: Some(icon_box_sz),
+                h: Some(icon_box_sz),
             })
             .bg(PAPER)
-            .border(0, PAPER, 20),
+            .border(0, PAPER, 16),
             [wifi_icon_align],
         );
-        let wifi_title = t.label(tr(Msg::LibraryWifiTransfer), s.font_sm().bold());
-        let wifi_spacer = t.spacer(1);
-        let wifi_arrow = t.icon(Icon::ChevronRight, 28, INK);
+        let mut wifi_title_p = Paragraph::plain(
+            tr(Msg::LibraryWifiTransfer),
+            s.font_sm().bold(),
+            Align::Left,
+        );
+        wifi_title_p.style.max_lines = Some(2);
+        let wifi_title_node = t.text(wifi_title_p);
+        let wifi_title = t.add(Node::column(0).flex(1), [wifi_title_node]);
+        let wifi_arrow = t.icon(Icon::ChevronRight, 24, INK);
         let wifi_top = t.add(
-            Node::row(16).cross(Cross::Center),
-            [wifi_icon_box, wifi_title, wifi_spacer, wifi_arrow],
+            Node::row(12).cross(Cross::Center),
+            [wifi_icon_box, wifi_title, wifi_arrow],
         );
-        let wifi_sub = t.label(
+        let mut wifi_sub_p = Paragraph::plain(
             tr(Msg::LibraryScanWifiDesc),
-            s.font_xs().gray(INK_MID).line_height(1.3),
+            s.font_xs().gray(INK_MID).line_height(1.25),
+            Align::Left,
         );
+        wifi_sub_p.style.max_lines = Some(2);
+        let wifi_sub = t.text(wifi_sub_p);
         let wifi_card_content = t.add(
-            Node::column(if compact { 8 } else { 12 }),
+            Node::column(if tight_h || very_tight_h { 6 } else { 10 }),
             [wifi_top, wifi_sub],
         );
-        let card_pad = if compact {
-            Insets::new(14, 20, 14, 20)
-        } else {
-            Insets::new(24, 28, 24, 28)
-        };
         let wifi_card_pad = t.pad(card_pad, wifi_card_content);
         let wifi_card = t.add(
             Node::column(0)
                 .bg(CARD)
-                .border(0, 0, 24)
+                .border(0, 0, 20)
                 .action(action::WIFI_TRANSFER)
                 .feedback(Feedback::Invert)
                 .flex(1),
             [wifi_card_pad],
         );
 
-        let usb_icon = t.icon(Icon::Usb, 36, INK);
+        let usb_icon = t.icon(Icon::Usb, icon_px, INK);
         let usb_icon_align = t.align(0.5, 0.5, usb_icon);
         let usb_icon_box = t.add(
             Node::new(Kind::Fixed {
-                w: Some(64),
-                h: Some(64),
+                w: Some(icon_box_sz),
+                h: Some(icon_box_sz),
             })
             .bg(PAPER)
-            .border(0, PAPER, 20),
+            .border(0, PAPER, 16),
             [usb_icon_align],
         );
-        let usb_title = t.label(tr(Msg::LibraryScanUsbTitle), s.font_sm().bold());
+        let mut usb_title_p = Paragraph::plain(
+            tr(Msg::LibraryScanUsbTitle),
+            s.font_sm().bold(),
+            Align::Left,
+        );
+        usb_title_p.style.max_lines = Some(2);
+        let usb_title_node = t.text(usb_title_p);
+        let usb_title = t.add(Node::column(0).flex(1), [usb_title_node]);
         let usb_top = t.add(
-            Node::row(16).cross(Cross::Center),
+            Node::row(12).cross(Cross::Center),
             [usb_icon_box, usb_title],
         );
-        let usb_sub = t.label(
+        let mut usb_sub_p = Paragraph::plain(
             tr(Msg::LibraryScanUsbDesc),
-            s.font_xs().gray(INK_MID).line_height(1.3),
+            s.font_xs().gray(INK_MID).line_height(1.25),
+            Align::Left,
         );
+        usb_sub_p.style.max_lines = Some(2);
+        let usb_sub = t.text(usb_sub_p);
         let usb_card_content = t.add(
-            Node::column(if compact { 8 } else { 12 }),
+            Node::column(if tight_h || very_tight_h { 6 } else { 10 }),
             [usb_top, usb_sub],
         );
         let usb_card_pad = t.pad(card_pad, usb_card_content);
         let usb_card = t.add(
-            Node::column(0).bg(CARD).border(0, 0, 24).flex(1),
+            Node::column(0).bg(CARD).border(0, 0, 20).flex(1),
             [usb_card_pad],
         );
 
         let cards_row = t.add(
-            Node::row(if compact { 16 } else { 24 }),
+            Node::row(if tight_h || very_tight_h { 14 } else { 20 }).cross(Cross::Stretch),
             [wifi_card, usb_card],
         );
 
-        // Supported formats section
-        let formats_label = t.label(
+        // Supported formats section (wrapped across rows so narrow screens never overflow)
+        let formats_label = t.text(Paragraph::plain(
             tr(Msg::LibraryScanSupportedFormats),
             s.font_xs().gray(INK_MID),
-        );
-        let format_names = ["EPUB", "MOBI / AZW3", "PDF", "TXT", "CBZ"];
-        let mut chips = Vec::new();
+            Align::Center,
+        ));
+        let format_names = [
+            "EPUB",
+            "MOBI / AZW3",
+            "PDF",
+            "TXT",
+            "CBZ",
+            "TTF / OTF / TTC",
+        ];
+        let chip_style = s.font_xs().bold().line_height(1.0);
+        let chip_pad_x = if very_tight_h || tight_h { 14 } else { 20 };
+        let chip_h = if very_tight_h {
+            44
+        } else if tight_h {
+            50
+        } else {
+            60
+        };
+        let chip_gap = if very_tight_h || tight_h { 10 } else { 14 };
+        let mut chip_rows = Vec::new();
+        let mut current_row = Vec::new();
+        let mut used = 0i32;
         for f in format_names {
-            let label = t.label(f, s.font_xs().bold().line_height(1.0));
-            let pad = t.pad(
-                Insets::new(
-                    0,
-                    if compact { 14 } else { 22 },
-                    0,
-                    if compact { 14 } else { 22 },
-                ),
-                label,
-            );
-            // MinSize shrink-wraps the label and gives it the 64 px height;
-            // a Fixed box would stretch the first chip across the row.
+            let text_w =
+                (text.measure(f, &chip_style) * 300.0 / s.density.dpi() as f32).ceil() as i32;
+            let chip_w = text_w + 2 * chip_pad_x + 4;
+            if !current_row.is_empty() && used + chip_gap + chip_w > avail_w {
+                chip_rows.push(t.add(
+                    Node::row(chip_gap).cross(Cross::Center),
+                    std::mem::take(&mut current_row),
+                ));
+                used = 0;
+            }
+            if !current_row.is_empty() {
+                used += chip_gap;
+            }
+            used += chip_w;
+            let label = t.label(f, chip_style.clone());
+            let pad = t.pad(Insets::new(0, chip_pad_x, 0, chip_pad_x), label);
             let chip = t.add(
-                Node::new(Kind::MinSize(Size::new(0, if compact { 52 } else { 64 })))
+                Node::new(Kind::MinSize(Size::new(0, chip_h)))
                     .bg(PAPER)
                     .border(2, INK, 16),
                 [pad],
             );
-            chips.push(chip);
+            current_row.push(chip);
         }
-        let chips_row = t.add(Node::row(if compact { 10 } else { 14 }), chips);
+        if !current_row.is_empty() {
+            chip_rows.push(t.add(Node::row(chip_gap).cross(Cross::Center), current_row));
+        }
+        let chips_col = t.add(Node::column(chip_gap).cross(Cross::Center), chip_rows);
         let formats_col = t.add(
-            Node::column(if compact { 10 } else { 16 }),
-            [formats_label, chips_row],
+            Node::column(if very_tight_h {
+                8
+            } else if tight_h {
+                10
+            } else {
+                14
+            })
+            .cross(Cross::Center),
+            [formats_label, chips_col],
         );
 
-        let g1 = t.gap(1, if compact { 16 } else { 40 });
-        let g2 = t.gap(1, if compact { 10 } else { 16 });
-        let g3 = t.gap(1, if compact { 18 } else { 40 });
-        let g4 = t.gap(1, if compact { 14 } else { 24 });
-        let g5 = t.gap(1, if compact { 14 } else { 28 });
+        let (g1, g2, g3, g4, g5) = if very_tight_h {
+            (10, 6, 12, 10, 10)
+        } else if tight_h {
+            (14, 8, 16, 12, 12)
+        } else {
+            (28, 14, 30, 20, 22)
+        };
+        let g1 = t.gap(1, g1);
+        let g2 = t.gap(1, g2);
+        let g3 = t.gap(1, g3);
+        let g4 = t.gap(1, g4);
+        let g5 = t.gap(1, g5);
 
         // Group into centered column
         let body = t.add(
@@ -862,8 +1010,10 @@ impl ScanUi {
         selected: &[String],
         whole: bool,
         destination: &str,
+        fonts_destination: &str,
     ) -> (NodeId, NodeId, NodeId) {
-        let destination_mode = mode == PickerMode::Destination;
+        let destination_mode =
+            matches!(mode, PickerMode::Destination | PickerMode::FontDestination);
         // The folder shown, which may be chosen as a source or destination.
         let current_value = if path.is_empty() {
             tr(Msg::LibraryScanScopeWhole).to_string()
@@ -921,6 +1071,37 @@ impl ScanUi {
             let dest_card = t.fixed(None, Some(88), Some(dest_card));
             parts.push(t.gap(1, 8));
             parts.push(dest_card);
+
+            // Designated fonts folder, and the way to choose another folder.
+            let font_dest_label = t.label(
+                tr(Msg::LibraryScanFontDestinationLabel),
+                s.font_xs().gray(INK_MID),
+            );
+            let mut font_dest_par = Paragraph::plain(
+                fonts_destination.to_string(),
+                s.font_xs().line_height(1.2),
+                Align::Left,
+            );
+            font_dest_par.style.max_lines = Some(1);
+            let font_dest_text = t.text(font_dest_par);
+            let font_dest_words = t.add(Node::column(2).flex(1), [font_dest_label, font_dest_text]);
+            let font_change_label = t.label(tr(Msg::LibraryScanDestinationChange), s.font_xs());
+            let font_change_pad = t.pad(Insets::vh(24, 20), font_change_label);
+            let font_change = t.add(
+                Node::new(Kind::MinSize(Size::new(64, 64)))
+                    .action(action::FONT_DEST_CHOOSE)
+                    .feedback(Feedback::Invert),
+                [font_change_pad],
+            );
+            let font_dest_row = t.add(
+                Node::row(16).cross(Cross::Center),
+                [font_dest_words, font_change],
+            );
+            let font_dest_pad = t.pad(Insets::new(10, 24, 10, 24), font_dest_row);
+            let font_dest_card = t.add(Node::column(0).bg(CARD).border(0, 0, 20), [font_dest_pad]);
+            let font_dest_card = t.fixed(None, Some(88), Some(font_dest_card));
+            parts.push(t.gap(1, 8));
+            parts.push(font_dest_card);
         }
 
         if !destination_mode {
@@ -1394,7 +1575,9 @@ impl ScanUi {
         path_par.style.max_lines = Some(1);
         let path = t.text(path_par);
         let mut texts = vec![title, path];
-        if !selectable {
+        if let Some(badge) = &book.status_badge {
+            texts.push(t.label(badge, s.font_xs().gray(INK_MID)));
+        } else if !selectable {
             texts.push(t.label(
                 tr(Msg::LibraryScanReviewInDestination),
                 s.font_xs().gray(INK_MID),
@@ -2115,6 +2298,7 @@ mod tests {
             selected,
             whole,
             destination: "/mnt/us/documents/墨阅书库".into(),
+            fonts_destination: "/mnt/us/fonts".into(),
         }
     }
 
@@ -2129,6 +2313,9 @@ mod tests {
                     format: "TXT".into(),
                     id: None,
                     in_destination: false,
+                    is_font: false,
+                    font_migratable: false,
+                    status_badge: None,
                 },
                 ReviewBook {
                     title: "Uczta".into(),
@@ -2136,6 +2323,9 @@ mod tests {
                     format: "EPUB".into(),
                     id: Some("uczta".into()),
                     in_destination: false,
+                    is_font: false,
+                    font_migratable: false,
+                    status_badge: None,
                 },
                 ReviewBook {
                     title: "Dziady".into(),
@@ -2143,6 +2333,9 @@ mod tests {
                     format: "TXT".into(),
                     id: Some("dziady".into()),
                     in_destination: true,
+                    is_font: false,
+                    font_migratable: false,
+                    status_badge: None,
                 },
             ],
             selected,
@@ -2161,6 +2354,7 @@ mod tests {
         assert!(has_action(&tree, root, action::SOURCE_ITEM));
         assert!(has_action(&tree, root, action::SCOPE_ITEM));
         assert!(has_action(&tree, root, action::DEST_CHOOSE));
+        assert!(has_action(&tree, root, action::FONT_DEST_CHOOSE));
 
         let (tree, _ui) = test_tree(sources_state(vec!["documents/Novels".into()], false));
         let root = tree.root().unwrap();
@@ -2210,6 +2404,9 @@ mod tests {
                     format: "TXT".into(),
                     id: None,
                     in_destination: true,
+                    is_font: false,
+                    font_migratable: false,
+                    status_badge: None,
                 },
                 ReviewBook {
                     title: "Known".into(),
@@ -2217,6 +2414,9 @@ mod tests {
                     format: "TXT".into(),
                     id: Some("known".into()),
                     in_destination: true,
+                    is_font: false,
+                    font_migratable: false,
+                    status_badge: None,
                 },
             ],
             selected: vec![false, false],
@@ -2257,6 +2457,7 @@ mod tests {
             selected: Vec::new(),
             whole: false,
             destination: "/mnt/us/documents/墨阅书库".into(),
+            fonts_destination: "/mnt/us/fonts".into(),
         });
         let root = tree.root().unwrap();
         assert!(has_action(&tree, root, action::DEST_USE));
@@ -2288,5 +2489,53 @@ mod tests {
             assert!(words.contains(&"documents/Poetry"));
             assert!(!words.contains(&"/mnt/us/documents/墨阅书库"));
         });
+    }
+
+    #[test]
+    fn font_review_rows_report_effectiveness_and_selectability() {
+        let pending_font = ReviewBook {
+            title: "LXGW WenKai".into(),
+            path: "Download/LXGWWenKai.ttf".into(),
+            format: "TTF".into(),
+            id: None,
+            in_destination: false,
+            is_font: true,
+            font_migratable: true,
+            status_badge: Some("字体 · 待迁移".into()),
+        };
+        let active_font = ReviewBook {
+            title: "Source Han Serif".into(),
+            path: "fonts/SourceHanSerif.otf".into(),
+            format: "OTF".into(),
+            id: None,
+            in_destination: true,
+            is_font: true,
+            font_migratable: false,
+            status_badge: Some("字体 · 已生效".into()),
+        };
+        let broken_font = ReviewBook {
+            title: "broken".into(),
+            path: "Download/broken.ttc".into(),
+            format: "TTC".into(),
+            id: None,
+            in_destination: false,
+            is_font: true,
+            font_migratable: false,
+            status_badge: Some("字体 · 无法解析".into()),
+        };
+        assert!(pending_font.selectable());
+        assert!(!active_font.selectable());
+        assert!(!broken_font.selectable());
+
+        let (tree, _ui) = test_tree(ScanState::Review {
+            sources: "全盘".into(),
+            destination: "/mnt/us/documents/墨阅书库".into(),
+            books: vec![pending_font, active_font, broken_font],
+            selected: vec![false, false, false],
+        });
+        let root = tree.root().unwrap();
+        assert!(has_action(&tree, root, action::REVIEW_ITEM));
+        assert!(!has_action(&tree, root, action::REVIEW_ITEM + 1));
+        assert!(!has_action(&tree, root, action::REVIEW_ITEM + 2));
     }
 }

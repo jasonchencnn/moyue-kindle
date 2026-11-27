@@ -202,7 +202,11 @@ impl HomeUi {
         home: &Home,
         size: Size,
     ) -> (Tree, Self) {
-        let compact = PanelLayout::for_size(size, s.density) == PanelLayout::Compact;
+        // Landscape viewports are wider but significantly shorter than portrait
+        // (e.g. 1680x1264 on Oasis 2), so use the compact vertical rhythm to
+        // keep all cards and the bottom navigation bar inside the screen.
+        let compact =
+            PanelLayout::for_size(size, s.density) == PanelLayout::Compact || size.w > size.h;
         let ty = Type::new(s, compact);
         let mut t = Tree::new();
         let screen_w = size.w;

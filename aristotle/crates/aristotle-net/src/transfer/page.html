@@ -58,13 +58,13 @@
 </head>
 <body>
 <h1>墨阅传书</h1>
-<p class="hint">把书拖进来，或点下面的按钮挑文件。可以一次选多个。图片会作为休眠屏图片保存。</p>
+<p class="hint">把书、字体或图片拖进来，或点下面的按钮挑文件。可以一次选多个。字体会保存到指定字体文件夹，图片会作为休眠屏图片保存。</p>
 
 <div id="drop">
   <div class="big">拖书到这里</div>
   <label id="pick" for="input">选择文件</label>
   <input id="input" type="file" multiple hidden
-         accept=".epub,.txt,.mobi,.azw3,.pdf,.cbz,.ttf,.otf,.jpg,.jpeg,.png">
+         accept=".epub,.txt,.mobi,.azw3,.pdf,.cbz,.ttf,.otf,.ttc,.jpg,.jpeg,.png">
 </div>
 
 <div id="files"></div>
@@ -106,9 +106,18 @@
 
   var count = 0;
   var bytes = 0;
+  var queue = [];
+  var sending = false;
 
-  function send(file) {
-    var r = row(file);
+  // Upload one file at a time: the device's HTTP server handles a single
+  // connection at a time to stay within e-reader memory limits, so parallel
+  // uploads (especially multiple large CJK font files) would time out or drop.
+  function pump() {
+    if (sending || queue.length === 0) return;
+    sending = true;
+    var item = queue.shift();
+    var file = item.file;
+    var r = item.row;
     var xhr = new XMLHttpRequest();
     // The device cannot know how big the file is on its own, so it is said
     // here: without it the device's own screen has no bar to fill.
@@ -131,10 +140,14 @@
         r.el.classList.add('bad');
         r.note.textContent = '失败' + (xhr.responseText ? '：' + xhr.responseText : '');
       }
+      sending = false;
+      pump();
     };
     xhr.onerror = function () {
       r.el.classList.add('bad');
       r.note.textContent = '失败：连接断开';
+      sending = false;
+      pump();
     };
     var form = new FormData();
     form.append('file', file, file.name);
@@ -142,7 +155,10 @@
   }
 
   function sendAll(files) {
-    for (var i = 0; i < files.length; i++) send(files[i]);
+    for (var i = 0; i < files.length; i++) {
+      queue.push({ file: files[i], row: row(files[i]) });
+    }
+    pump();
   }
 
   input.addEventListener('change', function () {

@@ -29,6 +29,7 @@ pub mod endpoint;
 pub mod http;
 pub mod jianguoyun;
 pub mod kosync;
+pub mod lan_input;
 pub mod localtime;
 pub mod opds;
 pub mod ota;
@@ -37,6 +38,7 @@ pub mod readest;
 pub mod store;
 pub mod transfer;
 pub mod translate;
+pub mod tts;
 pub mod url;
 
 #[cfg(test)]

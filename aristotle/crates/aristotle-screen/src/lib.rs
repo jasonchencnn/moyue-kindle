@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Screen geometry and density, independent of drivers and rendering.
 
+pub mod bars;
+pub mod device_prefs;
 pub mod model;
 pub mod usb;
 
+pub use bars::{BarItem, ReaderBarConfig, ReaderBarPreset, WifiBadge};
+pub use device_prefs::{
+    find_timezone, format_clock_hm, KeyLongPressAction, Orientation, TimezoneOption,
+    TouchZoneLayout, TIMEZONES,
+};
 pub use model::{Geometry, Model, PageTurnKeys, TouchTransform};
 pub use usb::{handle_usb_transition, UsbAction, UsbEvent, UsbMode};
 

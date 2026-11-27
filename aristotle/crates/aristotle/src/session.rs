@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use aristotle_i18n::{tf, Msg};
 use aristotle_library::index::AnnotationKind;
 use aristotle_library::{BookRecord, Library, Progress};
-use aristotle_render::book::{Book, CrengineMark, Engine, Link, Mark, Position, Word};
+use aristotle_render::book::{
+    Book, CrengineMark, Engine, Link, Mark, PageFootnote, Position, Word,
+};
 use aristotle_render::page::{Chrome, Page};
 use aristotle_render::plato_core::anyhow::{format_err, Context, Error};
 use aristotle_render::style::{Style, Underline};
@@ -66,6 +68,8 @@ pub struct Session {
     /// Words and links of the last page asked for.
     words: Option<(usize, Rc<Vec<Word>>)>,
     links: Option<(usize, Rc<Vec<Link>>)>,
+    /// Footnotes of the current page, resolved on demand.
+    footnotes: Option<(usize, Rc<Vec<PageFootnote>>)>,
 }
 
 /// What the timing log reports about opening a book.
@@ -502,6 +506,7 @@ impl Session {
                 .filter_map(|p| book.location_of(p))
                 .collect(),
             secs_per_page: src.secs_per_page,
+            status: Default::default(),
         };
         let first_next = if neighbours {
             book.next_page(current)
@@ -594,6 +599,7 @@ impl Session {
             raw_bookmarks: p.src.bookmarks,
             words: None,
             links: None,
+            footnotes: None,
         })
     }
 
@@ -909,6 +915,19 @@ impl Session {
             .is_some_and(|book| book.engine() == Engine::Vertical)
     }
 
+    /// Whether the loaded book is laid out by the fixed-layout engine (CBZ, PDF).
+    pub fn is_fixed(&self) -> bool {
+        self.book
+            .as_ref()
+            .is_some_and(|book| book.engine() == Engine::Fixed)
+    }
+
+    /// Whether page-turn gestures should mirror horizontally (left tap / right
+    /// swipe advances): true for vertical text and RTL fixed-layout comics.
+    pub fn is_rtl_turns(&self) -> bool {
+        self.is_vertical() || (self.is_fixed() && self.style.fixed_layout.direction.is_rtl())
+    }
+
     /// Whether the book is here rather than with a layout worker.
     pub fn has_book(&self) -> bool {
         self.book.is_some()
@@ -928,6 +947,7 @@ impl Session {
         self.prev_of.clear();
         self.words = None;
         self.links = None;
+        self.footnotes = None;
         self.kept = None;
     }
 
@@ -965,6 +985,22 @@ impl Session {
         }
     }
 
+    /// Book footnotes referenced on the page starting at `location`
+    /// (cached for the last page asked).
+    pub fn footnotes(&mut self, location: usize) -> Rc<Vec<PageFootnote>> {
+        match &self.footnotes {
+            Some((l, f)) if *l == location => f.clone(),
+            _ => {
+                let Some(book) = self.book.as_mut() else {
+                    return Rc::new(Vec::new());
+                };
+                let f = Rc::new(book.page_footnotes(location));
+                self.footnotes = Some((location, f.clone()));
+                f
+            }
+        }
+    }
+
     /// New highlights and bookmarks: rendered pages are redrawn on demand.
     pub fn set_marks(&mut self, marks: Vec<Mark>, bookmarks: Vec<usize>) {
         if marks != self.deco.marks || bookmarks != self.deco.bookmarks {
@@ -990,8 +1026,33 @@ impl Session {
         }
     }
 
+    /// Current chapter title at `location`, when known.
+    pub fn chapter_title(&mut self, location: usize) -> Option<String> {
+        self.book.as_mut()?.chapter_title(location)
+    }
+
     pub fn set_speed(&mut self, secs_per_page: f32) {
         self.deco.secs_per_page = secs_per_page;
+    }
+
+    /// Update the live device status drawn in the reader's bars.
+    /// Drops cached pages only when the displayed status actually changed.
+    pub fn set_bar_status(&mut self, status: aristotle_render::page::DeviceBarStatus) {
+        if self.deco.status != status {
+            self.deco.status = status;
+            self.pages.clear();
+        }
+    }
+
+    /// Update the reader's bar configuration in-place (for changes that do not
+    /// alter `text_top`/`text_bottom`). Drops cached page bitmaps so the next
+    /// draw picks up the new bars without re-laying out the book.
+    pub fn set_bar_config(&mut self, config: aristotle_screen::ReaderBarConfig) {
+        if self.style.bar_config != config {
+            self.style.bar_config = config;
+            self.chrome.set_config(config);
+            self.pages.clear();
+        }
     }
 
     /// Whether the page starting at `location` holds a bookmark.
@@ -1010,6 +1071,8 @@ pub struct Deco {
     /// Bookmarks as Plato locations.
     pub bookmarks: Vec<usize>,
     pub secs_per_page: f32,
+    /// Live device status (clock, battery, Wi-Fi, frontlight) for bar slots.
+    pub status: aristotle_render::page::DeviceBarStatus,
 }
 
 impl Deco {
@@ -1037,6 +1100,20 @@ pub fn render_page(
     } else {
         remaining_line(book, deco.secs_per_page, location, next)
     };
+    let book_remaining = if degraded {
+        None
+    } else {
+        book_remaining_line(book, deco.secs_per_page, location, next)
+    };
+    let chapter_page = if degraded {
+        None
+    } else {
+        chapter_page_info(book, location)
+    };
+    let has_footnotes = book.has_page_footnotes(location);
+    chrome.set_status(deco.status.clone());
+    chrome.set_page_extras(book_remaining, chapter_page);
+    chrome.set_has_footnotes(has_footnotes);
     let mut page = book.render_location_with_degraded(location, chrome, remaining, degraded)?;
     if !deco.marks.is_empty() {
         if book.engine() == Engine::Plato {
@@ -1129,8 +1206,68 @@ pub fn render_page(
             }
         }
     }
-    ribbon(&mut page, deco.bookmark_on(location, next).is_some());
+    let is_bookmarked = deco.bookmark_on(location, next).is_some();
+    if is_bookmarked || chrome.config().show_bookmark_ribbon {
+        ribbon(&mut page, is_bookmarked);
+    }
+    if has_footnotes {
+        footnote_badge(&mut page, chrome.dpi());
+    }
     Ok(page)
+}
+
+/// Estimated reading time remaining in the whole book, using the measured
+/// reading speed (`secs_per_page`).
+fn book_remaining_line(
+    book: &mut Book,
+    secs_per_page: f32,
+    location: usize,
+    next: Option<usize>,
+) -> Option<String> {
+    let pages_left = match book.pagination() {
+        Some(pages) if !pages.is_empty() => {
+            let here = pages.partition_point(|&p| p <= location);
+            pages.len().saturating_sub(here) as f32
+        }
+        _ => {
+            let total = book.len();
+            if total == 0 || location >= total {
+                return None;
+            }
+            let per_page = next.map_or(2000, |n| n.saturating_sub(location)).max(400) as f32;
+            (total.saturating_sub(location)) as f32 / per_page
+        }
+    };
+    let total_mins = (pages_left.max(0.0) * secs_per_page / 60.0).round() as u32;
+    if total_mins == 0 {
+        return None;
+    }
+    if total_mins >= 60 {
+        let hours = total_mins / 60;
+        let minutes = total_mins % 60;
+        Some(tf!(
+            Msg::BarsBookHoursMinsLeft,
+            hours = hours,
+            minutes = minutes
+        ))
+    } else {
+        Some(tf!(Msg::BarsBookMinsLeft, minutes = total_mins))
+    }
+}
+
+/// 1-based `(page_in_chapter, total_pages_in_chapter)` when pagination is known.
+fn chapter_page_info(book: &mut Book, location: usize) -> Option<(usize, usize)> {
+    let ch = book.chapter_info(location)?;
+    let pages = book.pagination()?;
+    let start = pages.partition_point(|&p| p < ch.start);
+    let end = pages.partition_point(|&p| p < ch.end);
+    if end <= start {
+        return None;
+    }
+    let here = pages.partition_point(|&p| p <= location).saturating_sub(1);
+    let page_in_ch = here.saturating_sub(start) + 1;
+    let total_in_ch = end - start;
+    Some((page_in_ch.min(total_in_ch), total_in_ch))
 }
 
 /// "本章剩约 12 分钟": the minutes left in the chapter at the measured
@@ -1214,6 +1351,81 @@ fn ribbon(page: &mut Page, bookmarked: bool) {
     }
 }
 
+/// Draw the top-right magnifying-glass footnote button onto `page`, centred
+/// inside [`crate::turns::footnote_button_at`] so it sits cleanly to the left
+/// of the bookmark ribbon without overlapping body text.
+fn footnote_badge(page: &mut Page, dpi: u16) {
+    let density = aristotle_screen::Density::new(dpi).unwrap_or_default();
+    let bm_w = density.mm(10.0);
+    let btn_w = density.mm(9.0);
+    let radius = density.px(11).max(7) as f32;
+    let cx = ((page.width as i32 - bm_w - btn_w / 2).max(radius as i32 + 2)) as f32;
+    let cy = density.px(32).max(radius as i32 + 2) as f32;
+
+    let border_half = density.scale(0.65).max(0.55);
+    let stroke_half = density.scale(0.95).max(0.75);
+
+    // Magnifying-glass geometry matching `Icon::Search` inside the circular badge.
+    let lens_cx = cx - radius * 0.14;
+    let lens_cy = cy - radius * 0.14;
+    let lens_r = radius * 0.36;
+    let diag = std::f32::consts::FRAC_1_SQRT_2;
+    let hx0 = lens_cx + lens_r * diag;
+    let hy0 = lens_cy + lens_r * diag;
+    let hx1 = cx + radius * 0.48;
+    let hy1 = cy + radius * 0.48;
+
+    let pad = (radius + border_half + 2.0).ceil() as i32;
+    let x0 = (cx as i32 - pad).max(0);
+    let x1 = (cx as i32 + pad).min(page.width as i32);
+    let y0 = (cy as i32 - pad).max(0);
+    let y1 = (cy as i32 + pad).min(page.height as i32);
+
+    for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        let dy_badge = py - cy;
+        let dy_lens = py - lens_cy;
+        for x in x0..x1 {
+            let px = x as f32 + 0.5;
+            let dx_badge = px - cx;
+            let dist_badge = (dx_badge * dx_badge + dy_badge * dy_badge).sqrt();
+            if dist_badge > radius + border_half {
+                continue;
+            }
+            let dst = y as usize * page.stride + x as usize;
+            // Outer button circle border.
+            if (dist_badge - radius).abs() <= border_half {
+                page.data[dst] = 0x20;
+                continue;
+            }
+            // Magnifying-glass lens ring.
+            let dx_lens = px - lens_cx;
+            let dist_lens = (dx_lens * dx_lens + dy_lens * dy_lens).sqrt();
+            let on_lens = (dist_lens - lens_r).abs() <= stroke_half;
+            // Magnifying-glass handle segment.
+            let handle_d2 = segment_dist_sq_f32(px, py, hx0, hy0, hx1, hy1);
+            let on_handle = handle_d2 <= stroke_half * stroke_half;
+            if on_lens || on_handle {
+                page.data[dst] = 0x00;
+            } else {
+                page.data[dst] = 0xff;
+            }
+        }
+    }
+}
+
+fn segment_dist_sq_f32(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let (dx, dy) = (bx - ax, by - ay);
+    let len_sq = dx * dx + dy * dy;
+    let t = if len_sq == 0.0 {
+        0.0
+    } else {
+        (((px - ax) * dx + (py - ay) * dy) / len_sq).clamp(0.0, 1.0)
+    };
+    let (qx, qy) = (ax + t * dx, ay + t * dy);
+    (px - qx) * (px - qx) + (py - qy) * (py - qy)
+}
+
 /// Whether (`x`, `y`) is inside the closed polygon `path` (even-odd rule).
 fn inside_polygon(x: f32, y: f32, path: &[(i32, i32)]) -> bool {
     let mut inside = false;
@@ -1285,6 +1497,45 @@ mod tests {
         assert_eq!(pixel(&page, x0 + 24, 20), 0);
         assert_eq!(pixel(&page, x0 + 24, 3), 0);
         assert_eq!(pixel(&page, x0 + 2, 20), 0xff);
+    }
+
+    #[test]
+    fn footnote_badge_draws_magnifying_glass_without_touching_ribbon() {
+        let (width, height) = (1072u32, 1448u32);
+        let mut page = Page {
+            width,
+            height,
+            stride: width as usize,
+            data: vec![0xff; width as usize * height as usize],
+            images: Vec::new(),
+        };
+        footnote_badge(&mut page, 300);
+        let btn = crate::turns::footnote_button_at(
+            aristotle_ui::geom::Rect::new(0, 0, width as i32, height as i32),
+            aristotle_ui::geom::Density::default(),
+        );
+        let mut dark_in_btn = 0usize;
+        for y in btn.y..btn.bottom() {
+            for x in btn.x..btn.right() {
+                if pixel(&page, x, y) < 0x80 {
+                    dark_in_btn += 1;
+                }
+            }
+        }
+        assert!(
+            dark_in_btn > 40,
+            "magnifying-glass badge should draw crisp ink inside button rect, got {dark_in_btn}"
+        );
+        // Bookmark ribbon area at the far right edge remains untouched white.
+        let bm = crate::turns::bookmark_corner_at(
+            aristotle_ui::geom::Rect::new(0, 0, width as i32, height as i32),
+            aristotle_ui::geom::Density::default(),
+        );
+        for y in bm.y..bm.bottom() {
+            for x in bm.x..bm.right() {
+                assert_eq!(pixel(&page, x, y), 0xff);
+            }
+        }
     }
     fn txt_source_for(path: std::path::PathBuf, saved: Progress) -> Source {
         Source {

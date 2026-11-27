@@ -244,9 +244,9 @@ fn receive(
                             return Ok(());
                         }
                         match write_file(&mut parser, folder, &safe.name, size, limit, state) {
-                            Ok((size, _)) => {
+                            Ok((size, _, final_name)) => {
                                 if let Ok(mut s) = state.lock() {
-                                    s.add_received(safe.name.clone(), size);
+                                    s.add_received_with_kind(final_name, size, safe.kind);
                                     s.current = None;
                                     s.stage = Stage::Done;
                                 }
@@ -297,7 +297,7 @@ fn write_file(
     size: u64,
     limit: u64,
     state: &Arc<Mutex<State>>,
-) -> io::Result<(u64, PathBuf)> {
+) -> io::Result<(u64, PathBuf, String)> {
     fs::create_dir_all(folder)?;
     // The name is free, so a book that came in before is not overwritten.
     let mut taken = |candidate: &str| folder.join(candidate).exists();
@@ -310,7 +310,10 @@ fn write_file(
         Ok(size) => {
             let path = folder.join(&final_name);
             fs::rename(&temp, &path)?;
-            Ok((size, path))
+            if let Ok(dir) = fs::File::open(folder) {
+                let _ = dir.sync_all();
+            }
+            Ok((size, path, final_name))
         }
         Err(e) => {
             let _ = fs::remove_file(&temp);
@@ -366,6 +369,7 @@ fn write_part(
         }
     }
     file.flush()?;
+    file.sync_all()?;
     Ok(written)
 }
 

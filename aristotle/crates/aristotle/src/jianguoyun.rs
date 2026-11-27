@@ -984,7 +984,7 @@ impl App {
             let dir = self.jianguoyun.current_dir.clone();
             self.jianguoyun.show_cached(&dir);
         }
-        self.show_jianguoyun_shelf(Refresh::Full, 0)?;
+        self.show_jianguoyun_shelf(Refresh::Clean, 0)?;
         if !self.jianguoyun.loading {
             self.refresh_jianguoyun();
             self.show_jianguoyun_shelf(Refresh::Auto, 0)?;
@@ -1206,7 +1206,7 @@ impl App {
             self.jianguoyun.entries.clear();
         }
         self.jianguoyun.sync_states(&self.lib);
-        self.show_jianguoyun_shelf(Refresh::Full, 0)?;
+        self.show_jianguoyun_shelf(Refresh::Clean, 0)?;
         self.refresh_jianguoyun();
         Ok(())
     }
@@ -1221,7 +1221,7 @@ impl App {
             self.jianguoyun.entries.clear();
         }
         self.jianguoyun.sync_states(&self.lib);
-        self.show_jianguoyun_shelf(Refresh::Full, 0)?;
+        self.show_jianguoyun_shelf(Refresh::Clean, 0)?;
         self.refresh_jianguoyun();
         Ok(())
     }
@@ -1438,7 +1438,7 @@ impl App {
             ui_login::JianguoyunLoginOutcome::Cancel => {
                 if self.jianguoyun_configured() {
                     self.jianguoyun.message = None;
-                    self.show_jianguoyun_shelf(Refresh::Full, 0)?;
+                    self.show_jianguoyun_shelf(Refresh::Clean, 0)?;
                     self.refresh_jianguoyun();
                 } else {
                     self.show_library(Refresh::Full)?;
@@ -1523,7 +1523,7 @@ impl App {
                 self.jianguoyun.failed = None;
                 self.jianguoyun.message = None;
                 self.jianguoyun.reload_cache(self.lib.data_dir());
-                self.show_jianguoyun_shelf(Refresh::Full, 0)?;
+                self.show_jianguoyun_shelf(Refresh::Clean, 0)?;
                 self.refresh_jianguoyun();
                 self.show_jianguoyun_shelf(Refresh::Auto, 0)
             }
@@ -1590,7 +1590,7 @@ impl App {
             UiEvent::Action { id, .. } => match id {
                 a::LOCAL => {
                     self.cancel_jianguoyun_on_leave();
-                    self.show_library(Refresh::Full)?;
+                    self.show_library(Refresh::Clean)?;
                 }
                 a::CLOUD => {
                     self.cancel_jianguoyun_on_leave();
@@ -1604,7 +1604,7 @@ impl App {
                     self.cancel_jianguoyun_on_leave();
                     let page = self.list_page();
                     self.refresh_jianguoyun();
-                    self.show_jianguoyun_shelf(Refresh::Full, page)?;
+                    self.show_jianguoyun_shelf(Refresh::Clean, page)?;
                 }
                 a::CONFIGURE => {
                     self.cancel_jianguoyun_on_leave();
@@ -1614,7 +1614,7 @@ impl App {
                     self.cancel_jianguoyun_on_leave();
                     if self.jianguoyun_configured() {
                         self.jianguoyun.message = None;
-                        self.show_jianguoyun_shelf(Refresh::Full, 0)?;
+                        self.show_jianguoyun_shelf(Refresh::Clean, 0)?;
                         self.refresh_jianguoyun();
                     } else {
                         self.open_jianguoyun_login()?;
@@ -1881,6 +1881,9 @@ impl App {
         remote_progress: &JianguoyunProgress,
         allow_backward: bool,
     ) -> Result<bool, Error> {
+        if self.asleep.is_some() {
+            return Ok(false);
+        }
         if !matches!(&self.screen, Screen::Reader(r) if r.session.id == book) {
             return Ok(false);
         }

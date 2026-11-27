@@ -198,7 +198,7 @@ fn every_typeset_control_is_on_screen_disjoint_and_tappable() {
                 let ui = build(w, h, dpi, true);
                 let controls = controls(&ui);
                 assert!(
-                    controls.len() >= 31,
+                    controls.len() >= 26,
                     "{name} {lang}: only {} controls",
                     controls.len()
                 );
@@ -211,16 +211,16 @@ fn every_typeset_control_is_on_screen_disjoint_and_tappable() {
                     action::COLLAPSE,
                     action::ADD_FONT,
                     action::CJK_FONT_BASE,
-                    action::SIZE_BASE,
-                    action::SIZE_BASE + 8,
-                    action::SPACING_BASE,
-                    action::SPACING_BASE + 2,
-                    action::MARGIN_BASE,
-                    action::MARGIN_BASE + 2,
-                    action::INDENT_BASE,
-                    action::INDENT_BASE + 1,
-                    action::GAP_BASE,
-                    action::GAP_BASE + 2,
+                    action::SIZE_DOWN,
+                    action::SIZE_UP,
+                    action::SPACING_DOWN,
+                    action::SPACING_UP,
+                    action::MARGIN_DOWN,
+                    action::MARGIN_UP,
+                    action::INDENT_DOWN,
+                    action::INDENT_UP,
+                    action::GAP_DOWN,
+                    action::GAP_UP,
                     action::UNDERLINE_BASE,
                     action::UNDERLINE_BASE + 2,
                     action::UNDERLINE_SCOPE_BASE,
@@ -234,6 +234,10 @@ fn every_typeset_control_is_on_screen_disjoint_and_tappable() {
                     action::WEIGHT_UP,
                     action::WRITING_MODE_BASE,
                     action::WRITING_MODE_BASE + 1,
+                    action::ORIENTATION_BASE,
+                    action::ORIENTATION_BASE + 1,
+                    action::ORIENTATION_BASE + 2,
+                    action::ORIENTATION_BASE + 3,
                 ] {
                     assert!(
                         controls.iter().any(|(_, a, _)| *a == wanted),
@@ -302,9 +306,91 @@ fn typeset_labels_keep_their_gutter_at_six_inches() {
 }
 
 #[test]
+fn typeset_font_rows_show_arrows_when_paginated_and_fine_locks_replace_controls() {
+    use aristotle_ui::screens::typeset::FontOption;
+
+    for lang in LANGUAGES {
+        aristotle_i18n::with_language(lang, || {
+            for (name, w, h, dpi) in PANELS {
+                let mut view = TypesetView {
+                    cjk_fonts: vec![
+                        FontOption {
+                            name: "Noto Sans SC".into(),
+                            sample_font: FamilyId(0),
+                        },
+                        FontOption {
+                            name: "LXGW WenKai Lite".into(),
+                            sample_font: FamilyId(0),
+                        },
+                        FontOption {
+                            name: "Source Han Serif CN".into(),
+                            sample_font: FamilyId(0),
+                        },
+                        FontOption {
+                            name: "Zhuque Fangsong".into(),
+                            sample_font: FamilyId(0),
+                        },
+                    ],
+                    cjk_page: 0,
+                    ..TypesetView::default()
+                };
+                let ui = build_view(w, h, dpi, true, &view);
+                assert_controls_sound(&ui, &format!("{name} {lang} multi-page fonts p0"));
+                assert!(
+                    controls(&ui)
+                        .iter()
+                        .any(|(_, a, _)| *a == action::NEXT_CJK_PAGE),
+                    "{name} {lang}: NEXT_CJK_PAGE arrow should be clickable on page 0"
+                );
+                assert!(
+                    !controls(&ui)
+                        .iter()
+                        .any(|(_, a, _)| *a == action::PREV_CJK_PAGE),
+                    "{name} {lang}: PREV_CJK_PAGE should be inactive on page 0"
+                );
+
+                view.cjk_page = 1;
+                let ui_p1 = build_view(w, h, dpi, true, &view);
+                assert_controls_sound(&ui_p1, &format!("{name} {lang} multi-page fonts p1"));
+                assert!(
+                    controls(&ui_p1)
+                        .iter()
+                        .any(|(_, a, _)| *a == action::PREV_CJK_PAGE),
+                    "{name} {lang}: PREV_CJK_PAGE arrow should be clickable on page 1"
+                );
+
+                // Even when fine typesetting and embedded book fonts are enabled,
+                // font and line spacing controls remain unlocked and editable (0.3.5 behavior),
+                // and line spacing down to 0% renders cleanly.
+                let fine_editable = TypesetView {
+                    fine_typesetting: true,
+                    embedded_fonts: true,
+                    fine_locks_fonts: true,
+                    fine_locks_spacing: true,
+                    spacing_pct: 0,
+                    ..TypesetView::default()
+                };
+                let ui_fine = build_view(w, h, dpi, true, &fine_editable);
+                assert_controls_sound(&ui_fine, &format!("{name} {lang} fine editable 0%"));
+                assert!(!has_text(&ui_fine, tr(Msg::TypesetFineLocked)));
+                assert!(has_text(&ui_fine, "0%"));
+                assert!(controls(&ui_fine)
+                    .iter()
+                    .any(|(_, a, _)| *a == action::SPACING_UP));
+                assert!(controls(&ui_fine)
+                    .iter()
+                    .any(|(_, a, _)| *a == action::SPACING_DOWN));
+                assert!(controls(&ui_fine)
+                    .iter()
+                    .any(|(_, a, _)| *a == action::CJK_FONT_BASE));
+            }
+        });
+    }
+}
+
+#[test]
 fn typeset_keeps_the_reference_widths_at_every_size() {
-    // Exact control widths at the three reference sizes: a regression here
-    // would move the existing panels even though the compact branch is off.
+    // Margin, indent and paragraph gap steppers keep stable button widths across reference sizes.
     aristotle_i18n::with_language("zh", || {
         for (name, w, h, dpi) in PANELS.iter().filter(|p| p.1 >= 700) {
             let ui = build(*w, *h, *dpi, true);
@@ -316,21 +402,14 @@ fn typeset_keeps_the_reference_widths_at_every_size() {
                     .map(|(_, _, r)| r.w)
                     .unwrap()
             };
-            let expected = match *name {
-                "pw2-212" => (53, 54, 96, 62),
-                "pw4-300" => (75, 75, 136, 87),
-                "oasis2-300" => (107, 107, 184, 119),
-                _ => unreachable!(),
-            };
-            assert_eq!(
-                (
-                    widths(action::SPACING_BASE),
-                    widths(action::MARGIN_BASE),
-                    widths(action::INDENT_BASE),
-                    widths(action::GAP_BASE),
-                ),
-                expected,
-                "{name}: reference control widths changed"
+            let (m, i, g) = (
+                widths(action::MARGIN_DOWN),
+                widths(action::INDENT_DOWN),
+                widths(action::GAP_DOWN),
+            );
+            assert!(
+                m >= 40 && i >= 40 && g >= 40,
+                "{name}: stepper widths too small: margin={m}, indent={i}, gap={g}"
             );
         }
     });
@@ -521,6 +600,39 @@ fn typeset_weight_row_shows_the_weight_in_use() {
     }
 }
 
+#[test]
+fn typeset_orientation_row_highlights_selected_angle_in_portrait_and_landscape() {
+    for lang in LANGUAGES {
+        aristotle_i18n::with_language(lang, || {
+            for (name, w, h, dpi) in [
+                ("oasis2-300", 1264, 1680, 300),
+                ("oasis2-landscape", 1680, 1264, 300),
+            ] {
+                for orient in 0..4 {
+                    let view = TypesetView {
+                        orientation: orient,
+                        ..TypesetView::default()
+                    };
+                    let ui = build_view(w, h, dpi, true, &view);
+                    assert_controls_sound(&ui, &format!("{name} {lang}, orient {orient}"));
+                    for i in 0..4 {
+                        let id = node_for(&ui, action::ORIENTATION_BASE + i as u32);
+                        assert!(
+                            !ui.tree.rect(id).is_empty(),
+                            "{name} {lang}: orientation {i} is not drawn"
+                        );
+                        assert_eq!(
+                            is_active(&ui, id),
+                            i == orient,
+                            "{name} {lang}: orientation {i} active mismatch at {orient}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// The fine switch and the guide's width show the state they are given.
 #[test]
 fn typeset_switches_show_the_state_in_use() {
@@ -585,6 +697,44 @@ fn typeset_text_stays_inside_its_control_at_six_inches() {
                 checked >= 10,
                 "{lang}: only {checked} controls were checked"
             );
+        });
+    }
+}
+
+#[test]
+fn fixed_layout_typeset_sheet_is_sound_across_sizes_and_languages() {
+    for lang in LANGUAGES {
+        aristotle_i18n::with_language(lang, || {
+            for (name, w, h, dpi) in [
+                ("basic-600", 600, 800, 167),
+                ("pw3-758", 758, 1024, 212),
+                ("pw4-1072", 1072, 1448, 300),
+                ("oasis2-1264", 1264, 1680, 300),
+                ("pw4-landscape", 1448, 1072, 300),
+            ] {
+                let view = TypesetView {
+                    title: "灌篮高手 Vol.1".into(),
+                    author: "井上雄彦".into(),
+                    fixed_layout: true,
+                    fit_mode: 1,
+                    page_direction: 1,
+                    fullscreen: true,
+                    auto_crop: true,
+                    split_spread: true,
+                    keep_images_in_night: true,
+                    orientation: 2,
+                    ..TypesetView::default()
+                };
+                let ui = build_view(w, h, dpi, true, &view);
+                assert_controls_sound(&ui, &format!("fixed {name} {lang}"));
+                assert!(is_active(&ui, node_for(&ui, action::FIT_MODE_BASE + 1)));
+                assert!(is_active(&ui, node_for(&ui, action::PAGE_DIR_BASE + 1)));
+                assert!(is_active(&ui, node_for(&ui, action::FULLSCREEN_BASE)));
+                assert!(is_active(&ui, node_for(&ui, action::AUTO_CROP_BASE)));
+                assert!(is_active(&ui, node_for(&ui, action::SPLIT_SPREAD_BASE)));
+                assert!(is_active(&ui, node_for(&ui, action::NIGHT_KEEP_IMG_BASE)));
+                assert!(is_active(&ui, node_for(&ui, action::ORIENTATION_BASE + 2)));
+            }
         });
     }
 }

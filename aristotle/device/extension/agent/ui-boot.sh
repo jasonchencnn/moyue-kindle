@@ -158,7 +158,8 @@ while :; do
     ARISTOTLE_EXIT_ACTIONS=0
     [ ! -r "$S/open-kual.sh" ] || ARISTOTLE_EXIT_ACTIONS=1
     export ARISTOTLE_EXIT_ACTIONS
-    "$APP" "$@" >> "$S/app.log" 2>&1 &
+    ota_dir=${MOYUE_OTA_DIR:-$R/mnt/us/.aristotle/ota}
+    MOYUE_OTA_DIR="$ota_dir" "$APP" "$@" >> "$S/app.log" 2>&1 &
     pid=$!
     echo "$pid" > "$S/app.pid"
     wait "$pid"
@@ -185,6 +186,68 @@ while :; do
         stock "Aristotle requested KUAL"
     fi
     if [ "$rc" = 0 ]; then
+        ota_dir=${MOYUE_OTA_DIR:-$R/mnt/us/.aristotle/ota}
+        ext_dir=${ARISTOTLE_EXT_DIR:-$R/mnt/us/extensions/aristotle}
+        usb_app=${ARISTOTLE_APP_DIR:-$R/mnt/us/aristotle}
+        handover="$ota_dir/handover.conf"
+        if [ ! -f "$handover" ] && [ -f "$usb_app/data/ota/handover.conf" ] && [ ! -L "$usb_app/data/ota/handover.conf" ]; then
+            _legacy_ho="$usb_app/data/ota/handover.conf"
+            _legacy_pkg=$(sed -n 's/^package=//p' "$_legacy_ho" | head -n 1)
+            if mkdir -p "$ota_dir" 2> /dev/null && [ -n "$_legacy_pkg" ] && [ -f "$_legacy_pkg" ] && [ ! -L "$_legacy_pkg" ]; then
+                _pkg_base=$(basename "$_legacy_pkg")
+                if mv "$_legacy_pkg" "$ota_dir/$_pkg_base" 2> /dev/null; then
+                    sed "s|^package=.*|package=$ota_dir/$_pkg_base|" "$_legacy_ho" > "$handover.tmp" \
+                        && mv "$handover.tmp" "$handover" \
+                        && rm -f "$_legacy_ho"
+                fi
+            fi
+        fi
+        if [ -f "$handover" ] && [ ! -L "$handover" ]; then
+            log "OTA handover detected"
+            _ota_tmp="$R/var/tmp/moyue-ota-run.$$"
+            _ota_script="$ext_dir/bin/ota-update.sh"
+            _ota_ok=0
+            if [ -f "$_ota_script" ] && [ ! -L "$_ota_script" ]; then
+                if mkdir -p "$_ota_tmp" 2> /dev/null && cp "$_ota_script" "$_ota_tmp/ota-update.sh" 2> /dev/null; then
+                    _ota_script="$_ota_tmp/ota-update.sh"
+                fi
+                if (cd "${R:-/}" && ARISTOTLE_APP_DIR="$usb_app" ARISTOTLE_EXT_DIR="$ext_dir" \
+                    MOYUE_OTA_DIR="$ota_dir" MOYUE_OTA_PIVOTED=1 sh "$_ota_script" handover) >> "$LOG" 2>&1; then
+                    _ota_ok=1
+                fi
+                rm -rf "$_ota_tmp" 2> /dev/null || true
+            fi
+            if [ "$_ota_ok" = 1 ]; then
+                # Refresh the internal boot copy from the updated USB app so the
+                # restarted instance runs the new version and future boots match.
+                if [ -x "$usb_app/aristotle" ] && [ -d "$usb_app/data" ] && [ -s "$usb_app/SOURCE.txt" ]; then
+                    rm -rf "$S/app.new"
+                    mkdir "$S/app.new"
+                    if cp -r "$usb_app/aristotle" "$usb_app/data" "$usb_app/SOURCE.txt" "$S/app.new/" &&
+                        cp "$usb_app/SOURCE.txt" "$S/app.new/USB-SOURCE.txt" &&
+                        chmod 700 "$S/app.new/aristotle"; then
+                        [ ! -f "$usb_app/VERSION" ] || cp "$usb_app/VERSION" "$S/app.new/VERSION"
+                        sync
+                        rm -rf "$S/app.previous"
+                        [ ! -d "$S/app" ] || mv "$S/app" "$S/app.previous"
+                        if mv "$S/app.new" "$S/app"; then
+                            APP=$S/app/aristotle
+                            set_fails 0
+                            log "OTA handover applied and boot copy updated; restarting app"
+                            continue
+                        fi
+                        [ ! -d "$S/app.previous" ] || mv "$S/app.previous" "$S/app"
+                    fi
+                    rm -rf "$S/app.new"
+                fi
+                log "OTA handover applied to USB app, but refreshing boot copy failed"
+                stock "OTA boot copy refresh failed"
+            else
+                rm -f "$handover"
+                log "OTA handover failed"
+                stock "OTA handover failed"
+            fi
+        fi
         set_fails 0
         stock "Aristotle quit"
     fi

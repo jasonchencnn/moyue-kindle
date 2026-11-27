@@ -366,6 +366,44 @@ impl Model {
             }
         }
     }
+
+    /// Whether this model has dual-tone warm frontlight LEDs.
+    pub const fn has_warm_light(self) -> bool {
+        matches!(
+            self,
+            Model::Oasis3
+                | Model::Paperwhite5
+                | Model::Paperwhite5Se
+                | Model::Paperwhite6
+                | Model::KindleScribe
+                | Model::KindleScribe2
+                | Model::KindleScribe3
+                | Model::ColorSoft
+                | Model::ScribeColorSoft
+        )
+    }
+
+    /// Whether this model has an ambient light sensor (auto-brightness).
+    pub const fn has_als(self) -> bool {
+        matches!(
+            self,
+            Model::Voyage | Model::Oasis2 | Model::Oasis3 | Model::Paperwhite5Se
+        )
+    }
+
+    /// Whether this model has an accelerometer for automatic screen rotation.
+    pub const fn has_accelerometer(self) -> bool {
+        matches!(
+            self,
+            Model::Oasis1
+                | Model::Oasis2
+                | Model::Oasis3
+                | Model::KindleScribe
+                | Model::KindleScribe2
+                | Model::KindleScribe3
+                | Model::ScribeColorSoft
+        )
+    }
 }
 
 /// The framebuffer rotation of a device held upside down.
@@ -677,6 +715,21 @@ impl KoboModel {
                 back: 193,
             }),
         }
+    }
+
+    /// Both Clara HD and Libra 2 carry ComfortLight PRO warm frontlight LEDs.
+    pub const fn has_warm_light(self) -> bool {
+        matches!(self, KoboModel::ClaraHd | KoboModel::Libra2)
+    }
+
+    /// Neither Clara HD nor Libra 2 has an ambient light sensor.
+    pub const fn has_als(self) -> bool {
+        false
+    }
+
+    /// Libra 2 carries an accelerometer; Clara HD does not.
+    pub const fn has_accelerometer(self) -> bool {
+        matches!(self, KoboModel::Libra2)
     }
 }
 

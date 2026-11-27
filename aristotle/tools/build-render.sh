@@ -305,7 +305,7 @@ fi
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 subset "$DL/$DEJAVU/ttf/DejaVuSans.ttf" "$WORK/DejaVuSans-Symbols.ttf" \
-    U+2190-21FF,U+2200-22C5,U+2500-257F,U+25A0-25FF,U+2600-266F,U+2700-2775,U+2B00-2B2F \
+    U+0250-02FF,U+1D00-1DBF,U+2190-21FF,U+2200-22C5,U+2500-25FF,U+2600-266F,U+26A0-26A1,U+2700-2775,U+2B00-2B2F \
     --no-hinting
 cp -p "$DL/$DEJAVU/LICENSE" "$OUT/data/fonts/DejaVuSans-LICENSE.txt"
 NOTO="$B/plato/thirdparty/mupdf/resources/fonts/noto"
@@ -342,6 +342,15 @@ for lang in $HYPH_LANGS; do
     unzip -o -q -j "$DL/$ZIP" "hyphenation-patterns/$lang.standard.bincode" \
         -d "$OUT/data/hyphenation-patterns"
 done
+
+# Built-in StarDict dictionaries (e.g. MIT-licensed xinhua-zh-zh) cached in
+# $ARISTOTLE_CACHE/dicts/ are bundled into data/dicts/ so fresh installs work
+# offline out of the box.
+if [ -d "$ARISTOTLE_CACHE/dicts" ]; then
+    rm -rf "$OUT/data/dicts"
+    mkdir -p "$OUT/data/dicts"
+    cp -R "$ARISTOTLE_CACHE/dicts/." "$OUT/data/dicts/"
+fi
 
 # Licences. The patterns' authors and licences are in the headers of their
 # hyph-utf8 master files, at the commit kl-hyphenate's README names; the

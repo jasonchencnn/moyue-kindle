@@ -138,6 +138,9 @@ pub struct Book {
     /// asks for the vertical layout. The engine has no Plato document, so
     /// [`Book::doc`] holds an empty placeholder then.
     vertical: Option<crate::vertical::Document>,
+    /// Virtual half-page slices for `Engine::Fixed` when `split_spread` is on.
+    /// Empty when spread splitting is disabled.
+    fixed_slices: Vec<crate::fixed::FixedSlice>,
 }
 
 /// A rectangle on the screen, in pixels: `x0..x1`, `y0..y1`.
@@ -204,6 +207,17 @@ pub struct Link {
     pub uri: String,
     pub rect: Bounds,
     pub offset: usize,
+}
+
+/// A resolved book footnote referenced on a rendered page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageFootnote {
+    /// The marker shown in the text (e.g. `"[1]"`, `"①"`, `"注"`), if known.
+    pub marker: String,
+    /// The link pointing to this footnote.
+    pub link: Link,
+    /// The extracted rich text of the footnote.
+    pub text: RichText,
 }
 
 /// A flattened table of contents line.
@@ -513,7 +527,7 @@ impl Book {
             Engine::Crengine => chapter_spine,
             _ => None,
         };
-        Ok(Book {
+        let mut book = Book {
             spine,
             doc,
             engine,
@@ -536,7 +550,10 @@ impl Book {
             underline: Underline::Off,
             underline_scope: UnderlineScope::TextOnly,
             vertical: None,
-        })
+            fixed_slices: Vec::new(),
+        };
+        book.rebuild_fixed_slices();
+        Ok(book)
     }
 
     /// Open `path` with the vertical engine.
@@ -569,7 +586,149 @@ impl Book {
             underline: Underline::Off,
             underline_scope: UnderlineScope::TextOnly,
             vertical: Some(document),
+            fixed_slices: Vec::new(),
         })
+    }
+
+    /// Rebuild the virtual half-page slice table for `Engine::Fixed`.
+    fn rebuild_fixed_slices(&mut self) {
+        if self.engine != Engine::Fixed || !self.style.fixed_layout.split_spread {
+            self.fixed_slices.clear();
+            return;
+        }
+        let count = self.doc.pages_count();
+        let dims = (0..count).map(|i| (i, self.doc.dims(i)));
+        self.fixed_slices = crate::fixed::build_slices(dims, self.style.fixed_layout.direction);
+    }
+
+    /// Resolve a virtual `location` to its physical document page and spread half.
+    fn fixed_slice(&self, location: usize) -> crate::fixed::FixedSlice {
+        if let Some(&slice) = self.fixed_slices.get(location) {
+            slice
+        } else {
+            crate::fixed::FixedSlice {
+                doc_page: location,
+                half: crate::fixed::SpreadHalf::Full,
+            }
+        }
+    }
+
+    /// Rasterise a fixed-layout page (CBZ, PDF) with optional spread splitting,
+    /// automatic white-margin cropping, and fit-mode scaling.
+    fn render_fixed_body(&mut self, location: usize) -> Option<Pixmap> {
+        let slice = self.fixed_slice(location);
+        let (doc_w, doc_h) = self.doc.dims(slice.doc_page)?;
+        let (_, _, vp_w, vp_h) = crate::fixed::viewport_rect(&self.style);
+        let fl = self.style.fixed_layout;
+        let half_w = match slice.half {
+            crate::fixed::SpreadHalf::Full => doc_w,
+            crate::fixed::SpreadHalf::Left | crate::fixed::SpreadHalf::Right => doc_w * 0.5,
+        };
+        let half_h = doc_h;
+
+        if !fl.auto_crop {
+            let scale = crate::fixed::compute_scale(
+                half_w,
+                half_h,
+                doc_w,
+                doc_h,
+                vp_w as f32,
+                vp_h as f32,
+                fl.fit,
+            );
+            let (pm, _) = self.doc.pixmap(Location::Exact(slice.doc_page), scale, 1)?;
+            return if slice.half == crate::fixed::SpreadHalf::Full {
+                Some(pm)
+            } else {
+                let hb = crate::fixed::half_bounds(pm.width, pm.height, slice.half);
+                Some(crate::fixed::crop_pixmap(&pm, hb))
+            };
+        }
+
+        // Auto-crop: probe at modest resolution, detect non-white bounds on
+        // the target half, then re-rasterise at the final fit scale if needed.
+        let probe_w = (vp_w as f32).min(600.0);
+        let probe_h = (vp_h as f32).min(800.0);
+        let probe_scale = crate::fixed::compute_scale(
+            half_w,
+            half_h,
+            doc_w,
+            doc_h,
+            probe_w,
+            probe_h,
+            crate::style::FitMode::FitPage,
+        );
+        let (probe_pm, _) = self
+            .doc
+            .pixmap(Location::Exact(slice.doc_page), probe_scale, 1)?;
+        let probe_half = if slice.half == crate::fixed::SpreadHalf::Full {
+            probe_pm
+        } else {
+            let hb = crate::fixed::half_bounds(probe_pm.width, probe_pm.height, slice.half);
+            crate::fixed::crop_pixmap(&probe_pm, hb)
+        };
+
+        let Some(cb) = crate::fixed::detect_content_bounds(&probe_half) else {
+            // Blank page: fall back to standard fit without cropping.
+            let scale = crate::fixed::compute_scale(
+                half_w,
+                half_h,
+                doc_w,
+                doc_h,
+                vp_w as f32,
+                vp_h as f32,
+                fl.fit,
+            );
+            let (pm, _) = self.doc.pixmap(Location::Exact(slice.doc_page), scale, 1)?;
+            return if slice.half == crate::fixed::SpreadHalf::Full {
+                Some(pm)
+            } else {
+                let hb = crate::fixed::half_bounds(pm.width, pm.height, slice.half);
+                Some(crate::fixed::crop_pixmap(&pm, hb))
+            };
+        };
+
+        let pw = probe_half.width.max(1) as f32;
+        let ph = probe_half.height.max(1) as f32;
+        let u0 = cb.x0 as f32 / pw;
+        let v0 = cb.y0 as f32 / ph;
+        let u1 = cb.x1 as f32 / pw;
+        let v1 = cb.y1 as f32 / ph;
+
+        let crop_doc_w = (half_w * (u1 - u0)).max(1.0);
+        let crop_doc_h = (half_h * (v1 - v0)).max(1.0);
+        let target_scale = crate::fixed::compute_scale(
+            crop_doc_w,
+            crop_doc_h,
+            doc_w,
+            doc_h,
+            vp_w as f32,
+            vp_h as f32,
+            fl.fit,
+        );
+
+        if (target_scale - probe_scale).abs() <= probe_scale * 0.05 {
+            return Some(crate::fixed::crop_pixmap(&probe_half, cb));
+        }
+
+        let (full_pm, _) = self
+            .doc
+            .pixmap(Location::Exact(slice.doc_page), target_scale, 1)?;
+        let half_pm = if slice.half == crate::fixed::SpreadHalf::Full {
+            full_pm
+        } else {
+            let hb = crate::fixed::half_bounds(full_pm.width, full_pm.height, slice.half);
+            crate::fixed::crop_pixmap(&full_pm, hb)
+        };
+        let fw = half_pm.width as f32;
+        let fh = half_pm.height as f32;
+        let final_bounds = Bounds {
+            x0: (u0 * fw).floor() as i32,
+            y0: (v0 * fh).floor() as i32,
+            x1: (u1 * fw).ceil() as i32,
+            y1: (v1 * fh).ceil() as i32,
+        };
+        Some(crate::fixed::crop_pixmap(&half_pm, final_bounds))
     }
 
     /// The geometry the vertical engine lays this book out with.
@@ -698,6 +857,11 @@ impl Book {
             self.style = style.clone();
             self.pages.clear();
             self.complete = false;
+            return Ok(());
+        }
+        if self.engine == Engine::Fixed {
+            self.style = style.clone();
+            self.rebuild_fixed_slices();
             return Ok(());
         }
         let _ = (style, progress);
@@ -900,14 +1064,12 @@ impl Book {
         if self.engine == Engine::Vertical {
             return None;
         }
+        if self.engine == Engine::Fixed {
+            return self.render_fixed_body(location);
+        }
         let scale = match self.engine {
             Engine::Plato | Engine::MupdfReflow => 1.0,
-            Engine::Fixed => {
-                let (w, h) = self.doc.dims(location)?;
-                let (_, body_h) = self.style.body();
-                let m = self.style.margin_px() as f32;
-                ((self.style.width as f32) / w).min((body_h as f32 - 2.0 * m) / h)
-            }
+            Engine::Fixed => unreachable!("handled above"),
             // crengine-ng renders into a gray buffer, not a pixmap.
             Engine::Crengine => return None,
             // The vertical engine renders its own page (see
@@ -923,21 +1085,48 @@ impl Book {
     pub fn compose(&self, body: &Pixmap, folio: &Folio, chrome: &mut Chrome) -> Page {
         let style = &self.style;
         let mut page = Page::white(style);
-        let (top, body_h) = style.body();
+        let (top, _body_h) = style.body();
         let (x, y) = match self.engine {
             Engine::Plato => (0, top),
             Engine::MupdfReflow => (style.margin_px(), top + style.margin_px()),
-            Engine::Fixed => (
-                (style.width as i32 - body.width as i32) / 2,
-                top + (body_h as i32 - body.height as i32) / 2,
-            ),
+            Engine::Fixed => {
+                let (vp_x, vp_y, vp_w, vp_h) = crate::fixed::viewport_rect(style);
+                crate::fixed::place_in_viewport(
+                    body.width as i32,
+                    body.height as i32,
+                    vp_x,
+                    vp_y,
+                    vp_w as i32,
+                    vp_h as i32,
+                    style.fixed_layout.fit,
+                )
+            }
             // crengine-ng renders into a gray buffer, not a pixmap.
             Engine::Crengine => (0, top),
             // The vertical engine renders its own page; nothing to compose.
             Engine::Vertical => (0, top),
         };
         page.blit_pixmap(body, x, y);
-        chrome.draw(&mut page, folio);
+        if self.engine == Engine::Fixed && style.fixed_layout.keep_images_in_night {
+            let screen = Bounds {
+                x0: 0,
+                y0: 0,
+                x1: style.width as i32,
+                y1: style.height as i32,
+            };
+            let art = Bounds {
+                x0: x,
+                y0: y,
+                x1: x + body.width as i32,
+                y1: y + body.height as i32,
+            };
+            if let Some(clipped) = art.intersect(&screen) {
+                page.images.push(clipped);
+            }
+        }
+        if !(self.engine == Engine::Fixed && style.fixed_layout.fullscreen) {
+            chrome.draw(&mut page, folio);
+        }
         page
     }
 
@@ -955,6 +1144,7 @@ impl Book {
             pages: self.known_page_count(),
             progress: self.progress(index, location),
             degraded: false,
+            ..Default::default()
         }
     }
 
@@ -985,6 +1175,9 @@ impl Book {
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
             return self.crengine.as_ref().map_or(0, |doc| doc.page_count());
+        }
+        if self.engine == Engine::Fixed && !self.fixed_slices.is_empty() {
+            return self.fixed_slices.len();
         }
         self.doc.pages_count()
     }
@@ -1026,6 +1219,10 @@ impl Book {
             let next = location + 1;
             return (next < self.len()).then_some(next);
         }
+        if self.engine == Engine::Fixed && !self.fixed_slices.is_empty() {
+            let next = location + 1;
+            return (next < self.fixed_slices.len()).then_some(next);
+        }
         self.doc
             .resolve_location(Location::Next(location))
             .filter(|&n| n > location)
@@ -1043,6 +1240,9 @@ impl Book {
         }
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
+            return location.checked_sub(1);
+        }
+        if self.engine == Engine::Fixed && !self.fixed_slices.is_empty() {
             return location.checked_sub(1);
         }
         self.doc
@@ -1164,8 +1364,18 @@ impl Book {
                 .as_ref()
                 .and_then(|m| m.posmap.as_ref())
                 .map(|m| m.location(*p) as usize),
-            (Engine::MupdfReflow | Engine::Fixed, Position::Page(i)) => {
-                Some((*i).min(len.saturating_sub(1)))
+            (Engine::MupdfReflow, Position::Page(i)) => Some((*i).min(len.saturating_sub(1))),
+            (Engine::Fixed, Position::Page(i)) => {
+                if !self.fixed_slices.is_empty() {
+                    let idx = self
+                        .fixed_slices
+                        .iter()
+                        .position(|s| s.doc_page >= *i)
+                        .unwrap_or_else(|| self.fixed_slices.len().saturating_sub(1));
+                    Some(idx)
+                } else {
+                    Some((*i).min(len.saturating_sub(1)))
+                }
             }
             #[cfg(feature = "crengine")]
             (Engine::Crengine, Position::Page(i)) => Some((*i).min(len.saturating_sub(1))),
@@ -1231,6 +1441,7 @@ impl Book {
                     Position::Fraction(location as f32 / self.len().max(1) as f32)
                 }
             }
+            Engine::Fixed => Position::Page(self.fixed_slice(location).doc_page),
             _ => Position::Page(location),
         }
     }
@@ -1281,9 +1492,12 @@ impl Book {
             pages: self.known_page_count(),
             progress: self.fraction(location),
             degraded,
+            ..Default::default()
         };
         let mut page = self.compose(&body, &folio, chrome);
-        page.images = self.images(location);
+        if self.engine == Engine::Plato {
+            page.images = self.images(location);
+        }
         Ok(page)
     }
 
@@ -1304,7 +1518,9 @@ impl Book {
             .ok_or_else(|| format_err!("can't render page {}", index + 1))?;
         let folio = self.folio(index, location);
         let mut page = self.compose(&body, &folio, chrome);
-        page.images = self.images(location);
+        if self.engine == Engine::Plato {
+            page.images = self.images(location);
+        }
         Ok(page)
     }
 
@@ -1380,6 +1596,7 @@ impl Book {
             pages: self.known_page_count(),
             progress: self.fraction(location),
             degraded,
+            ..Default::default()
         };
         chrome.draw(&mut page, &folio);
         Ok(page)
@@ -1431,6 +1648,7 @@ impl Book {
             pages: self.known_page_count(),
             progress: self.fraction(location),
             degraded,
+            ..Default::default()
         };
         let mut page = Page::white(&self.style);
         page.blit_gray_buffer(&buffer, 0, top);
@@ -1763,7 +1981,11 @@ impl Book {
     }
 
     #[cfg(feature = "crengine")]
-    fn crengine_footnote(&mut self, link: &Link, link_text: &str) -> Option<RichText> {
+    fn crengine_footnote_with_marker(
+        &mut self,
+        link: &Link,
+        link_text: &str,
+    ) -> Option<(String, RichText)> {
         let spine = self.spine.as_ref()?;
         let (source_path, target_path, anchor) = {
             let uri = &link.uri;
@@ -1787,7 +2009,7 @@ impl Book {
         if self.notes.is_none() {
             self.notes = notes::Source::open(&self.source);
         }
-        self.notes.as_mut()?.footnote_target(
+        self.notes.as_mut()?.footnote_target_with_marker(
             source_path.as_deref(),
             &target_path,
             &anchor,
@@ -1798,9 +2020,20 @@ impl Book {
     /// The note behind `link` if it is a footnote (see [`crate::notes`]);
     /// `link_text` is the marker the link shows.
     pub fn footnote(&mut self, link: &Link, link_text: &str) -> Option<RichText> {
+        self.footnote_with_marker(link, link_text)
+            .map(|(_, text)| text)
+    }
+
+    /// Like [`Book::footnote`], also returning the resolved marker text
+    /// without needing `words()` on the page.
+    pub fn footnote_with_marker(
+        &mut self,
+        link: &Link,
+        link_text: &str,
+    ) -> Option<(String, RichText)> {
         #[cfg(feature = "crengine")]
         if self.engine == Engine::Crengine {
-            return self.crengine_footnote(link, link_text);
+            return self.crengine_footnote_with_marker(link, link_text);
         }
         if self.engine != Engine::Plato {
             return None;
@@ -1809,7 +2042,55 @@ impl Book {
         if self.notes.is_none() {
             self.notes = notes::Source::open(&self.source);
         }
-        self.notes.as_mut()?.footnote(&base, &link.uri, link_text)
+        self.notes
+            .as_mut()?
+            .footnote_with_marker(&base, &link.uri, link_text)
+    }
+
+    /// All book footnotes referenced on the page at `location`, deduplicated
+    /// by target URI while preserving document order.
+    pub fn page_footnotes(&mut self, location: usize) -> Vec<PageFootnote> {
+        let links = self.links(location);
+        if links.is_empty() {
+            return Vec::new();
+        }
+        let mut seen = Vec::new();
+        let mut out = Vec::new();
+        for link in links {
+            if seen.iter().any(|u| u == &link.uri) {
+                continue;
+            }
+            seen.push(link.uri.clone());
+            if let Some((marker, text)) = self.footnote_with_marker(&link, "") {
+                out.push(PageFootnote { marker, link, text });
+            }
+        }
+        out
+    }
+
+    /// Publisher fine-typesetting locks detected in the book's EPUB CSS
+    /// (`@font-face` embedded fonts and explicit body `line-height`).
+    pub fn fine_book_locks(&self) -> notes::FineBookLocks {
+        notes::inspect_fine_locks(&self.source)
+    }
+
+    /// Whether the page at `location` contains at least one book footnote.
+    pub fn has_page_footnotes(&mut self, location: usize) -> bool {
+        let links = self.links(location);
+        if links.is_empty() {
+            return false;
+        }
+        let mut seen = Vec::new();
+        for link in links {
+            if seen.iter().any(|u| u == &link.uri) {
+                continue;
+            }
+            seen.push(link.uri.clone());
+            if self.footnote_with_marker(&link, "").is_some() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Start of the page a link in the page at `location` leads to.

@@ -378,6 +378,19 @@ pub fn light_intensity() -> io::Result<u32> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("flIntensity: {e}")))
 }
 
+/// powerd's warm frontlight level, `0..=24` (`flWarmth`), on dual-tone models.
+pub fn warmth_intensity() -> io::Result<u32> {
+    get_prop(POWERD, "flWarmth", true)?
+        .trim()
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("flWarmth: {e}")))
+}
+
+/// Whether ambient-light auto-brightness is enabled in powerd (`alsEnabled`).
+pub fn auto_brightness() -> io::Result<bool> {
+    Ok(get_prop(POWERD, "alsEnabled", true)?.trim() == "1")
+}
+
 pub(crate) fn get_prop(service: &str, prop: &str, int: bool) -> io::Result<String> {
     let mut command = Command::new("lipc-get-prop");
     command
@@ -503,6 +516,24 @@ impl Lipc {
     /// and ramps it down and back up around its screensaver to this value.
     pub fn set_light_intensity(&self, step: u32) {
         self.send(POWERD, "flIntensity", &step.to_string(), true);
+    }
+
+    /// Set powerd's warm frontlight level, `0..=24`, on dual-tone models.
+    pub fn set_warmth_intensity(&self, step: u32) {
+        self.send(POWERD, "flWarmth", &step.to_string(), true);
+    }
+
+    /// Enable or disable ambient-light auto-brightness (`alsEnabled`).
+    pub fn set_auto_brightness(&self, on: bool) {
+        self.send(POWERD, "alsEnabled", if on { "1" } else { "0" }, true);
+    }
+
+    /// Defer kernel suspend by `seconds` while powerd is in `readyToSuspend`.
+    ///
+    /// Verified on Oasis 2 (5.16.2.1.1): keeps both `btfd` (Bluetooth) and
+    /// `wifid` (Wi-Fi) alive while the screen remains locked in screensaver.
+    pub fn defer_suspend(&self, seconds: u32) {
+        self.send(POWERD, "deferSuspend", &seconds.to_string(), true);
     }
 }
 

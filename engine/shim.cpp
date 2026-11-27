@@ -629,6 +629,19 @@ void apply_embedded_styles(LVDocView *view, bool enabled) {
     }
 }
 
+/* 设置书内嵌字体开关。
+ *
+ * 对应 crengine 的 PROP_EMBEDDED_FONTS / DOC_FLAG_ENABLE_DOC_FONTS：
+ * 解析期由 createEmptyDocument() 读取 m_props 落到 doc flags，已打开文档
+ * 切换时同步更新 doc flag，使 @font-face 立即生效或回退到阅读器选定字体。 */
+void apply_embedded_fonts(LVDocView *view, bool enabled) {
+    view->propsGetCurrent()->setBool(PROP_EMBEDDED_FONTS, enabled);
+    ldomDocument *doc = view->getDocument();
+    if (doc != nullptr) {
+        doc->setDocFlag(DOC_FLAG_ENABLE_DOC_FONTS, enabled);
+    }
+}
+
 /* 把请求的基准字重换成字体管理器实际能画好的那一个。
  *
  * crengine 的字面选择是「最近字重」：字面只有 400/700 时，请求 600 会选中
@@ -694,7 +707,8 @@ int resolve_base_weight_locked(LVDocView *view, int weight) {
  * propsApply()（它会 requestRender，把已经翻到的页清掉）。
  *
  * font_weight 越界时钳到 100..900；<= 0 时按 400 处理。 */
-void apply_fine_typesetting(LVDocView *view, bool fine, int font_weight, int dpi) {
+void apply_fine_typesetting(LVDocView *view, bool fine, bool embedded_fonts, int font_weight,
+                            int dpi) {
     if (view == nullptr) {
         return;
     }
@@ -721,17 +735,19 @@ void apply_fine_typesetting(LVDocView *view, bool fine, int font_weight, int dpi
     props->setInt(PROP_REQUESTED_DOM_VERSION, gDOMVersionCurrent);
     // 悬挂标点（crengine 里叫 floating punctuation）。
     props->setBool(PROP_FLOATING_PUNCTUATION, fine);
-    // 书内嵌字体。
-    props->setBool(PROP_EMBEDDED_FONTS, fine);
-    // 页下注（配合 -cr-hint: footnote-inpage，让多看与 EPUB3 脚注在引用页底部呈现）。
-    props->setBool(PROP_FOOTNOTES, fine);
+    // 书内嵌字体：仅在精排开启且用户允许书内字体时启用。
+    props->setBool(PROP_EMBEDDED_FONTS, fine && embedded_fonts);
+    // 页下注关闭：注释已收进阅读器弹窗中展示，不再在每页底部重复排印注释原文。
+    props->setBool(PROP_FOOTNOTES, false);
     // 激活 CJK 语言管线：精排模式默认按 zh-CN 启用简中标点挤压表与 libunibreak
     // 中文避头尾禁则，并开启内嵌语言识别（书内 xml:lang="zh-TW"/"ja"/"en" 自动切换）。
     props->setString(PROP_TEXTLANG_MAIN_LANG, fine ? lString32(U"zh-CN") : lString32(U"en"));
     props->setBool(PROP_TEXTLANG_EMBEDDED_LANGS_ENABLED, fine);
-    // HarfBuzz kerning/shaping：3 = KERNING_MODE_HARFBUZZ（完整 shaping，
-    // 含连字、字偶距、CJK 标点挤压与中西文 1/4em 留白）。关掉精排时不启用。
-    props->setInt(PROP_FONT_KERNING, fine ? KERNING_MODE_HARFBUZZ : KERNING_MODE_DISABLED);
+    // 字偶距与 CJK 精排：使用 KERNING_MODE_FREETYPE（非 DISABLED 即激活 lvtextfm.cpp
+    // 的全部 CJK 标点挤压、灵活宽度与中西文 1/4em 留白，同时保留西文 FreeType kerning
+    // 并走单字符宽度缓存）。避免对整本几十万汉字走 KERNING_MODE_HARFBUZZ 逐段全量 shaping
+    // 导致低主频 ARM 墨水屏首次开书耗时放大 3~5 倍。关掉精排时不启用。
+    props->setInt(PROP_FONT_KERNING, fine ? KERNING_MODE_FREETYPE : KERNING_MODE_DISABLED);
     // 自动 hinting 是 crengine 的现代默认；传统模式用 FreeType 的字节码
     // 解释器。两者都不改变行宽（只影响字形栅格化）。
     props->setInt(PROP_FONT_HINTING,
@@ -851,15 +867,18 @@ void apply_layout(LVDocView *view, const CrLayout &layout) {
     if (layout.font_size > 0) {
         view->setFontSize(layout.font_size);
     }
-    if (layout.line_spacing_percent > 0) {
+    if (layout.line_spacing_percent >= 0) {
         view->setDefaultInterlineSpace(layout.line_spacing_percent);
     }
     // 精排属性要在文档解析前就位（DOM 版本、block rendering 标志、内嵌
     // 字体），文档已建好时它们会触发重排。字重是全局设置，每次渲染前
     // 还会再按文档自己的值设一次。
-    apply_fine_typesetting(view, layout.fine_typesetting != 0, layout.font_weight, layout.dpi);
+    const bool fine = layout.fine_typesetting != 0;
+    const bool allow_doc_fonts = fine && (layout.embedded_fonts != 0);
+    apply_fine_typesetting(view, fine, allow_doc_fonts, layout.font_weight, layout.dpi);
     // 文档已经建好了，这里要重新打一次标记：换排版参数时可能改了开关。
     apply_embedded_styles(view, layout.embedded_styles != 0);
+    apply_embedded_fonts(view, allow_doc_fonts);
     // lvRect(left, top, right, bottom) 记的是页边距，不是页面矩形。
     view->setPageMargins(lvRect(layout.margin_left, layout.margin_top, layout.margin_right,
                                  layout.margin_bottom));
@@ -885,7 +904,7 @@ void apply_render_globals(LVDocView *view, bool fine, int font_weight, int rende
     if (fontMan == nullptr) {
         return;
     }
-    const kerning_mode_t kerning = fine ? KERNING_MODE_HARFBUZZ : KERNING_MODE_DISABLED;
+    const kerning_mode_t kerning = fine ? KERNING_MODE_FREETYPE : KERNING_MODE_DISABLED;
     if (fontMan->GetKerningMode() != kerning) {
         fontMan->SetKerningMode(kerning);
     }

@@ -52,6 +52,20 @@ impl Scope {
         Some(Scope { root, path })
     }
 
+    /// The scope for `path` under `root`, allowing the top-level `fonts` folder
+    /// (used when choosing the designated fonts directory).
+    pub fn new_allowing_fonts(root: &Path, path: &Path) -> Option<Scope> {
+        let root = fs::canonicalize(root).ok()?;
+        let path = fs::canonicalize(path).ok()?;
+        if !path.starts_with(&root) || !path.is_dir() {
+            return None;
+        }
+        if excluded_relative_allowing_fonts(&root, &path) {
+            return None;
+        }
+        Some(Scope { root, path })
+    }
+
     /// The scope of the scan root itself: the whole store.
     pub fn whole(root: &Path) -> Option<Scope> {
         Scope::new(root, root)
@@ -83,6 +97,16 @@ impl Scope {
     /// `books` is a list of the indexed paths, relative to the root. The
     /// app's own folders and the hidden ones are left out.
     pub fn folders(&self, books: &[String]) -> Vec<ScopeFolder> {
+        self.folders_filtered(books, false)
+    }
+
+    /// Like [`Scope::folders`], but keeps the top-level `fonts` folder visible
+    /// so the user can pick it as the designated fonts directory or scan it.
+    pub fn folders_allowing_fonts(&self, books: &[String]) -> Vec<ScopeFolder> {
+        self.folders_filtered(books, true)
+    }
+
+    fn folders_filtered(&self, books: &[String], allow_fonts: bool) -> Vec<ScopeFolder> {
         let entries = match fs::read_dir(&self.path) {
             Ok(e) => e,
             Err(_) => return Vec::new(),
@@ -102,7 +126,12 @@ impl Scope {
             }
             // The app's own folders sit at the root of the store; deeper
             // ones with the same name are the reader's own.
-            if self.is_whole() && excluded_relative(&self.root, &path) {
+            let excluded = if allow_fonts {
+                excluded_relative_allowing_fonts(&self.root, &path)
+            } else {
+                excluded_relative(&self.root, &path)
+            };
+            if self.is_whole() && excluded {
                 continue;
             }
             let relative = relative_of(&self.root, &path);
@@ -159,6 +188,23 @@ pub fn excluded_relative(root: &Path, path: &Path) -> bool {
         .ok()
         .and_then(|relative| relative.components().next())
         .is_some_and(|part| excluded_store_folder(&part.as_os_str().to_string_lossy()))
+}
+
+/// Like [`excluded_relative`], but allows the top-level `fonts` and `koreader`
+/// folders so users can pick `/mnt/us/fonts` or `/mnt/us/koreader/fonts`.
+pub fn excluded_relative_allowing_fonts(root: &Path, path: &Path) -> bool {
+    if root != Path::new(KINDLE_STORE) {
+        return false;
+    }
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|part| {
+            let name = part.as_os_str().to_string_lossy();
+            !name.eq_ignore_ascii_case("fonts")
+                && !name.eq_ignore_ascii_case("koreader")
+                && excluded_store_folder(&name)
+        })
 }
 
 /// The canonical folders to scan for the reader's `selected` sources, given

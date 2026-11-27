@@ -7,6 +7,8 @@
 
 use std::time::Duration;
 
+use crate::transfer::names::{self, Kind};
+
 /// How a transfer is doing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Stage {
@@ -37,6 +39,8 @@ pub struct Received {
     pub name: String,
     /// Its size in bytes.
     pub size: u64,
+    /// Book, font, or sleep-screen image.
+    pub kind: Kind,
 }
 
 /// What the screen shows while a file is on its way.
@@ -133,8 +137,16 @@ impl State {
 
     /// Notes that a file has arrived in full.
     pub fn add_received(&mut self, name: String, size: u64) {
+        let kind = names::sanitize(&name)
+            .map(|safe| safe.kind)
+            .unwrap_or(Kind::Book);
+        self.add_received_with_kind(name, size, kind);
+    }
+
+    /// Notes that a file of a known [`Kind`] has arrived in full.
+    pub fn add_received_with_kind(&mut self, name: String, size: u64, kind: Kind) {
         self.total_bytes = self.total_bytes.saturating_add(size);
-        self.received.push(Received { name, size });
+        self.received.push(Received { name, size, kind });
         self.stage = Stage::Done;
     }
 

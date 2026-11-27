@@ -15,7 +15,7 @@
 /// whitelist: a file whose extension is not here is refused, not stored.
 pub const BOOK_EXTENSIONS: &[&str] = &["epub", "txt", "mobi", "azw3", "pdf", "cbz"];
 /// Font files, which go to the fonts folder instead of the library.
-pub const FONT_EXTENSIONS: &[&str] = &["ttf", "otf"];
+pub const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "ttc"];
 /// Sleep-screen pictures, which go to the `screensavers` folder.
 pub const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png"];
 
@@ -162,6 +162,7 @@ mod tests {
         assert_eq!(sanitize("a.TXT").unwrap().kind, Kind::Book);
         assert_eq!(sanitize("a.ttf").unwrap().kind, Kind::Font);
         assert_eq!(sanitize("a.otf").unwrap().kind, Kind::Font);
+        assert_eq!(sanitize("a.ttc").unwrap().kind, Kind::Font);
         assert_eq!(sanitize("a.jpg").unwrap().kind, Kind::Image);
         assert_eq!(sanitize("a.exe").unwrap_err(), NameError::Unsupported);
         assert_eq!(sanitize("a").unwrap_err(), NameError::Unsupported);

@@ -246,6 +246,24 @@ impl Sleep {
         self.lipc.power_button();
     }
 
+    /// Set warm frontlight step (`0..=24`) via powerd on dual-tone models.
+    pub fn set_warmth(&self, step: u32) {
+        self.lipc.set_warmth_intensity(step);
+    }
+
+    /// Enable or disable ambient-light auto-brightness via powerd.
+    pub fn set_auto_brightness(&self, on: bool) {
+        self.lipc.set_auto_brightness(on);
+    }
+
+    /// Defer kernel suspend by `seconds` while powerd is in `readyToSuspend`,
+    /// keeping both Bluetooth (`btfd`) and Wi-Fi (`wifid`) awake for online TTS.
+    pub fn defer_suspend(&self, seconds: u32) {
+        if self.managed() {
+            self.lipc.defer_suspend(seconds);
+        }
+    }
+
     /// Work due now: restarting powerd's idle timer while awake, and the
     /// fallbacks when powerd does not answer.
     pub fn tick(&mut self, now: Instant, asleep: bool) -> Action {

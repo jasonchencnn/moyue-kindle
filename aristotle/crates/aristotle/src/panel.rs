@@ -72,16 +72,11 @@ pub const FLASH: FbWaveform = FbWaveform::GCK16;
 pub const CLEAN: FbWaveform = FbWaveform::GLKW16;
 
 /// Partial updates (DU and GL16, not A2 or [`CLEAN`]) allowed between two
-/// full-screen updates before the next settled update becomes a flash.
-/// Six is KOReader's default full-refresh interval ("Full refresh rate:
-/// every 6 pages"; from KOReader's settings, not measured here). A2 does
-/// not count: it is always cleaned by a [`CLEAN`] update.
+/// full-screen flashes before the next settled update becomes a flash.
 pub const PARTIALS_PER_FLASH: u32 = 6;
-/// The same limit by area: partial and [`CLEAN`] region updates adding up
-/// to this many screens since the last full-screen update. An inference:
-/// region updates leave residue at their edges, and three screens' worth
-/// is about one settings page of toggles.
-pub const PARTIAL_SCREENS_PER_FLASH: i64 = 3;
+/// The same limit by area: partial and non-flashing [`CLEAN`] updates adding
+/// up to this many screens since the last flashing full-screen update.
+pub const PARTIAL_SCREENS_PER_FLASH: i64 = 4;
 
 /// A [`CLEAN`] region at least this share of the screen goes out as one
 /// full-screen update instead: the same panel time, and no edge between
@@ -106,7 +101,8 @@ impl GhostBudget {
     /// Account for one request that went out.
     pub fn note(&mut self, req: Request, rect: Rect) {
         match req {
-            Request::FullScreen(_) => *self = GhostBudget::default(),
+            Request::FullScreen(wf) if wf == FLASH => *self = GhostBudget::default(),
+            Request::FullScreen(_) => self.area += rect.area(),
             Request::Partial(wf) if wf == FbWaveform::A2 => {}
             Request::Partial(_) => {
                 self.partials += 1;
@@ -300,6 +296,127 @@ impl Sequencer {
     }
 }
 
+/// Software rotation step in quarter-turns clockwise (`0..=3`):
+/// - `0`: upright portrait (0°)
+/// - `1`: landscape right (90° CW)
+/// - `2`: upside-down portrait (180°)
+/// - `3`: landscape left (270° CW / 90° CCW)
+pub fn soft_rotate_for(o: aristotle_screen::Orientation) -> u8 {
+    match o {
+        aristotle_screen::Orientation::Portrait | aristotle_screen::Orientation::Auto => 0,
+        aristotle_screen::Orientation::LandscapeRight => 1,
+        aristotle_screen::Orientation::PortraitInverted => 2,
+        aristotle_screen::Orientation::LandscapeLeft => 3,
+    }
+}
+
+/// Logical canvas dimensions `(width, height)` for a physical panel of
+/// `(phys_w, phys_h)` under software rotation `rot` (`0..=3`).
+pub fn logical_size_for(phys_w: u32, phys_h: u32, rot: u8) -> (u32, u32) {
+    match rot & 3 {
+        1 | 3 => (phys_h, phys_w),
+        _ => (phys_w, phys_h),
+    }
+}
+
+/// Map a logical rectangle into physical framebuffer coordinates under `rot`.
+pub fn map_logical_rect(r: Rect, phys_w: u32, phys_h: u32, rot: u8) -> Rect {
+    let pw = phys_w as i32;
+    let ph = phys_h as i32;
+    match rot & 3 {
+        1 => Rect::new(pw - (r.y + r.h), r.x, r.h, r.w),
+        2 => Rect::new(pw - (r.x + r.w), ph - (r.y + r.h), r.w, r.h),
+        3 => Rect::new(r.y, ph - (r.x + r.w), r.h, r.w),
+        _ => r,
+    }
+}
+
+/// Inverse-transform a physical touch coordinate `(px, py)` into logical canvas
+/// coordinates under `rot`.
+pub fn unmap_touch_point(px: i32, py: i32, phys_w: u32, phys_h: u32, rot: u8) -> (i32, i32) {
+    let pw = phys_w as i32;
+    let ph = phys_h as i32;
+    match rot & 3 {
+        1 => (py.clamp(0, ph - 1), (pw - 1 - px).clamp(0, pw - 1)),
+        2 => (
+            (pw - 1 - px).clamp(0, pw - 1),
+            (ph - 1 - py).clamp(0, ph - 1),
+        ),
+        3 => ((ph - 1 - py).clamp(0, ph - 1), px.clamp(0, pw - 1)),
+        _ => (px, py),
+    }
+}
+
+/// Rotate a rectangular region `src_rect` from a logical buffer into a tightly
+/// packed physical-orientation buffer `(pixels, dst_w, dst_h)`.
+pub fn rotate_region(
+    src: &[u8],
+    src_stride: usize,
+    src_rect: Rect,
+    rot: u8,
+    invert: bool,
+) -> (Vec<u8>, usize, usize) {
+    let sx = src_rect.x.max(0) as usize;
+    let sy = src_rect.y.max(0) as usize;
+    let sw = src_rect.w.max(0) as usize;
+    let sh = src_rect.h.max(0) as usize;
+    let (dst_w, dst_h) = match rot & 3 {
+        1 | 3 => (sh, sw),
+        _ => (sw, sh),
+    };
+    let mut out = vec![0u8; dst_w * dst_h];
+    match rot & 3 {
+        1 => {
+            for dy in 0..dst_h {
+                let lx = sx + dy;
+                let dst_row = dy * dst_w;
+                for dx in 0..dst_w {
+                    let ly = sy + sh - 1 - dx;
+                    let v = src[ly * src_stride + lx];
+                    out[dst_row + dx] = if invert { 255 - v } else { v };
+                }
+            }
+        }
+        2 => {
+            for dy in 0..dst_h {
+                let ly = sy + sh - 1 - dy;
+                let src_row = ly * src_stride;
+                let dst_row = dy * dst_w;
+                for dx in 0..dst_w {
+                    let lx = sx + sw - 1 - dx;
+                    let v = src[src_row + lx];
+                    out[dst_row + dx] = if invert { 255 - v } else { v };
+                }
+            }
+        }
+        3 => {
+            for dy in 0..dst_h {
+                let lx = sx + sw - 1 - dy;
+                let dst_row = dy * dst_w;
+                for dx in 0..dst_w {
+                    let ly = sy + dx;
+                    let v = src[ly * src_stride + lx];
+                    out[dst_row + dx] = if invert { 255 - v } else { v };
+                }
+            }
+        }
+        _ => {
+            for dy in 0..dst_h {
+                let src_row = (sy + dy) * src_stride + sx;
+                let dst_row = dy * dst_w;
+                if invert {
+                    for dx in 0..dst_w {
+                        out[dst_row + dx] = 255 - src[src_row + dx];
+                    }
+                } else {
+                    out[dst_row..dst_row + dst_w].copy_from_slice(&src[src_row..src_row + dst_w]);
+                }
+            }
+        }
+    }
+    (out, dst_w, dst_h)
+}
+
 /// The real panel.
 pub struct Device {
     fb: Framebuffer,
@@ -314,6 +431,8 @@ pub struct Device {
     /// Full-screen full-mode updates submitted so far (pages and flashes).
     full_updates: u64,
     ghosts: GhostBudget,
+    /// Software rotation in quarter-turns clockwise (`0..=3`).
+    soft_rotate: u8,
 }
 
 fn fb_rect(r: Rect) -> FbRect {
@@ -341,7 +460,26 @@ impl Device {
             night: None,
             full_updates: 0,
             ghosts: GhostBudget::default(),
+            soft_rotate: 0,
         })
+    }
+
+    /// Physical framebuffer dimensions `(width, height)` before software rotation.
+    pub fn physical_size(&self) -> (u32, u32) {
+        let g = self.fb.geometry();
+        (g.width, g.height)
+    }
+
+    /// Set the software rotation in quarter-turns clockwise (`0..=3`).
+    pub fn set_soft_rotate(&mut self, rot: u8) {
+        self.wait_idle();
+        self.soft_rotate = rot & 3;
+        self.ghosts.reset();
+    }
+
+    /// Current software rotation in quarter-turns clockwise (`0..=3`).
+    pub fn soft_rotate(&self) -> u8 {
+        self.soft_rotate
     }
 
     /// Switch night mode. With [`NightMethod::Software`] the caller inverts
@@ -362,13 +500,20 @@ impl Device {
 
     pub fn size(&self) -> (u32, u32) {
         let g = self.fb.geometry();
-        (g.width, g.height)
+        logical_size_for(g.width, g.height, self.soft_rotate)
     }
 
     /// The framebuffer's rotation, as the driver reports it: 0 when the
     /// content is drawn the way the panel is, 2 when it is turned around.
     pub fn rotate(&self) -> u32 {
         self.fb.geometry().rotate
+    }
+
+    /// Force the kernel framebuffer's `var.rotate` back to the startup value
+    /// bound to the touchscreen, preventing native accelerometer flips on
+    /// wakeup from desynchronizing display and touch.
+    pub fn enforce_fb_rotate(&mut self) -> io::Result<bool> {
+        self.fb.ensure_rotate(self.fb.geometry().rotate)
     }
 
     /// Send a UI frame's damage (see the module documentation).
@@ -399,11 +544,15 @@ impl Device {
                     // No wait: the driver latched the last page when it
                     // started it, and the display thread queues behind it.
                     self.blit_ui(ui, d.rect);
-                    self.display.damage(fb_rect(d.rect), wf, &[]);
+                    let (pw, ph) = self.physical_size();
+                    let phys_r = map_logical_rect(d.rect, pw, ph, self.soft_rotate);
+                    self.display.damage(fb_rect(phys_r), wf, &[]);
                 }
                 Request::Clean(wf) => {
                     self.blit_ui(ui, d.rect);
-                    self.display.damage_full(fb_rect(d.rect), wf, &[]);
+                    let (pw, ph) = self.physical_size();
+                    let phys_r = map_logical_rect(d.rect, pw, ph, self.soft_rotate);
+                    self.display.damage_full(fb_rect(phys_r), wf, &[]);
                 }
             }
         }
@@ -441,10 +590,33 @@ impl Device {
         let page = night_page(page, self.night.is_some());
         let waited = self.wait_idle();
         let rect = self.fb.full_screen();
-        if self.inverts_pixels() {
-            self.fb.blit_inverted(&page.data, page.stride, rect);
+        if self.soft_rotate == 0 {
+            let blit_rect = fb_rect(Rect::new(
+                0,
+                0,
+                page.width.min(rect.width) as i32,
+                page.height.min(rect.height) as i32,
+            ));
+            if self.inverts_pixels() {
+                self.fb.blit_inverted(&page.data, page.stride, blit_rect);
+            } else {
+                self.fb.blit(&page.data, page.stride, blit_rect);
+            }
         } else {
-            self.fb.blit(&page.data, page.stride, rect);
+            let (lw, lh) = self.size();
+            let src_w = page.width.min(lw) as i32;
+            let src_h = page.height.min(lh) as i32;
+            let src_rect = Rect::new(0, 0, src_w, src_h);
+            let (buf, dst_w, _) = rotate_region(
+                &page.data,
+                page.stride,
+                src_rect,
+                self.soft_rotate,
+                self.inverts_pixels(),
+            );
+            let (pw, ph) = self.physical_size();
+            let phys = map_logical_rect(src_rect, pw, ph, self.soft_rotate);
+            self.fb.blit(&buf, dst_w, fb_rect(phys));
         }
         let wf = if flash { FLASH } else { self.turn };
         let m = self.fb.update(rect, wf, true)?;
@@ -460,30 +632,41 @@ impl Device {
         self.full_updates
     }
 
-    /// Whether the panel still holds `ui`'s frame in a band across its
-    /// middle. The takeover does not wait for the stock GUI's 10-13 s
-    /// shutdown, and the GUI can draw its splash over our first frame while
-    /// it goes (measured 5.2 s after the tap, `STARTUP-001`). The watch in
-    /// `App::watch_startup` uses this to notice and repaint.
+    /// Whether the panel still holds `ui`'s frame across three sampled bands
+    /// (upper, middle, lower). The takeover does not wait for the stock GUI's
+    /// 10-13 s shutdown, and the GUI or system screensaver can draw a blank
+    /// frame over our framebuffer (`STARTUP-001`, sleep-screen watch).
     fn still_shows_ui(&self, ui: &Ui) -> bool {
-        const ROWS: u32 = 64;
+        if self.soft_rotate != 0 {
+            return true;
+        }
+        const ROWS: u32 = 32;
         let c = ui.screen();
         let g = self.fb.geometry();
-        let top = (g.height / 2).saturating_sub(ROWS / 2);
-        if top + ROWS > c.height {
+        let height = c.height.min(g.height);
+        if height < ROWS {
             return true;
         }
         let width = c.width.min(g.width) as usize;
         let stride = g.stride as usize;
-        let band = self.fb.rows(top, ROWS);
-        if band.len() != ROWS as usize * stride {
-            return true;
+        for frac in [1u32, 2, 3] {
+            let top = (height * frac / 4)
+                .saturating_sub(ROWS / 2)
+                .min(height - ROWS);
+            let band = self.fb.rows(top, ROWS);
+            if band.len() != ROWS as usize * stride {
+                return true;
+            }
+            let matches = (0..ROWS as usize).all(|r| {
+                let fb = &band[r * stride..r * stride + width];
+                let canvas = &c.pixels[(top as usize + r) * c.stride as usize..][..width];
+                fb == canvas
+            });
+            if !matches {
+                return false;
+            }
         }
-        (0..ROWS as usize).all(|r| {
-            let fb = &band[r * stride..r * stride + width];
-            let canvas = &c.pixels[(top as usize + r) * c.stride as usize..][..width];
-            fb == canvas
-        })
+        true
     }
 
     fn track(&mut self, marker: Option<u32>, label: &str) {
@@ -536,8 +719,15 @@ impl Device {
             return;
         };
         let stride = c.stride as usize;
-        let start = r.y as usize * stride + r.x as usize;
-        self.fb.blit(&c.pixels[start..], stride, fb_rect(r));
+        if self.soft_rotate == 0 {
+            let start = r.y as usize * stride + r.x as usize;
+            self.fb.blit(&c.pixels[start..], stride, fb_rect(r));
+        } else {
+            let (buf, dst_w, _) = rotate_region(&c.pixels, stride, r, self.soft_rotate, false);
+            let (pw, ph) = self.physical_size();
+            let phys = map_logical_rect(r, pw, ph, self.soft_rotate);
+            self.fb.blit(&buf, dst_w, fb_rect(phys));
+        }
     }
 
     fn blit_ui_wait(&mut self, ui: &Ui, rect: Rect) -> io::Result<()> {
@@ -579,6 +769,7 @@ pub struct Memory {
     turn: FbWaveform,
     night: Option<NightMethod>,
     ghosts: GhostBudget,
+    soft_rotate: u8,
 }
 
 impl Memory {
@@ -593,7 +784,21 @@ impl Memory {
             turn: FbWaveform(turn_mode),
             night: None,
             ghosts: GhostBudget::default(),
+            soft_rotate: 0,
         }
+    }
+
+    pub fn set_soft_rotate(&mut self, rot: u8) {
+        self.soft_rotate = rot & 3;
+        self.ghosts.reset();
+    }
+
+    pub fn soft_rotate(&self) -> u8 {
+        self.soft_rotate
+    }
+
+    pub fn logical_size(&self) -> (u32, u32) {
+        logical_size_for(self.width, self.height, self.soft_rotate)
     }
 
     /// Whether the EPDC would invert what it shows (hardware night): the
@@ -603,7 +808,8 @@ impl Memory {
     }
 
     fn all(&self) -> Rect {
-        Rect::new(0, 0, self.width as i32, self.height as i32)
+        let (lw, lh) = self.logical_size();
+        Rect::new(0, 0, lw as i32, lh as i32)
     }
 
     fn copy_ui(&mut self, ui: &Ui, rect: Rect) {
@@ -611,11 +817,22 @@ impl Memory {
         let Some(r) = rect.intersect(&Rect::new(0, 0, c.width as i32, c.height as i32)) else {
             return;
         };
-        for y in r.y..r.y + r.h {
-            let src = y as usize * c.stride as usize + r.x as usize;
-            let dst = y as usize * self.stride + r.x as usize;
-            self.pixels[dst..dst + r.w as usize]
-                .copy_from_slice(&c.pixels[src..src + r.w as usize]);
+        if self.soft_rotate == 0 {
+            for y in r.y..r.y + r.h {
+                let src = y as usize * c.stride as usize + r.x as usize;
+                let dst = y as usize * self.stride + r.x as usize;
+                self.pixels[dst..dst + r.w as usize]
+                    .copy_from_slice(&c.pixels[src..src + r.w as usize]);
+            }
+        } else {
+            let (buf, dst_w, dst_h) =
+                rotate_region(&c.pixels, c.stride as usize, r, self.soft_rotate, false);
+            let phys = map_logical_rect(r, self.width, self.height, self.soft_rotate);
+            for dy in 0..dst_h {
+                let dst = (phys.y as usize + dy) * self.stride + phys.x as usize;
+                let src = dy * dst_w;
+                self.pixels[dst..dst + dst_w].copy_from_slice(&buf[src..src + dst_w]);
+            }
         }
     }
 
@@ -663,13 +880,27 @@ impl Memory {
     fn show_page(&mut self, page: &Page, flash: bool, label: &str) {
         let page = night_page(page, self.night.is_some());
         let invert = self.night == Some(NightMethod::Software);
-        for y in 0..self.height as usize {
-            let src = y * page.stride;
-            let dst = y * self.stride;
+        if self.soft_rotate == 0 {
+            let h = (page.height as usize).min(self.height as usize);
             let w = (page.width as usize).min(self.width as usize);
-            let row = &page.data[src..src + w];
-            for (d, s) in self.pixels[dst..dst + w].iter_mut().zip(row) {
-                *d = if invert { 255 - *s } else { *s };
+            for y in 0..h {
+                let src = y * page.stride;
+                let dst = y * self.stride;
+                let row = &page.data[src..src + w];
+                for (d, s) in self.pixels[dst..dst + w].iter_mut().zip(row) {
+                    *d = if invert { 255 - *s } else { *s };
+                }
+            }
+        } else {
+            let (lw, lh) = self.logical_size();
+            let src_rect = Rect::new(0, 0, page.width.min(lw) as i32, page.height.min(lh) as i32);
+            let (buf, dst_w, dst_h) =
+                rotate_region(&page.data, page.stride, src_rect, self.soft_rotate, invert);
+            let phys = map_logical_rect(src_rect, self.width, self.height, self.soft_rotate);
+            for dy in 0..dst_h {
+                let dst = (phys.y as usize + dy) * self.stride + phys.x as usize;
+                let src = dy * dst_w;
+                self.pixels[dst..dst + dst_w].copy_from_slice(&buf[src..src + dst_w]);
             }
         }
         let mode = if flash { FLASH.0 } else { self.turn.0 };
@@ -704,7 +935,31 @@ impl Panel {
     pub fn size(&self) -> (u32, u32) {
         match self {
             Panel::Device(d) => d.size(),
+            Panel::Memory(m) => m.logical_size(),
+        }
+    }
+
+    /// Physical panel dimensions `(width, height)` before software rotation.
+    pub fn physical_size(&self) -> (u32, u32) {
+        match self {
+            Panel::Device(d) => d.physical_size(),
             Panel::Memory(m) => (m.width, m.height),
+        }
+    }
+
+    /// Set the software rotation in quarter-turns clockwise (`0..=3`).
+    pub fn set_soft_rotate(&mut self, rot: u8) {
+        match self {
+            Panel::Device(d) => d.set_soft_rotate(rot),
+            Panel::Memory(m) => m.set_soft_rotate(rot),
+        }
+    }
+
+    /// Current software rotation in quarter-turns clockwise (`0..=3`).
+    pub fn soft_rotate(&self) -> u8 {
+        match self {
+            Panel::Device(d) => d.soft_rotate(),
+            Panel::Memory(m) => m.soft_rotate(),
         }
     }
 
@@ -716,6 +971,14 @@ impl Panel {
         match self {
             Panel::Device(d) => d.rotate(),
             Panel::Memory(_) => 0,
+        }
+    }
+
+    /// See [`Device::enforce_fb_rotate`].
+    pub fn enforce_fb_rotate(&mut self) -> io::Result<bool> {
+        match self {
+            Panel::Device(d) => d.enforce_fb_rotate(),
+            Panel::Memory(_) => Ok(false),
         }
     }
 
@@ -766,12 +1029,46 @@ impl Panel {
         }
     }
 
-    /// See [`Device::still_shows_ui`]. A panel in memory always does: tests
-    /// do not have a stock GUI drawing over it.
+    /// See [`Device::still_shows_ui`]. A panel in memory checks its own
+    /// framebuffer pixels so host tests can simulate an external overwrite.
     pub fn still_shows_ui(&self, ui: &Ui) -> bool {
         match self {
             Panel::Device(d) => d.still_shows_ui(ui),
-            Panel::Memory(_) => true,
+            Panel::Memory(m) => {
+                if m.soft_rotate != 0 {
+                    return true;
+                }
+                const ROWS: u32 = 32;
+                let c = ui.screen();
+                let height = c.height.min(m.height);
+                if height < ROWS {
+                    return true;
+                }
+                let width = c.width.min(m.width) as usize;
+                for frac in [1u32, 2, 3] {
+                    let top = (height * frac / 4)
+                        .saturating_sub(ROWS / 2)
+                        .min(height - ROWS);
+                    let matches = (0..ROWS as usize).all(|r| {
+                        let y = top as usize + r;
+                        let fb = &m.pixels[y * m.stride..][..width];
+                        let canvas = &c.pixels[y * c.stride as usize..][..width];
+                        fb == canvas
+                    });
+                    if !matches {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+    }
+
+    /// Block until every submitted panel update has completed.
+    pub fn wait_idle(&mut self) -> Duration {
+        match self {
+            Panel::Device(d) => d.wait_idle(),
+            Panel::Memory(_) => Duration::ZERO,
         }
     }
 
@@ -914,7 +1211,16 @@ mod tests {
         b.note(Request::Partial(FbWaveform::GL16), small);
         assert!(b.spent(SCREEN));
         b.note(Request::FullScreen(FLASH), SCREEN);
-        assert!(!b.spent(SCREEN), "a full-screen update starts over");
+        assert!(!b.spent(SCREEN), "a full-screen flash starts over");
+        for _ in 0..PARTIAL_SCREENS_PER_FLASH {
+            b.note(Request::FullScreen(CLEAN), SCREEN);
+        }
+        assert!(
+            b.spent(SCREEN),
+            "non-flashing clean screens accumulate area"
+        );
+        b.note(Request::FullScreen(FLASH), SCREEN);
+        assert!(!b.spent(SCREEN));
         for _ in 0..PARTIAL_SCREENS_PER_FLASH {
             b.note(Request::Clean(CLEAN), SCREEN);
         }
@@ -1022,5 +1328,47 @@ mod tests {
         assert!(matches!(night_page(&page, false), Cow::Borrowed(_)));
         page.images.clear();
         assert!(matches!(night_page(&page, true), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn software_rotation_maps_pixels_rects_and_touch_consistently_across_all_4_orientations() {
+        let (pw, ph) = (60u32, 80u32);
+        for rot in 0..4u8 {
+            let (lw, lh) = logical_size_for(pw, ph, rot);
+            // Put a unique marker pixel at logical (7, 13).
+            let mut src = vec![0xffu8; (lw * lh) as usize];
+            let (lx, ly) = (7i32, 13i32);
+            src[ly as usize * lw as usize + lx as usize] = 0x2a;
+
+            let full = Rect::new(0, 0, lw as i32, lh as i32);
+            let (rotated, dst_w, dst_h) = rotate_region(&src, lw as usize, full, rot, false);
+            assert_eq!(dst_w, pw as usize);
+            assert_eq!(dst_h, ph as usize);
+
+            // Find the single marker pixel in physical coordinates.
+            let mut found = None;
+            for py in 0..ph as i32 {
+                for px in 0..pw as i32 {
+                    if rotated[py as usize * dst_w + px as usize] == 0x2a {
+                        assert!(found.is_none(), "duplicate marker for rot={rot}");
+                        found = Some((px, py));
+                    }
+                }
+            }
+            let (px, py) = found.expect("marker must survive rotation");
+            // Touching the physical position of that pixel must unmap back to (lx, ly).
+            assert_eq!(
+                unmap_touch_point(px, py, pw, ph, rot),
+                (lx, ly),
+                "touch unmap mismatch for rot={rot}"
+            );
+            // Mapping a 1x1 logical rect at (lx, ly) must land at (px, py).
+            let pr = map_logical_rect(Rect::new(lx, ly, 1, 1), pw, ph, rot);
+            assert_eq!(
+                pr,
+                Rect::new(px, py, 1, 1),
+                "rect map mismatch for rot={rot}"
+            );
+        }
     }
 }

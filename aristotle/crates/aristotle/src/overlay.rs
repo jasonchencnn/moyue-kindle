@@ -798,4 +798,71 @@ mod tests {
         assert_eq!(fit_label("Wikisłownik", 20.0, chars), "Wikisłownik");
         assert_eq!(fit_label("Słownikjęzykapolskiego", 8.0, chars), "Słownik…");
     }
+
+    #[test]
+    fn tapping_outside_footnote_popup_hits_nothing_and_inside_blocks() {
+        use super::{act, popup, Place, PopupSpec};
+        use aristotle_render::richtext::RichText;
+        use aristotle_ui::geom::{Point, Rect, SCREEN_HEIGHT, SCREEN_WIDTH};
+        use aristotle_ui::screens::sheet::Button;
+        use aristotle_ui::text::{FamilyId, TextEngine};
+        use aristotle_ui::theme::Styles;
+        use aristotle_ui::tree::{Hit, Tree};
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../aristotle-render/assets/fonts");
+        let mut text = TextEngine::new(crate::ui_fonts(&dir, &dir).unwrap());
+        let st = Styles::new(FamilyId(0));
+        let mut t = Tree::new();
+        let body = RichText::plain("这是一条书籍自带注释的正文内容。");
+        let close = Button::new(&mut text, &st, "关闭", act::CANCEL);
+        let p = popup(
+            &mut t,
+            &st,
+            &PopupSpec {
+                title: "脚注".into(),
+                subtitle: None,
+                tabs: Vec::new(),
+                body: &body,
+                suggestions: Vec::new(),
+                actions: vec![close],
+                available: SCREEN_WIDTH - 64,
+                place: Place::Bottom,
+                height: 420,
+            },
+        );
+        t.set_root(p.root);
+        let screen = Rect::new(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+        t.layout(screen, &mut text);
+        let sheet_rect = t.rect(p.sheet);
+
+        // Anywhere outside the popup sheet returns Hit::Nothing (Ui emits Tap -> closes popup).
+        for pt in [
+            Point { x: 10, y: 10 },
+            Point {
+                x: SCREEN_WIDTH - 20,
+                y: 20,
+            },
+            Point {
+                x: SCREEN_WIDTH / 2,
+                y: sheet_rect.y / 2,
+            },
+            Point {
+                x: 40,
+                y: sheet_rect.y - 4,
+            },
+        ] {
+            assert_eq!(
+                t.hit(pt),
+                Hit::Nothing,
+                "outside point {pt:?} should dismiss"
+            );
+        }
+        // Inside the popup sheet (non-button body area) returns Hit::Blocked (keeps popup open).
+        let inside = Point {
+            x: sheet_rect.x + sheet_rect.w / 2,
+            y: sheet_rect.y + 40,
+        };
+        assert_eq!(t.hit(inside), Hit::Blocked);
+    }
 }

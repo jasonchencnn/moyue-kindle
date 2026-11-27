@@ -52,9 +52,9 @@ pub const DEFAULT_LATIN: &str = "Literata";
 pub const DEFAULT_CJK: &str = "Noto Sans SC";
 /// Where the stock reader and Aristotle look for the user's fonts.
 pub const DEFAULT_DIR: &str = "/mnt/us/fonts";
-/// Larger files are skipped: CJK superfamilies run to tens of megabytes and
-/// would cost a long copy and memory for little use in this reader.
-pub const MAX_BYTES: u64 = 20 * 1024 * 1024;
+/// Larger files are skipped: most CJK reading fonts (including Source Han,
+/// Founder, LXGW WenKai and TTC collections) fit well under 64 MiB.
+pub const MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// The family list, in the library data directory.
 const LIST_FILE: &str = "fonts.json";
 /// Copies of chosen families, in the library data directory.
@@ -212,11 +212,440 @@ pub fn group(files: Vec<Scanned>) -> Vec<Family> {
     out
 }
 
-/// Whether `path` looks like a font file.
-fn is_font(path: &Path) -> bool {
+/// Whether `path` looks like a font file (`.ttf`, `.otf`, `.ttc`).
+pub fn is_font(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        e.eq_ignore_ascii_case("ttf")
+            || e.eq_ignore_ascii_case("otf")
+            || e.eq_ignore_ascii_case("ttc")
+    })
+}
+
+/// Format label (`TTF`, `OTF`, `TTC`) for a font path.
+pub fn font_format(path: &Path) -> String {
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf"))
+        .map(|e| e.to_ascii_uppercase())
+        .unwrap_or_else(|| "FONT".to_string())
+}
+
+/// Whether a top-level store folder should be skipped when browsing or
+/// scanning for fonts. Unlike book scanning, the root `fonts` folder is
+/// always allowed so users can inspect or keep it as their font directory.
+pub fn excluded_font_store_folder(name: &str) -> bool {
+    if name.eq_ignore_ascii_case("fonts") || name.eq_ignore_ascii_case("koreader") {
+        return false;
+    }
+    aristotle_library::library::excluded_store_folder(name)
+}
+
+/// Resolves a designated fonts folder under `root`, allowing `/mnt/us/fonts`
+/// while still blocking symlinks escaping `root`, hidden segments, and system
+/// folders.
+pub fn resolve_fonts_destination(root: &Path, destination: &Path) -> std::io::Result<PathBuf> {
+    if !destination.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "fonts folder must be absolute",
+        ));
+    }
+    let root = std::fs::canonicalize(root)?;
+    let mut existing = destination.to_path_buf();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let resolved = loop {
+        match std::fs::canonicalize(&existing) {
+            Ok(path) => {
+                break missing
+                    .iter()
+                    .rev()
+                    .fold(path, |path, part| path.join(part));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match (existing.file_name(), existing.parent()) {
+                    (Some(name), Some(parent)) if parent != existing => {
+                        missing.push(name.to_os_string());
+                        existing = parent.to_path_buf();
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "fonts folder cannot be resolved",
+                        ));
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    if !resolved.starts_with(&root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "fonts folder must be inside the scan root",
+        ));
+    }
+    let relative = resolved.strip_prefix(&root).unwrap_or(Path::new(""));
+    for part in relative.components() {
+        if let std::path::Component::Normal(name) = part {
+            if name.to_string_lossy().starts_with('.') {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "fonts folder cannot be hidden",
+                ));
+            }
+        }
+    }
+    if root == Path::new(aristotle_library::library::KINDLE_STORE) {
+        if let Some(std::path::Component::Normal(first)) = relative.components().next() {
+            if excluded_font_store_folder(&first.to_string_lossy()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "fonts folder cannot be a system folder",
+                ));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Effectiveness status of a discovered font file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FontEffectStatus {
+    /// Inside the designated fonts folder and registered with the renderer.
+    Effective,
+    /// Valid font file outside the designated fonts folder (ready to migrate).
+    ValidPendingMigration,
+    /// Inside the designated fonts folder and readable, but not yet registered.
+    ValidNotRegistered,
+    /// File exceeds [`MAX_BYTES`] or is empty.
+    TooLarge,
+    /// File cannot be parsed by FreeType or lacks a family name.
+    Unreadable,
+}
+
+impl FontEffectStatus {
+    /// Whether this font can be migrated into the designated fonts folder.
+    pub fn migratable(self) -> bool {
+        matches!(self, FontEffectStatus::ValidPendingMigration)
+    }
+
+    /// Short localized status label for the scan review list.
+    pub fn label(self) -> &'static str {
+        match self {
+            FontEffectStatus::Effective => tr(Msg::FontStatusEffective),
+            FontEffectStatus::ValidPendingMigration => tr(Msg::FontStatusPending),
+            FontEffectStatus::ValidNotRegistered => tr(Msg::FontStatusNotRegistered),
+            FontEffectStatus::TooLarge => tr(Msg::FontStatusTooLarge),
+            FontEffectStatus::Unreadable => tr(Msg::FontStatusUnreadable),
+        }
+    }
+}
+
+/// A font file discovered during a unified book + font scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredFont {
+    /// Path relative to the scan root.
+    pub path: String,
+    /// Display title: FreeType family name when valid, else file stem.
+    pub title: String,
+    /// Uppercase format (`TTF`, `OTF`, `TTC`).
+    pub format: String,
+    /// Whether the file already lives inside the designated fonts folder.
+    pub in_destination: bool,
+    /// Whether the font is currently effective / valid / why not.
+    pub status: FontEffectStatus,
+}
+
+/// Face names currently registered in crengine's process-wide font manager.
+pub fn registered_crengine_faces() -> Vec<String> {
+    #[cfg(feature = "crengine")]
+    {
+        aristotle_render::crengine::registered_faces()
+    }
+    #[cfg(not(feature = "crengine"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Walks `sources` (or the whole `root` when `sources` is empty) for `.ttf`,
+/// `.otf`, and `.ttc` files and inspects each with FreeType to report whether
+/// it is effective, ready to migrate, or invalid.
+pub fn discover_fonts_in_sources(
+    root: &Path,
+    sources: &[PathBuf],
+    destination: &Path,
+    registered_faces: &[String],
+) -> Vec<DiscoveredFont> {
+    let Ok(canonical_root) = std::fs::canonicalize(root) else {
+        return Vec::new();
+    };
+    let dest_rel = crate::scan_scope::relative_path(
+        &canonical_root,
+        &std::fs::canonicalize(destination).unwrap_or_else(|_| destination.to_path_buf()),
+    );
+    let in_dest = |rel: &str| {
+        !dest_rel.is_empty()
+            && (rel == dest_rel
+                || rel
+                    .strip_prefix(&dest_rel)
+                    .is_some_and(|rest| rest.starts_with('/')))
+    };
+
+    let mut roots: Vec<PathBuf> = if sources.is_empty() {
+        vec![canonical_root.clone()]
+    } else {
+        sources.to_vec()
+    };
+    // Always include the designated fonts folder in whole-store scans so users
+    // can inspect whether fonts already inside it are effective.
+    if sources.is_empty() && destination.is_dir() {
+        if let Ok(canon_dest) = std::fs::canonicalize(destination) {
+            if !roots.iter().any(|r| canon_dest.starts_with(r)) {
+                roots.push(canon_dest);
+            }
+        }
+    }
+
+    let mut found_paths = Vec::new();
+    let mut visited_dirs = std::collections::HashSet::new();
+    let is_kindle_store = canonical_root == Path::new(aristotle_library::library::KINDLE_STORE);
+    for start in roots {
+        collect_font_files(
+            &canonical_root,
+            &start,
+            is_kindle_store,
+            &mut visited_dirs,
+            &mut found_paths,
+        );
+    }
+    found_paths.sort();
+    found_paths.dedup();
+
+    let opener = FontOpener::new().ok();
+    let mut out = Vec::new();
+    for path in found_paths {
+        let rel = crate::scan_scope::relative_path(&canonical_root, &path);
+        if rel.is_empty() {
+            continue;
+        }
+        let format = font_format(&path);
+        let fallback_title = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&rel)
+            .to_string();
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() => m,
+            _ => continue,
+        };
+        let in_destination = in_dest(&rel);
+        let (title, status) = if meta.len() == 0 || meta.len() > MAX_BYTES {
+            (fallback_title, FontEffectStatus::TooLarge)
+        } else if let Some(family) =
+            opener
+                .as_ref()
+                .and_then(|o| o.open(&path).ok())
+                .and_then(|f| {
+                    f.family_name()
+                        .map(str::trim)
+                        .filter(|n| !n.is_empty())
+                        .map(str::to_string)
+                })
+        {
+            let status = if in_destination {
+                if registered_faces.is_empty()
+                    || registered_faces
+                        .iter()
+                        .any(|r| r.eq_ignore_ascii_case(&family))
+                {
+                    FontEffectStatus::Effective
+                } else {
+                    FontEffectStatus::ValidNotRegistered
+                }
+            } else {
+                FontEffectStatus::ValidPendingMigration
+            };
+            (family, status)
+        } else {
+            (fallback_title, FontEffectStatus::Unreadable)
+        };
+        out.push(DiscoveredFont {
+            path: rel,
+            title,
+            format,
+            in_destination,
+            status,
+        });
+    }
+    out
+}
+
+fn collect_font_files(
+    root: &Path,
+    dir: &Path,
+    is_kindle_store: bool,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    out: &mut Vec<PathBuf>,
+) {
+    let Ok(canon) = std::fs::canonicalize(dir) else {
+        return;
+    };
+    if !canon.starts_with(root) || !visited.insert(canon.clone()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&canon) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            if name_str.to_lowercase().ends_with(".sdr") {
+                continue;
+            }
+            if is_kindle_store && canon == root && excluded_font_store_folder(&name_str) {
+                continue;
+            }
+            collect_font_files(root, &path, is_kindle_store, visited, out);
+        } else if ft.is_file() && is_font(&path) {
+            out.push(path);
+        }
+    }
+}
+
+/// Safely migrates one font file (`relative` under `root`) into `destination`.
+///
+/// Copies through a synced temporary file, verifies size and byte equality,
+/// installs into a unique name with `create_new`, syncs the destination
+/// directory, and only then removes the original file.
+pub fn migrate_font(root: &Path, relative: &str, destination: &Path) -> std::io::Result<PathBuf> {
+    use std::io::{Read, Write};
+
+    let canon_root = std::fs::canonicalize(root)?;
+    let source = canon_root.join(relative);
+    let canon_source = std::fs::canonicalize(&source)?;
+    if !canon_source.starts_with(&canon_root) || !canon_source.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "font source is outside the scan root",
+        ));
+    }
+    let dest = resolve_fonts_destination(&canon_root, destination)?;
+    std::fs::create_dir_all(&dest)?;
+    let canon_dest = std::fs::canonicalize(&dest)?;
+    if canon_source.parent() == Some(canon_dest.as_path()) {
+        return Ok(canon_source);
+    }
+
+    let raw_name = canon_source
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "font has no file name")
+        })?;
+
+    let target = {
+        let mut attempt = 0usize;
+        loop {
+            let candidate_name = if attempt == 0 {
+                raw_name.clone()
+            } else {
+                let n = attempt + 1;
+                match raw_name.rsplit_once('.') {
+                    Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+                    _ => format!("{raw_name} ({n})"),
+                }
+            };
+            let candidate = canon_dest.join(&candidate_name);
+            if !candidate.exists() {
+                break candidate;
+            }
+            attempt += 1;
+            if attempt > 9999 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "no free filename in fonts destination",
+                ));
+            }
+        }
+    };
+
+    let temp = canon_dest.join(format!(
+        ".{}.part",
+        target
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default()
+    ));
+    let copy_result = (|| -> std::io::Result<()> {
+        let mut src = std::fs::File::open(&canon_source)?;
+        let mut dst = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = src.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&buf[..n])?;
+        }
+        dst.flush()?;
+        dst.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = copy_result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+
+    // Verify byte-for-byte before renaming and removing source.
+    let same = (|| -> std::io::Result<bool> {
+        let m1 = std::fs::metadata(&canon_source)?;
+        let m2 = std::fs::metadata(&temp)?;
+        if m1.len() != m2.len() {
+            return Ok(false);
+        }
+        let mut f1 = std::fs::File::open(&canon_source)?;
+        let mut f2 = std::fs::File::open(&temp)?;
+        let mut b1 = [0u8; 64 * 1024];
+        let mut b2 = [0u8; 64 * 1024];
+        loop {
+            let n1 = f1.read(&mut b1)?;
+            let n2 = f2.read(&mut b2)?;
+            if n1 != n2 || b1[..n1] != b2[..n2] {
+                return Ok(false);
+            }
+            if n1 == 0 {
+                return Ok(true);
+            }
+        }
+    })()?;
+    if !same {
+        let _ = std::fs::remove_file(&temp);
+        return Err(std::io::Error::other("font copy verification failed"));
+    }
+
+    std::fs::rename(&temp, &target)?;
+    if let Ok(dir) = std::fs::File::open(&canon_dest) {
+        let _ = dir.sync_all();
+    }
+    std::fs::remove_file(&canon_source)?;
+    if let Some(parent) = canon_source.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(target)
 }
 
 /// The font files in `dir` (not its subfolders), sorted, with their
@@ -385,6 +814,410 @@ fn resolve(data_dir: &Path, dir: &Path, name: &str) -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// Script group a reading font belongs to (Chinese/CJK vs Western/Latin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FontScript {
+    /// Chinese / Japanese / Korean body font.
+    Cjk,
+    /// Western / Latin body font.
+    Latin,
+}
+
+/// Known Western / Latin font families whose names may contain ambiguous words
+/// (such as "Gothic" in "Century Gothic" or "Franklin Gothic").
+const KNOWN_LATIN_PATTERNS: &[&str] = &[
+    "literata",
+    "charis",
+    "gentium",
+    "bookerly",
+    "caecilia",
+    "amazon ember",
+    "baskerville",
+    "palatino",
+    "garamond",
+    "georgia",
+    "helvetica",
+    "times new roman",
+    "arial",
+    "verdana",
+    "tahoma",
+    "trebuchet",
+    "century gothic",
+    "franklin gothic",
+    "trade gothic",
+    "news gothic",
+    "copperplate gothic",
+    "bank gothic",
+    "didot",
+    "bodoni",
+    "caslon",
+    "minion",
+    "myriad",
+    "frutiger",
+    "futura",
+    "gill sans",
+    "optima",
+    "avenir",
+    "sabon",
+    "bembo",
+    "janson",
+    "rockwell",
+    "clarendon",
+    "cambria",
+    "calibri",
+    "candara",
+    "consolas",
+    "constantia",
+    "corbel",
+    "segoe",
+    "roboto",
+    "open sans",
+    "lato",
+    "montserrat",
+    "merriweather",
+    "lora",
+    "crimson",
+    "fira",
+    "inter",
+    "jetbrains",
+    "cascadia",
+    "ubuntu",
+    "dejavu",
+    "liberation",
+    "atkinson",
+    "spectral",
+    "alegreya",
+    "vollkorn",
+    "bitter",
+    "ibm plex",
+    "pt serif",
+    "pt sans",
+    "stix",
+    "linux libertine",
+    "linux biolinum",
+    "tex gyre",
+    "charter",
+    "iowan",
+    "new york",
+    "san francisco",
+    "sf pro",
+    "sf mono",
+    "sf compact",
+    "cochin",
+    "hoefler",
+    "american typewriter",
+    "courier",
+    "monaco",
+    "menlo",
+];
+
+/// Known Chinese / CJK font families, foundries, and romanized style names.
+///
+/// Matched case-insensitively against the FreeType family name so CJK fonts
+/// with English metadata (such as `LXGW WenKai Lite`, `Source Han Serif CN`,
+/// `Zhuque Fangsong`, `FZShuSong`, `HYQiHei`, `PingFang`, `SimSun`, `MiSans`)
+/// are classified into the Chinese font row rather than the Western row.
+const KNOWN_CJK_PATTERNS: &[&str] = &[
+    // Open-source & popular e-ink Chinese reading fonts
+    "lxgw",
+    "wenkai",
+    "xihei",
+    "source han",
+    "siyuan",
+    "zhuque",
+    "huiwen",
+    "kinghwa",
+    "jinghua",
+    "wenyue",
+    "canger",
+    "tsanger",
+    "smiley sans",
+    "zcool",
+    "wenquanyi",
+    "fandol",
+    "sarasa",
+    "genwan",
+    "genyo",
+    "genryu",
+    "genseki",
+    "gensen",
+    "genjyuu",
+    "cwtex",
+    "ar pl",
+    "i.ming",
+    "oradano",
+    "hanazono",
+    "babelstone han",
+    "plangothic",
+    "maple mono cn",
+    "ma shan zheng",
+    "zhi mang xing",
+    "liu jian mao cao",
+    "long cang",
+    "jiangcheng",
+    "jinling",
+    "chillround",
+    "chillkai",
+    "yozai",
+    "hanyi",
+    "founder",
+    "fangzheng",
+    "zhongyi",
+    "changfangsong",
+    // System & commercial CJK fonts (Windows, macOS, Android, OEM)
+    "simsun",
+    "nsimsun",
+    "simhei",
+    "simkai",
+    "simfang",
+    "simli",
+    "simyou",
+    "kaiti",
+    "fangsong",
+    "songti",
+    "heiti",
+    "yahei",
+    "jhenghei",
+    "dengxian",
+    "mingliu",
+    "pmingliu",
+    "dfkai",
+    "pingfang",
+    "stsong",
+    "stkaiti",
+    "stfangsong",
+    "stheiti",
+    "stxihei",
+    "stzhongsong",
+    "stxinwei",
+    "stxingkai",
+    "stcaiyun",
+    "sthupo",
+    "stliti",
+    "lisu",
+    "youyuan",
+    "lantinghei",
+    "lanting",
+    "baoli",
+    "hannotate",
+    "hanzipen",
+    "libian",
+    "lingwai",
+    "wawati",
+    "weibei",
+    "xingkai",
+    "yuanti",
+    "yuppy",
+    "biaukai",
+    "hiragino sans gb",
+    "hiragino mincho",
+    "hiragino kaku",
+    "hiragino maru",
+    "misans",
+    "harmonyos sans sc",
+    "harmonyos sans tc",
+    "puhuiti",
+    "alibaba sans",
+    "oppo sans",
+    "vivo sans",
+    "honor sans",
+    "droid sans fallback",
+    // Common Chinese romanized style suffixes/words
+    "shusong",
+    "biaosong",
+    "xinsong",
+    "cusong",
+    "zhongsong",
+    "yansong",
+    "xiaobiaosong",
+    "mingti",
+    "yuansong",
+    "keshu",
+    // Japanese / Korean CJK reading families
+    "kozuka",
+    "yumincho",
+    "yugothic",
+    "meiryo",
+    "ms mincho",
+    "ms gothic",
+    "ms pmincho",
+    "ms pgothic",
+    "ipaex",
+    "ipamincho",
+    "ipagothic",
+    "shippori",
+    "klee",
+    "biz ud",
+    "nanum",
+    "malgun",
+    "batang",
+    "dotum",
+    "gulim",
+    "gungsuh",
+    "pretendard",
+    "spoqa",
+];
+
+/// Foundry prefixes commonly used in Chinese commercial/free font family names
+/// (Founder `FZ*`, Hanyi `HY*`, DynaFont `DF*`, Arphic `AR*`, Taiwan `TW-*`,
+/// WeRead/QQ `WR*` / `DK-*`).
+const KNOWN_CJK_PREFIXES: &[&str] = &["fz", "hy", "df", "tw-", "han "];
+
+/// Regional/script tokens that identify a CJK variant when appearing as a
+/// standalone word (e.g. `Noto Serif SC`, `Source Han Serif CN`, `Noto Sans HK`).
+const CJK_REGION_TOKENS: &[&str] = &["cjk", "sc", "tc", "cn", "hk", "tw", "jp", "kr", "gb", "gbk"];
+
+fn is_cjk_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x2E80..=0x2EFF
+            | 0x3000..=0x30FF
+            | 0x3100..=0x312F
+            | 0x31A0..=0x31BF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2FA1F
+    )
+}
+
+/// Classify a font family name using the built-in Chinese / Western font
+/// knowledge base. Returns `Some(FontScript)` when the name matches a known
+/// rule, or `None` when the name is unrecognized and file-level inspection
+/// should be consulted.
+pub fn classify_font_name_known(name: &str) -> Option<FontScript> {
+    if name.chars().any(is_cjk_char) {
+        return Some(FontScript::Cjk);
+    }
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+
+    // Explicit CJK knowledge base matches take precedence before generic Latin
+    // prefixes (e.g. `Source Han Serif CN` vs `Source Serif`, `Noto Sans SC` vs `Noto Sans`).
+    if KNOWN_CJK_PATTERNS.iter().any(|pat| lower.contains(pat)) {
+        return Some(FontScript::Cjk);
+    }
+
+    // Standalone regional/script tokens such as `SC`, `TC`, `CN`, `CJK`, `HK`, `JP`, `KR`.
+    if lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| CJK_REGION_TOKENS.contains(&tok))
+    {
+        return Some(FontScript::Cjk);
+    }
+
+    // Foundry prefixes like `FZShuSong-Z01`, `HYQiHei-55S`, `DFKai-SB`, `TW-Kai`.
+    if KNOWN_CJK_PREFIXES.iter().any(|prefix| {
+        lower.starts_with(prefix)
+            && (prefix.ends_with('-')
+                || prefix.ends_with(' ')
+                || name.len() > prefix.len()
+                    && name
+                        .as_bytes()
+                        .get(prefix.len())
+                        .is_some_and(|b| b.is_ascii_uppercase() || *b == b'-' || *b == b'_'))
+    }) {
+        return Some(FontScript::Cjk);
+    }
+
+    if KNOWN_LATIN_PATTERNS.iter().any(|pat| lower.contains(pat)) {
+        return Some(FontScript::Latin);
+    }
+
+    None
+}
+
+/// Inspect a TTF/OTF/TTC font file's SFNT `OS/2` table to determine whether it
+/// declares CJK Unicode or codepage coverage.
+///
+/// Reads only the table directory and the 86-byte `OS/2` header, so it stays
+/// fast even on large 20+ MiB CJK fonts.
+fn sfnt_declares_cjk(path: &Path) -> Option<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header).ok()?;
+
+    let sfnt_offset: u64 = if &header[0..4] == b"ttcf" {
+        let num_fonts = u32::from_be_bytes(header[8..12].try_into().ok()?);
+        if num_fonts == 0 {
+            return None;
+        }
+        u32::from_be_bytes(header[12..16].try_into().ok()?) as u64
+    } else {
+        0
+    };
+
+    file.seek(SeekFrom::Start(sfnt_offset)).ok()?;
+    let mut table_dir_hdr = [0u8; 12];
+    file.read_exact(&mut table_dir_hdr).ok()?;
+    let sfnt_tag = &table_dir_hdr[0..4];
+    if sfnt_tag != [0x00, 0x01, 0x00, 0x00] && sfnt_tag != b"OTTO" && sfnt_tag != b"true" {
+        return None;
+    }
+    let num_tables = u16::from_be_bytes(table_dir_hdr[4..6].try_into().ok()?) as usize;
+    let mut os2_offset_len: Option<(u64, u32)> = None;
+    let mut rec = [0u8; 16];
+    for _ in 0..num_tables.min(128) {
+        file.read_exact(&mut rec).ok()?;
+        if &rec[0..4] == b"OS/2" {
+            let offset = u32::from_be_bytes(rec[8..12].try_into().ok()?) as u64;
+            let length = u32::from_be_bytes(rec[12..16].try_into().ok()?);
+            os2_offset_len = Some((offset, length));
+            break;
+        }
+    }
+    let (offset, length) = os2_offset_len?;
+    if length < 58 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let read_len = (length as usize).min(86);
+    let mut os2 = [0u8; 86];
+    file.read_exact(&mut os2[..read_len]).ok()?;
+
+    let version = u16::from_be_bytes([os2[0], os2[1]]);
+    // ulUnicodeRange2 is at byte offset 46..50:
+    // bit 27 (0x0800_0000) = CJK Unified Ideographs (U+4E00..U+9FFF)
+    let unicode_range_2 = u32::from_be_bytes([os2[46], os2[47], os2[48], os2[49]]);
+    let has_cjk_ideographs = (unicode_range_2 & (1 << 27)) != 0;
+
+    // For OS/2 version >= 1, ulCodePageRange1 is at byte offset 78..82:
+    // bit 17 = JIS/Japan, bit 18 = Chinese Simplified, bit 19 = Korean, bit 20 = Chinese Traditional
+    let has_cjk_codepage = if version >= 1 && read_len >= 82 {
+        let cp1 = u32::from_be_bytes([os2[78], os2[79], os2[80], os2[81]]);
+        (cp1 & ((1 << 17) | (1 << 18) | (1 << 19) | (1 << 20))) != 0
+    } else {
+        false
+    };
+
+    Some(has_cjk_ideographs || has_cjk_codepage)
+}
+
+/// Classify a font family name into [`FontScript::Cjk`] or [`FontScript::Latin`]
+/// using the font knowledge base alone.
+#[cfg(test)]
+pub fn classify_font_name(name: &str) -> FontScript {
+    classify_font_name_known(name).unwrap_or(FontScript::Latin)
+}
+
+/// Classify a scanned [`Family`] into [`FontScript::Cjk`] or [`FontScript::Latin`]:
+/// checks the font knowledge base first, and falls back to inspecting the
+/// regular font file's SFNT `OS/2` CJK coverage bits for unrecognized names.
+pub fn classify_family(family: &Family) -> FontScript {
+    if let Some(known) = classify_font_name_known(&family.name) {
+        return known;
+    }
+    if let Some(true) = sfnt_declares_cjk(&family.regular().path) {
+        return FontScript::Cjk;
+    }
+    FontScript::Latin
 }
 
 /// Which font group is being configured in the reader menu.
@@ -599,11 +1432,19 @@ impl App {
             ui: Some(FamilyId(0)),
             pick: Some(Pick::Default),
         }];
+        let registered = registered_crengine_faces();
         for f in &families {
             let ui = self.ui_family(f);
+            let status = if registered.is_empty()
+                || registered.iter().any(|r| r.eq_ignore_ascii_case(&f.name))
+            {
+                Some(tr(Msg::FontStatusEffective))
+            } else {
+                Some(tr(Msg::FontStatusNotRegistered))
+            };
             rows.push(FontRow {
                 name: f.name.clone(),
-                meta: mark(&f.name, None),
+                meta: mark(&f.name, status),
                 ui: Some(ui),
                 pick: Some(Pick::Family(Box::new(f.clone()))),
             });
@@ -888,5 +1729,56 @@ mod tests {
         let q = resolve(&dir, &user, "Charis").unwrap();
         assert_ne!(p, q);
         assert!(!p.exists());
+    }
+
+    #[test]
+    fn font_knowledge_base_classifies_chinese_and_western_fonts() {
+        for cjk in [
+            "LXGW WenKai Lite",
+            "LXGW WenKai Screen",
+            "Source Han Serif CN",
+            "Source Han Sans CN",
+            "Zhuque Fangsong",
+            "Noto Serif SC",
+            "Noto Sans CJK TC",
+            "FZShuSong-Z01",
+            "HYQiHei-55S",
+            "SimSun",
+            "PingFang SC",
+            "MiSans",
+            "Alibaba PuHuiTi 3.0",
+            "KingHwa_OldSong",
+            "霞鹜文楷",
+            "方正书宋",
+            "Sarasa Gothic SC",
+        ] {
+            assert_eq!(
+                classify_font_name(cjk),
+                FontScript::Cjk,
+                "{cjk} should be classified as CJK"
+            );
+        }
+        for latin in [
+            "Literata",
+            "Charis",
+            "Gentium Book",
+            "Bookerly",
+            "Georgia",
+            "Baskerville",
+            "Century Gothic",
+            "Franklin Gothic",
+            "EB Garamond",
+            "Merriweather",
+            "Source Serif 4",
+            "Noto Serif",
+            "Inter",
+            "Roboto",
+        ] {
+            assert_eq!(
+                classify_font_name(latin),
+                FontScript::Latin,
+                "{latin} should be classified as Latin"
+            );
+        }
     }
 }

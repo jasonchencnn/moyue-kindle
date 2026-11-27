@@ -1,6 +1,7 @@
 #!/bin/sh
 # Name: 墨阅
 # Author: 墨阅
+# Icon: /mnt/us/aristotle/moyue-icon.png
 # DontUseFBInk
 #
 # SH Integration 书库入口：启动本机已安装的墨阅应用。

@@ -57,6 +57,7 @@ mod cloud;
 mod covers;
 mod custom_quotes;
 mod device;
+mod device_settings;
 mod dict;
 mod fonts;
 mod jianguoyun;
@@ -87,6 +88,7 @@ mod stats;
 mod sync;
 mod transition;
 mod translate;
+mod tts;
 mod turns;
 mod usb_watch;
 mod wake;
@@ -121,6 +123,7 @@ use aristotle_ui::input::{Direction, Phase, TouchEvent};
 use aristotle_ui::keyboard::KeyboardState;
 use aristotle_ui::nav as ui_nav;
 use aristotle_ui::screens::about as ui_about;
+use aristotle_ui::screens::bluetooth_settings as bt_ui;
 use aristotle_ui::screens::book_actions::{
     self as ui_actions, ActionStep, ActionsSheet, BookActionInfo,
 };
@@ -129,25 +132,32 @@ use aristotle_ui::screens::calendar as ui_cal;
 use aristotle_ui::screens::cloud as ui_cloud;
 use aristotle_ui::screens::coming_soon as ui_soon;
 use aristotle_ui::screens::home as ui_home;
+use aristotle_ui::screens::key_settings as keys_ui;
 use aristotle_ui::screens::library::{self as ui_lib, CoverMode, Filter, View};
 use aristotle_ui::screens::marks as ui_marks;
 use aristotle_ui::screens::mine as ui_mine;
 use aristotle_ui::screens::ota as ui_ota;
+use aristotle_ui::screens::pin_lock as pin_ui;
 use aristotle_ui::screens::quote_add as ui_quote_add;
 use aristotle_ui::screens::quotes as ui_quotes;
 use aristotle_ui::screens::reader as ui_reader;
 use aristotle_ui::screens::reader::{
     action as menu_action, Menu, MenuSpec, ProgressNodes, Settings,
 };
+use aristotle_ui::screens::reader_bars as bars_ui;
 use aristotle_ui::screens::readest_login as ui_readest_login;
 use aristotle_ui::screens::scan as ui_scan;
 use aristotle_ui::screens::search as ui_search;
 use aristotle_ui::screens::settings::{self as set_ui, SystemView, LIGHT_PRESETS, SLEEP_MINUTES};
 use aristotle_ui::screens::sleep;
 use aristotle_ui::screens::sleep_images as ui_sleep_images;
+use aristotle_ui::screens::time_settings as time_ui;
+use aristotle_ui::screens::tts_player as tts_player_ui;
+use aristotle_ui::screens::tts_settings as tts_set_ui;
 use aristotle_ui::screens::typeset as ui_typeset;
 use aristotle_ui::screens::weread_shelf as ui_weread_shelf;
 use aristotle_ui::screens::wifi as ui_wifi;
+use aristotle_ui::screens::wifi_settings as wifi_set_ui;
 use aristotle_ui::status::{Loading, LoadingNodes};
 use aristotle_ui::text::{FamilyId, FontData, Fonts, TextEngine};
 use aristotle_ui::theme::Styles;
@@ -170,10 +180,9 @@ use crate::shelf::{Covers, HomeModel, Nav, ShelfModel, Target, SORTS};
 use crate::speed::Speed;
 use crate::stats::Stats;
 use crate::translate::Service as TranslateService;
+use crate::tts::{Event as TtsEvent, Service as TtsService};
 use crate::turns::{Intent, Turn, TurnGestures};
-use aristotle_i18n::{
-    fmt_clock_date, fmt_clock_day, fmt_clock_weekday, fmt_time, tf, tr, trn, Msg, Plural,
-};
+use aristotle_i18n::{fmt_clock_date, fmt_clock_day, fmt_clock_weekday, tf, tr, trn, Msg, Plural};
 
 static START: OnceLock<Instant> = OnceLock::new();
 
@@ -414,6 +423,13 @@ fn run() -> Result<u8, Error> {
     }
 
     let mut prefs = Prefs::load(&args.library);
+    system::set_clock_offset(prefs.clock_offset_secs);
+    system::set_clock_24h(prefs.clock_24h);
+    if let Some(tz_id) = prefs.timezone.as_deref() {
+        if let Some(tz) = aristotle_screen::find_timezone(tz_id) {
+            system::apply_timezone(tz.posix_tz, tz.id);
+        }
+    }
     if let Some(mode) = args.turn_mode {
         if mode != prefs::STOCK_TURN && mode != prefs::DU4_TURN {
             eprintln!(
@@ -421,6 +437,9 @@ fn run() -> Result<u8, Error> {
             );
         }
         prefs.turn_mode = mode;
+        let _ = prefs.save(&args.library);
+    } else if prefs.turn_mode == prefs::DU4_TURN {
+        prefs.turn_mode = prefs::STOCK_TURN;
         let _ = prefs.save(&args.library);
     }
     if let Some(m) = args.night_method {
@@ -522,10 +541,13 @@ fn run() -> Result<u8, Error> {
     result.map(|()| code)
 }
 
-/// Where to look for dictionaries: `--dict`, else the device defaults.
+/// Where to look for dictionaries: `--dict`, else the device defaults plus
+/// the bundled `data/dicts` directory shipped with the app.
 fn dict_dirs(args: &Args) -> Vec<PathBuf> {
     if args.dicts.is_empty() {
-        dict::SEARCH_DIRS.iter().map(PathBuf::from).collect()
+        let mut dirs: Vec<PathBuf> = dict::SEARCH_DIRS.iter().map(PathBuf::from).collect();
+        dirs.push(args.data.join("dicts"));
+        dirs
     } else {
         args.dicts.clone()
     }
@@ -651,14 +673,20 @@ fn build_app(
         }
         _ => UsbMode::Disconnected,
     };
+    let initial_fonts_dir = prefs
+        .fonts_destination
+        .as_deref()
+        .and_then(|p| fonts::resolve_fonts_destination(&scan_root(&args.root), p).ok())
+        .unwrap_or_else(|| args.fonts.clone());
     let mut app = App {
         panel,
         light,
         light_wanted: std::cell::Cell::new(light_wanted),
+        pending_light_restore: std::cell::Cell::new(None),
         battery: Battery::open().ok(),
         mobi_cache: args.library.join("epub-cache"),
         root: args.root.clone(),
-        data: args.data.clone(),
+        data: args.library.clone(),
         ota: ota::State::new(ota::current_version()),
         ota_generation: 0,
         ota_busy: false,
@@ -684,12 +712,17 @@ fn build_app(
         pending_delete_quote: None,
         home_clock: clock_minute(),
         startup_watch: None,
+        sleep_watch: None,
+        screensaver_blanket_dirty: false,
         light_off_by_app: false,
         last_touch: Instant::now(),
         sleep_ctl,
         swallow: false,
         dict: Some(dict),
         translate: None,
+        tts: None,
+        tts_defer_at: None,
+        lan_input: None,
         speed: Speed::load(&args.library),
         stats: Stats::new(&args.library),
         exports: export_paths(args),
@@ -703,8 +736,17 @@ fn build_app(
         jianguoyun: jianguoyun::JianguoyunState::default(),
         weread: weread::WereadState::new(),
         catalogs: catalogs::CatalogState::default(),
-        fonts_dir: args.fonts.clone(),
+        fonts_dir: initial_fonts_dir,
         font_faces: HashMap::new(),
+        device_caps: device_settings::DeviceCaps::detect(),
+        reboot_armed: false,
+        cache_status: None,
+        font_picker_return: None,
+        scan_kind: ScanKind::Books,
+        scan_return: None,
+        wifi_was_on_before_sleep: false,
+        bt_worker: None,
+        time_sync: device_settings::TimeSyncState::default(),
         exit_target: launcher::Target::Kindle,
         settings_message: None,
         kual_available: launcher::kual_available(),
@@ -741,10 +783,26 @@ fn build_app(
     app.jianguoyun.preload_cache(app.lib.data_dir());
     app.load_font();
     app.apply_night();
-    // The home page is where the reader is expected to land: it holds the
-    // book being read. Without such a book there is nothing to continue,
-    // and the library is the better first screen.
-    if crate::shelf::current_book(&app.lib).is_some() {
+    aristotle_ui::status::set_show_battery_pct(app.prefs.show_battery_pct);
+    app.apply_orientation(aristotle_screen::Orientation::from_index(
+        app.prefs.orientation,
+    ));
+    // If an app passcode (PIN) is configured, lock at startup before showing
+    // the library or home screen.
+    if app.prefs.app_pin_hash.is_some() {
+        app.show_pin_lock(
+            Refresh::Full,
+            pin_ui::PinMode::Unlock,
+            String::new(),
+            None,
+            None,
+            0,
+            None,
+        )?;
+    } else if crate::shelf::current_book(&app.lib).is_some() {
+        // The home page is where the reader is expected to land: it holds the
+        // book being read. Without such a book there is nothing to continue,
+        // and the library is the better first screen.
         app.show_home(Refresh::Full)?;
     } else {
         app.show_library(Refresh::Full)?;
@@ -862,6 +920,32 @@ fn should_save_progress(
 // One screen exists at a time and it is never moved in a hot path, so the
 // size difference between the variants costs nothing.
 #[allow(clippy::large_enum_variant)]
+/// Where the back button of the reader bars screen leads.
+enum ReaderBarsReturn {
+    Settings(usize),
+    Reader {
+        reading: Box<Reading>,
+        initial_config: aristotle_screen::ReaderBarConfig,
+    },
+}
+
+/// Where [`Screen::TtsSettings`] returns when the user taps Back.
+enum TtsSettingsReturn {
+    Settings(usize),
+    TtsPlayer(Box<TtsPlayerState>),
+}
+
+/// Live state held by [`Screen::TtsPlayer`] while reading aloud.
+struct TtsPlayerState {
+    reader: Box<Reading>,
+    chunks: Vec<String>,
+    chunk_index: usize,
+    current_text: String,
+    next_text: Option<String>,
+    paused: bool,
+    error: Option<String>,
+}
+
 enum Screen {
     /// The first section: the book being read and the books opened lately.
     Home {
@@ -907,6 +991,66 @@ enum Screen {
     Settings {
         ids: Option<set_ui::Settings>,
         page: usize,
+    },
+    /// Reader top & bottom bars customization screen.
+    ReaderBars {
+        ids: bars_ui::ReaderBarsUi,
+        page: usize,
+        back: ReaderBarsReturn,
+    },
+    /// Wi-Fi & airplane mode management screen.
+    WifiSettings {
+        ids: wifi_set_ui::WifiSettingsUi,
+        page: usize,
+        settings_page: usize,
+        networks: Vec<aristotle_hal::wifi::WifiNetwork>,
+        message: Option<String>,
+    },
+    /// Bluetooth page-turner management screen (power, discovery, PIN/Passkey pairing).
+    BluetoothSettings {
+        ids: bt_ui::BluetoothSettingsUi,
+        page: usize,
+        settings_page: usize,
+        devices: Vec<aristotle_hal::bluetooth::BluetoothDevice>,
+        scanning: bool,
+        message: Option<String>,
+        auth_prompt: Option<bt_ui::BluetoothAuthPrompt>,
+    },
+    /// Dedicated TTS (audiobook) settings screen: API & voice configuration.
+    TtsSettings {
+        ids: tts_set_ui::TtsSettingsUi,
+        back: TtsSettingsReturn,
+        message: Option<String>,
+        editor: Option<tts_set_ui::FieldEditor>,
+    },
+    /// Dedicated TTS audiobook playback screen with live paragraph text and
+    /// main control popup for temporary voice/speed adjustments.
+    TtsPlayer {
+        ids: tts_player_ui::TtsPlayerUi,
+        state: Box<TtsPlayerState>,
+    },
+    /// Time & timezone configuration screen.
+    TimeSettings {
+        ids: time_ui::TimeSettingsUi,
+        page: usize,
+        settings_page: usize,
+        message: Option<String>,
+    },
+    /// Hardware page-turn keys & touch zones configuration screen.
+    KeySettings {
+        ids: keys_ui::KeySettingsUi,
+        page: usize,
+        settings_page: usize,
+    },
+    /// 4-digit PIN lock and passcode management screen.
+    PinLock {
+        mode: pin_ui::PinMode,
+        digits: String,
+        first_pin: Option<String>,
+        error: Option<String>,
+        settings_page: usize,
+        /// Screen to restore once `PinMode::Unlock` succeeds after wakeup.
+        resume: Option<Box<Screen>>,
     },
     /// The page that picks the screensaver's own picture.
     SleepImages {
@@ -1115,7 +1259,7 @@ fn clock_text() -> ui_home::ClockText {
     let Some(t) = system::local_time() else {
         return text;
     };
-    text.time = fmt_time(t.hour, t.minute);
+    text.time = aristotle_screen::format_clock_hm(t.hour, t.minute, system::clock_24h());
     text.date = fmt_clock_date(t.month, t.day, t.weekday);
     text.month_day = fmt_clock_day(t.month, t.day);
     text.weekday = fmt_clock_weekday(t.weekday);
@@ -1169,6 +1313,16 @@ struct StartupWatch {
     repairs: u8,
 }
 
+/// Completion messages sent by the background Bluetooth scan / pairing thread.
+enum BluetoothWorkerMsg {
+    ScanDone(Vec<aristotle_hal::bluetooth::BluetoothDevice>),
+    PairDone {
+        name: String,
+        outcome: aristotle_hal::bluetooth::PairOutcome,
+        devices: Vec<aristotle_hal::bluetooth::BluetoothDevice>,
+    },
+}
+
 struct App {
     panel: Panel,
     light: Option<Frontlight>,
@@ -1178,6 +1332,8 @@ struct App {
     /// a read then returns a partly dimmed step, and repeated presses of
     /// the power button ratcheted the light down to off (H-008).
     light_wanted: std::cell::Cell<u32>,
+    /// Temporarily dimmed frontlight during a flashing night refresh: `(restore_at, saved_step)`.
+    pending_light_restore: std::cell::Cell<Option<(Instant, u32)>>,
     battery: Option<Battery>,
     mobi_cache: PathBuf,
     root: PathBuf,
@@ -1220,6 +1376,24 @@ struct App {
     asleep: Option<u32>,
     /// The quotation pool managing built-in, custom, and file quotes.
     quotes: QuotePool,
+    /// Probed hardware capabilities (keys, warmth, ALS, accelerometer).
+    device_caps: device_settings::DeviceCaps,
+    /// Two-tap confirmation state for device reboot.
+    reboot_armed: bool,
+    /// Short feedback line after clearing layout caches.
+    cache_status: Option<String>,
+    /// When the font folder picker was opened from Settings or Reader/Wi-Fi,
+    /// where closing or confirming it should return.
+    font_picker_return: Option<SoonBack>,
+    /// Whether the active local scan looks for books only or fonts only.
+    scan_kind: ScanKind,
+    /// Where a font-scan session returns once finished or backed out.
+    scan_return: Option<SoonBack>,
+    /// Whether Wi-Fi was enabled before sleep (for `sleep_wifi_off` restore).
+    wifi_was_on_before_sleep: bool,
+    /// Active background worker for Bluetooth scan / interactive PIN pairing.
+    bt_worker: Option<std::sync::mpsc::Receiver<BluetoothWorkerMsg>>,
+    time_sync: device_settings::TimeSyncState,
     /// The quotation the home screen shows: the one of the day, or the
     /// next one the reader asked for.
     home_quote_id: u32,
@@ -1230,6 +1404,12 @@ struct App {
     /// Watches the first frame while the stock GUI finishes shutting down
     /// (`STARTUP-001`).
     startup_watch: Option<StartupWatch>,
+    /// Watches the screensaver frame shortly after entering sleep so a late
+    /// blank/system overwrite of `/dev/fb0` is caught and repainted.
+    sleep_watch: Option<StartupWatch>,
+    /// USB drive mode ended while asleep, so `blanket`'s `screensaver` module
+    /// was left alone until wake; unload it once the device wakes.
+    screensaver_blanket_dirty: bool,
     /// The app switched the light off for its own screensaver (powerd's
     /// screensaver switches it off and back on by itself).
     light_off_by_app: bool,
@@ -1244,6 +1424,12 @@ struct App {
     /// Translations (a thread of their own), started when the reader
     /// asks for one.
     translate: Option<TranslateService>,
+    /// Bluetooth AI audiobook (TTS) playback worker.
+    tts: Option<TtsService>,
+    /// Last time `deferSuspend` was sent while asleep and playing TTS.
+    tts_defer_at: Option<Instant>,
+    /// Ephemeral LAN HTTP server for phone QR-code configuration/text input.
+    lan_input: Option<aristotle_net::lan_input::LanInputServer>,
     speed: Speed,
     /// Page stays for the statistics screens and the sync (stats.rs).
     stats: Stats,
@@ -1342,8 +1528,18 @@ enum ScanDone {
         aristotle_library::ScanReport,
         aristotle_library::index::Index,
     ),
-    /// An import: what was copied, after the originals were cleaned up.
-    Import(aristotle_library::transfer::PreparedBatch),
+    /// An import: what was copied, after the originals were cleaned up,
+    /// plus how many font files were migrated into the designated fonts folder.
+    Import(aristotle_library::transfer::PreparedBatch, usize),
+}
+
+/// What a local scan session looks for: books only (from the library) or
+/// fonts only (from the add-font flow).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ScanKind {
+    #[default]
+    Books,
+    Fonts,
 }
 
 /// What a scan worker does.
@@ -1358,12 +1554,15 @@ enum ScanPurpose {
     Review { sources: Vec<PathBuf> },
     /// An explicit import: add the checked new books, then copy every checked
     /// book into the physical library folder and remove its original only
-    /// after the index was saved.
+    /// after the index was saved, and migrate any checked font files into the
+    /// designated fonts folder.
     Import {
         sources: Vec<PathBuf>,
         new_paths: Vec<String>,
         indexed: Vec<String>,
         destination: PathBuf,
+        font_paths: Vec<String>,
+        fonts_destination: PathBuf,
     },
 }
 
@@ -1433,58 +1632,62 @@ fn run_scan_worker(
             new_paths,
             indexed,
             destination,
+            font_paths,
+            fonts_destination,
         } => {
-            let options = ScanOptions {
-                admission: ScanAdmission::Confirmed(
-                    new_paths.iter().cloned().collect::<HashSet<String>>(),
-                ),
-                ..opts.clone()
-            };
-            let report = lib
-                .scan_sources(root, sources, &options)
-                .map_err(|e| e.to_string())?;
-            if report.cancelled {
-                return Ok(ScanDone::Import(
-                    aristotle_library::transfer::PreparedBatch {
-                        cancelled: true,
-                        ..Default::default()
-                    },
-                ));
-            }
             let mut records = Vec::new();
-            let mut seen = HashSet::new();
             let mut missing: Vec<(String, String)> = Vec::new();
-            for path in new_paths {
-                match lib.books().iter().find(|b| &b.file.path == path) {
-                    Some(book) => {
-                        if seen.insert(book.id.clone()) {
-                            records.push(book.clone());
-                        }
-                    }
-                    None => missing.push((
-                        path.clone(),
-                        "not imported: not found as a supported book after the scan".into(),
-                    )),
+            if !new_paths.is_empty() || !indexed.is_empty() {
+                let options = ScanOptions {
+                    admission: ScanAdmission::Confirmed(
+                        new_paths.iter().cloned().collect::<HashSet<String>>(),
+                    ),
+                    ..opts.clone()
+                };
+                let report = lib
+                    .scan_sources(root, sources, &options)
+                    .map_err(|e| e.to_string())?;
+                if report.cancelled {
+                    return Ok(ScanDone::Import(
+                        aristotle_library::transfer::PreparedBatch {
+                            cancelled: true,
+                            ..Default::default()
+                        },
+                        0,
+                    ));
                 }
-            }
-            for id in indexed {
-                match lib.book(id) {
-                    Some(book) => {
-                        if seen.insert(book.id.clone()) {
-                            records.push(book.clone());
+                let mut seen = HashSet::new();
+                for path in new_paths {
+                    match lib.books().iter().find(|b| &b.file.path == path) {
+                        Some(book) => {
+                            if seen.insert(book.id.clone()) {
+                                records.push(book.clone());
+                            }
                         }
+                        None => missing.push((
+                            path.clone(),
+                            "not imported: not found as a supported book after the scan".into(),
+                        )),
                     }
-                    None => missing.push((
-                        id.clone(),
-                        "not imported: the book is no longer in the library".into(),
-                    )),
                 }
+                for id in indexed {
+                    match lib.book(id) {
+                        Some(book) => {
+                            if seen.insert(book.id.clone()) {
+                                records.push(book.clone());
+                            }
+                        }
+                        None => missing.push((
+                            id.clone(),
+                            "not imported: the book is no longer in the library".into(),
+                        )),
+                    }
+                }
+                drop(report);
             }
             // Release the scan snapshot before the file-copy phase.
-            drop(report);
             drop(lib);
-            drop(seen);
-            let total = records.len();
+            let total = records.len() + font_paths.len();
             let mut result = aristotle_library::transfer::PreparedBatch {
                 errors: missing,
                 ..Default::default()
@@ -1581,7 +1784,25 @@ fn run_scan_worker(
                 }
                 start = end;
             }
-            Ok(ScanDone::Import(result))
+            let mut migrated_fonts = 0usize;
+            for (idx, rel) in font_paths.iter().enumerate() {
+                if cancel.load(Ordering::SeqCst) {
+                    result.cancelled = true;
+                    break;
+                }
+                let _ = tx.send(ScanMsg::ImportProgress {
+                    done: records.len() + idx,
+                    total,
+                });
+                match fonts::migrate_font(root, rel, fonts_destination) {
+                    Ok(_) => migrated_fonts += 1,
+                    Err(error) => result.errors.push((rel.clone(), error.to_string())),
+                }
+            }
+            if !font_paths.is_empty() && !result.cancelled {
+                let _ = tx.send(ScanMsg::ImportProgress { done: total, total });
+            }
+            Ok(ScanDone::Import(result, migrated_fonts))
         }
     }
 }
@@ -1774,6 +1995,35 @@ impl App {
             .with_screen(self.ui.profile(), self.panel.stride())
     }
 
+    /// Build a [`Style`] for `rec`, attaching its per-book fixed-layout /
+    /// comic settings (fit mode, RTL direction, fullscreen, auto-crop,
+    /// landscape spread splitting, night-mode image preservation).
+    pub(crate) fn page_style_for_book(&self, rec: &aristotle_library::index::BookRecord) -> Style {
+        let mut style = self.page_style();
+        style.fixed_layout = self
+            .prefs
+            .fixed_layout_for(&rec.id, rec.format, rec.meta.manga_rtl);
+        style
+    }
+
+    /// Build a [`Style`] for the currently open book (if any), preserving its
+    /// per-book fixed-layout settings.
+    pub(crate) fn page_style_for_current(&self) -> Style {
+        if let Screen::Reader(r) = &self.screen {
+            if let Some(rec) = self.lib.book(&r.session.id) {
+                return self.page_style_for_book(rec);
+            }
+        }
+        self.page_style()
+    }
+
+    /// Restore the global screen orientation when leaving a book that had a
+    /// per-book orientation override.
+    fn restore_global_orientation(&mut self) {
+        let global = aristotle_screen::Orientation::from_index(self.prefs.orientation);
+        self.apply_orientation(global);
+    }
+
     /// Render and send UI chrome changes.
     fn render_ui(&mut self) -> Result<(), Error> {
         self.render_ui_with(Content::Chrome)
@@ -1830,6 +2080,11 @@ impl App {
             Screen::Library { view, .. } => Some(view.loading),
             Screen::Scan { view, .. } => Some(view.loading),
             Screen::Settings { ids, .. } => ids.as_ref().map(|s| s.loading),
+            Screen::ReaderBars { ids, .. } => Some(ids.loading),
+            Screen::WifiSettings { ids, .. } => Some(ids.loading),
+            Screen::BluetoothSettings { ids, .. } => Some(ids.loading),
+            Screen::TimeSettings { ids, .. } => Some(ids.loading),
+            Screen::KeySettings { ids, .. } => Some(ids.loading),
             Screen::Network(ns) => ns.frame.as_ref().map(|f| f.loading),
             Screen::WifiTransfer { view, .. } => Some(view.loading),
             Screen::Marks { loading, .. } => Some(*loading),
@@ -1900,6 +2155,49 @@ impl App {
         }
     }
 
+    /// Briefly dim the frontlight before a flashing full refresh in night mode
+    /// so the inverted flash does not dazzle the reader.
+    fn dim_for_night_flash(&self) {
+        const NIGHT_DIM_STEP: u32 = 2;
+        const NIGHT_DIM_HOLD: Duration = Duration::from_millis(480);
+        if !self.prefs.night
+            || !self.prefs.night_dim_refresh
+            || self.pending_light_restore.get().is_some()
+        {
+            return;
+        }
+        let saved = self.light_step();
+        if saved <= NIGHT_DIM_STEP {
+            return;
+        }
+        if self.sleep_ctl.managed() {
+            self.sleep_ctl.set_light(NIGHT_DIM_STEP);
+        } else {
+            self.apply_light_step(NIGHT_DIM_STEP);
+        }
+        self.pending_light_restore
+            .set(Some((Instant::now() + NIGHT_DIM_HOLD, saved)));
+    }
+
+    /// Restore the frontlight after a dimmed night flash once its hold timer
+    /// expires (or immediately when `force` is true).
+    fn restore_dimmed_light(&self, force: bool) {
+        let Some((deadline, saved)) = self.pending_light_restore.get() else {
+            return;
+        };
+        if !force && Instant::now() < deadline {
+            return;
+        }
+        self.pending_light_restore.set(None);
+        if self.asleep.is_none() && self.light_step() == saved {
+            if self.sleep_ctl.managed() {
+                self.sleep_ctl.set_light(saved);
+            } else {
+                self.apply_light_step(saved);
+            }
+        }
+    }
+
     /// The style of the home screen's clock card.
     fn clock_style(&self) -> ui_home::ClockStyle {
         ui_home::ClockStyle::ALL
@@ -1920,9 +2218,9 @@ impl App {
         self.cancel_cloud_on_leave();
         self.weread.cancel_login();
         match tab {
-            ui_nav::Tab::Home => self.show_home(Refresh::Full),
-            ui_nav::Tab::Library => self.show_library(Refresh::Full),
-            ui_nav::Tab::Mine => self.show_mine(Refresh::Full),
+            ui_nav::Tab::Home => self.show_home(Refresh::Clean),
+            ui_nav::Tab::Library => self.show_library(Refresh::Clean),
+            ui_nav::Tab::Mine => self.show_mine(Refresh::Clean),
         }
     }
 
@@ -2010,6 +2308,7 @@ impl App {
 
     /// The home screen, on the page of the books opened lately.
     fn show_home_at(&mut self, refresh: Refresh, page: usize) -> Result<(), Error> {
+        self.restore_global_orientation();
         let t0 = Instant::now();
         let sources = self.channel_sources();
         let mut model = HomeModel::build_with_sources(&self.lib, &mut self.covers, &sources);
@@ -2559,7 +2858,7 @@ impl App {
             // No Wi-Fi: there is nobody to reach the device.
             return;
         }
-        let config = transfer::Config::new(self.root.clone(), self.fonts_dir.clone());
+        let config = transfer::Config::new(self.root.clone(), self.active_fonts_dir());
         match transfer::Service::start(config) {
             Ok(service) => {
                 let mut firewall =
@@ -2599,18 +2898,33 @@ impl App {
         };
         if state.stage != stage || state.received.len() != received {
             if state.received.len() > received {
-                // A book that just arrived is admitted by name, together
-                // with a refresh of the known books. Nothing else nearby is
-                // picked up by this background walk (UX-112).
+                // Newly received books are admitted by name; newly received
+                // fonts reload the font list and re-register with crengine so
+                // they are immediately visible and usable.
                 let root = scan_root(&self.root);
-                let arrived: Vec<String> = state
-                    .received
-                    .iter()
-                    .skip(received)
-                    .map(|book| scan_scope::relative_path(&root, &self.root.join(&book.name)))
-                    .filter(|path| !path.is_empty())
-                    .collect();
-                self.scan_in_background(arrived);
+                let mut arrived_books = Vec::new();
+                let mut got_fonts = false;
+                for item in state.received.iter().skip(received) {
+                    match item.kind {
+                        transfer::names::Kind::Book => {
+                            let rel = scan_scope::relative_path(&root, &self.root.join(&item.name));
+                            if !rel.is_empty() {
+                                arrived_books.push(rel);
+                            }
+                        }
+                        transfer::names::Kind::Font => {
+                            got_fonts = true;
+                        }
+                        transfer::names::Kind::Image => {}
+                    }
+                }
+                if got_fonts {
+                    self.fonts_dir = self.active_fonts_dir();
+                    self.load_font();
+                }
+                if !arrived_books.is_empty() {
+                    self.scan_in_background(arrived_books);
+                }
             }
             self.show_wifi_transfer(Refresh::Full, back)?;
             return Ok(());
@@ -3118,6 +3432,7 @@ impl App {
 
     /// Rebuild the library screen for `self.nav`, on list page `page`.
     fn show_library_at(&mut self, refresh: Refresh, page: usize) -> Result<(), Error> {
+        self.restore_global_orientation();
         self.rebuild_library_at(refresh, page, false)
     }
 
@@ -3251,6 +3566,17 @@ impl App {
             .unwrap_or(default)
     }
 
+    /// The designated fonts folder: the user's choice when valid under the
+    /// scan root, else the platform default (`self.fonts_dir`).
+    fn active_fonts_dir(&self) -> PathBuf {
+        let root = scan_root(&self.root);
+        self.prefs
+            .fonts_destination
+            .as_deref()
+            .and_then(|path| fonts::resolve_fonts_destination(&root, path).ok())
+            .unwrap_or_else(|| self.fonts_dir.clone())
+    }
+
     /// The sources the next scan covers: the whole store when the reader
     /// chose it (or chose nothing yet), else the checked folders that are
     /// still there.
@@ -3271,6 +3597,8 @@ impl App {
     }
 
     fn show_scan_empty(&mut self, refresh: Refresh) -> Result<(), Error> {
+        self.scan_kind = ScanKind::Books;
+        self.scan_return = None;
         self.show_scan(refresh, ui_scan::ScanState::Empty)
     }
 
@@ -3284,7 +3612,10 @@ impl App {
         path: Option<&Path>,
     ) -> Result<(), Error> {
         let root = scan_root(&self.root);
+        let allow_fonts = mode == ui_scan::PickerMode::FontDestination
+            || (mode == ui_scan::PickerMode::Sources && self.scan_kind == ScanKind::Fonts);
         let scope = match path {
+            Some(p) if allow_fonts => scan_scope::Scope::new_allowing_fonts(&root, p),
             Some(p) => scan_scope::Scope::new(&root, p),
             None => scan_scope::Scope::whole(&root),
         };
@@ -3305,8 +3636,12 @@ impl App {
             .iter()
             .map(|b| b.file.path.clone())
             .collect();
-        let folders = scope
-            .folders(&books)
+        let raw_folders = if allow_fonts {
+            scope.folders_allowing_fonts(&books)
+        } else {
+            scope.folders(&books)
+        };
+        let folders = raw_folders
             .into_iter()
             .map(|f| ui_scan::ScopeFolder {
                 name: f.name,
@@ -3323,6 +3658,7 @@ impl App {
             selected: self.scan_sources.clone(),
             whole: self.scan_whole,
             destination: self.library_destination().display().to_string(),
+            fonts_destination: self.active_fonts_dir().display().to_string(),
         };
         self.show_scan(refresh, state)
     }
@@ -3427,21 +3763,50 @@ impl App {
                         .strip_prefix(&destination_relative)
                         .is_some_and(|rest| rest.starts_with('/')))
         };
-        let books: Vec<ui_scan::ReviewBook> = report
-            .candidates
-            .iter()
-            .map(|c| ui_scan::ReviewBook {
-                title: c.title.clone(),
-                path: c.path.clone(),
-                format: c.format.clone(),
-                id: c.indexed.clone(),
-                in_destination: in_destination(&c.path),
-            })
-            .collect();
+        let mut books: Vec<ui_scan::ReviewBook> = Vec::new();
+        let display_destination = match self.scan_kind {
+            ScanKind::Books => {
+                books.extend(report.candidates.iter().map(|c| ui_scan::ReviewBook {
+                    title: c.title.clone(),
+                    path: c.path.clone(),
+                    format: c.format.clone(),
+                    id: c.indexed.clone(),
+                    in_destination: in_destination(&c.path),
+                    is_font: false,
+                    font_migratable: false,
+                    status_badge: None,
+                }));
+                destination.display().to_string()
+            }
+            ScanKind::Fonts => {
+                let fonts_dest = self.active_fonts_dir();
+                let registered = fonts::registered_crengine_faces();
+                let discovered_fonts = fonts::discover_fonts_in_sources(
+                    &root,
+                    &self.chosen_sources(),
+                    &fonts_dest,
+                    &registered,
+                );
+                for f in discovered_fonts {
+                    let badge = format!("{} · {}", tr(Msg::FontTag), f.status.label());
+                    books.push(ui_scan::ReviewBook {
+                        title: f.title,
+                        path: f.path,
+                        format: f.format,
+                        id: None,
+                        in_destination: f.in_destination,
+                        is_font: true,
+                        font_migratable: f.status.migratable(),
+                        status_badge: Some(badge),
+                    });
+                }
+                fonts_dest.display().to_string()
+            }
+        };
         let selected = vec![false; books.len()];
         ui_scan::ScanState::Review {
             sources: self.scan_sources_display(),
-            destination: destination.display().to_string(),
+            destination: display_destination,
             books,
             selected,
         }
@@ -3498,32 +3863,45 @@ impl App {
         };
         let mut new_paths = Vec::new();
         let mut indexed = Vec::new();
+        let mut font_paths = Vec::new();
         for (i, book) in books.iter().enumerate() {
             if !selected.get(i).copied().unwrap_or(false) || !book.selectable() {
                 continue;
             }
-            match &book.id {
-                Some(id) => indexed.push(id.clone()),
-                None => new_paths.push(book.path.clone()),
+            if book.is_font {
+                font_paths.push(book.path.clone());
+            } else {
+                match &book.id {
+                    Some(id) => indexed.push(id.clone()),
+                    None => new_paths.push(book.path.clone()),
+                }
             }
         }
-        let total = new_paths.len() + indexed.len();
+        let total = new_paths.len() + indexed.len() + font_paths.len();
         if total == 0 {
             return Ok(());
         }
         let destination = self.library_destination();
+        let fonts_destination = self.active_fonts_dir();
+        let display_destination = if new_paths.is_empty() && indexed.is_empty() {
+            fonts_destination.display().to_string()
+        } else {
+            destination.display().to_string()
+        };
         let sources = self.chosen_sources();
         let purpose = ScanPurpose::Import {
             sources,
             new_paths,
             indexed,
             destination: destination.clone(),
+            font_paths,
+            fonts_destination,
         };
         if let Err(e) = self.spawn_scan(purpose) {
             return self.show_scan(
                 Refresh::Full,
                 ui_scan::ScanState::Imported {
-                    destination: destination.display().to_string(),
+                    destination: display_destination,
                     migrated: 0,
                     failed: 1,
                     cancelled: false,
@@ -3534,7 +3912,7 @@ impl App {
         self.show_scan(
             Refresh::Full,
             ui_scan::ScanState::Importing {
-                destination: destination.display().to_string(),
+                destination: display_destination,
                 done: 0,
                 total,
                 status: tr(Msg::LibraryScanImportingStatus).to_string(),
@@ -3800,10 +4178,24 @@ impl App {
                     }
                 }
             }
-            Ok(ScanDone::Import(batch)) => {
+            Ok(ScanDone::Import(batch, migrated_fonts)) => {
+                if migrated_fonts > 0 {
+                    self.fonts_dir = self.active_fonts_dir();
+                    self.load_font();
+                }
                 let destination = match &purpose {
-                    Some(ScanPurpose::Import { destination, .. }) => {
-                        destination.display().to_string()
+                    Some(ScanPurpose::Import {
+                        destination,
+                        fonts_destination,
+                        new_paths,
+                        indexed,
+                        ..
+                    }) => {
+                        if new_paths.is_empty() && indexed.is_empty() {
+                            fonts_destination.display().to_string()
+                        } else {
+                            destination.display().to_string()
+                        }
                     }
                     _ => self.library_destination().display().to_string(),
                 };
@@ -3812,7 +4204,7 @@ impl App {
                         Refresh::Full,
                         ui_scan::ScanState::Imported {
                             destination,
-                            migrated: batch.books.len(),
+                            migrated: batch.books.len() + migrated_fonts,
                             failed: batch.errors.len(),
                             cancelled: batch.cancelled,
                             errors: batch
@@ -4160,10 +4552,7 @@ impl App {
             if f.name == crate::fonts::DEFAULT_CJK || f.name == crate::fonts::DEFAULT_LATIN {
                 continue;
             }
-            let is_cjk = f.name.contains("SC")
-                || f.name.contains("TC")
-                || f.name.contains("CJK")
-                || f.name.chars().any(crate::selection::is_cjk);
+            let is_cjk = crate::fonts::classify_family(f) == crate::fonts::FontScript::Cjk;
             let ui = self.ui_family(f);
             let option = FontOption {
                 name: f.name.clone(),
@@ -4206,22 +4595,33 @@ impl App {
             selected_latin_font: selected_latin,
             latin_page: selected_latin / ui_typeset::FONTS_PER_PAGE,
             size_index: self.prefs.size.min(ui_typeset::SIZES_PX.len() - 1),
+            font_size_half_pt: self.prefs.font_size_half_pt(),
             spacing_index: self.prefs.spacing.min(ui_typeset::SPACING_RATIO.len() - 1),
+            spacing_tenths: self.prefs.spacing_tenths(),
+            spacing_pct: self.prefs.spacing_pct(),
             margin_index: (2usize.saturating_sub(self.prefs.margins))
                 .min(ui_typeset::MARGINS_PX.len() - 1),
+            margin_ref_px: self.prefs.margin_ref_px(),
             indent_index: self.prefs.cjk_indent.min(1),
+            indent_tenths: self.prefs.cjk_indent_tenths(),
             // Script conversion, punctuation trim and page animation are
             // not offered; old reader.json fields are still read.
             script_index: 0,
             gap_index: self.prefs.cjk_gap.min(2),
+            gap_tenths: self.prefs.cjk_gap_tenths(),
             underline_index: self.prefs.underline.min(2),
             underline_scope: self.prefs.underline_scope.min(1),
             fine_typesetting: self.prefs.fine_typesetting,
+            embedded_fonts: self.prefs.embedded_fonts,
+            fine_locks_fonts: false,
+            fine_locks_spacing: false,
             font_weight: self.prefs.font_weight,
             writing_mode: self.prefs.writing_mode.min(1),
+            orientation: self.prefs.orientation.min(3),
             trim_index: 0,
             anim_enabled: false,
             anim_speed: 1,
+            ..ui_typeset::TypesetView::default()
         }
     }
 
@@ -4295,7 +4695,7 @@ impl App {
                     self.apply_reading_font(crate::fonts::FontTarget::Cjk, &name);
                 }
             }
-            i if (a::LATIN_FONT_BASE..a::SIZE_BASE).contains(&i) => {
+            i if (a::LATIN_FONT_BASE..a::SIZE_DOWN).contains(&i) => {
                 let idx = (i - a::LATIN_FONT_BASE) as usize;
                 if let Some(font) = view.latin_fonts.get(idx) {
                     let name = font.name.clone();
@@ -4304,43 +4704,48 @@ impl App {
                     self.apply_reading_font(crate::fonts::FontTarget::Latin, &name);
                 }
             }
-            i if (a::SIZE_BASE..a::SPACING_BASE).contains(&i) => {
-                let idx = (i - a::SIZE_BASE) as usize;
-                if idx < ui_typeset::SIZES_PX.len() {
-                    view.size_index = idx;
-                    self.prefs.size = idx;
+            a::SIZE_DOWN | a::SIZE_UP => {
+                let next =
+                    ui_typeset::font_size_half_pt_stepped(view.font_size_half_pt, id == a::SIZE_UP);
+                if next != view.font_size_half_pt {
+                    view.font_size_half_pt = next;
+                    self.prefs.font_size_half_pt = Some(next);
                     prefs_changed = true;
                 }
             }
-            i if (a::SPACING_BASE..a::MARGIN_BASE).contains(&i) => {
-                let idx = (i - a::SPACING_BASE) as usize;
-                if idx < ui_typeset::SPACING_RATIO.len() {
-                    view.spacing_index = idx;
-                    self.prefs.spacing = idx;
+            a::SPACING_DOWN | a::SPACING_UP => {
+                let next = ui_typeset::spacing_pct_stepped(view.spacing_pct, id == a::SPACING_UP);
+                if next != view.spacing_pct {
+                    view.spacing_pct = next;
+                    view.spacing_tenths =
+                        (next / 10).min(ui_typeset::SPACING_MAX_TENTHS as u16) as u8;
+                    self.prefs.line_spacing_pct = Some(next);
                     prefs_changed = true;
                 }
             }
-            i if (a::MARGIN_BASE..a::INDENT_BASE).contains(&i) => {
-                let idx = (i - a::MARGIN_BASE) as usize;
-                if idx < ui_typeset::MARGINS_PX.len() {
-                    view.margin_index = idx;
-                    self.prefs.margins = 2usize.saturating_sub(idx);
+            a::MARGIN_DOWN | a::MARGIN_UP => {
+                let next =
+                    ui_typeset::margin_ref_px_stepped(view.margin_ref_px, id == a::MARGIN_UP);
+                if next != view.margin_ref_px {
+                    view.margin_ref_px = next;
+                    self.prefs.margin_ref_px = Some(next);
                     prefs_changed = true;
                 }
             }
-            i if (a::INDENT_BASE..a::GAP_BASE).contains(&i) => {
-                let idx = (i - a::INDENT_BASE) as usize;
-                if idx < 2 {
-                    view.indent_index = idx;
-                    self.prefs.cjk_indent = idx;
+            a::INDENT_DOWN | a::INDENT_UP => {
+                let next =
+                    ui_typeset::indent_tenths_stepped(view.indent_tenths, id == a::INDENT_UP);
+                if next != view.indent_tenths {
+                    view.indent_tenths = next;
+                    self.prefs.cjk_indent_tenths = Some(next);
                     prefs_changed = true;
                 }
             }
-            i if (a::GAP_BASE..a::TRIM_BASE).contains(&i) => {
-                let idx = (i - a::GAP_BASE) as usize;
-                if idx < ui_typeset::GAP_RATIO.len() {
-                    view.gap_index = idx;
-                    self.prefs.cjk_gap = idx;
+            a::GAP_DOWN | a::GAP_UP => {
+                let next = ui_typeset::gap_tenths_stepped(view.gap_tenths, id == a::GAP_UP);
+                if next != view.gap_tenths {
+                    view.gap_tenths = next;
+                    self.prefs.cjk_gap_tenths = Some(next);
                     prefs_changed = true;
                 }
             }
@@ -4373,6 +4778,11 @@ impl App {
                 self.prefs.fine_typesetting = view.fine_typesetting;
                 prefs_changed = true;
             }
+            i if (a::EMBEDDED_FONTS_BASE..a::EMBEDDED_FONTS_BASE + 2).contains(&i) => {
+                view.embedded_fonts = i == a::EMBEDDED_FONTS_BASE;
+                self.prefs.embedded_fonts = view.embedded_fonts;
+                prefs_changed = true;
+            }
             i if (a::WEIGHT_BASE..a::WEIGHT_DOWN).contains(&i) => {
                 let Some(&weight) = ui_typeset::WEIGHT_PRESETS.get((i - a::WEIGHT_BASE) as usize)
                 else {
@@ -4386,6 +4796,16 @@ impl App {
                 view.font_weight = ui_typeset::weight_stepped(view.font_weight, id == a::WEIGHT_UP);
                 self.prefs.font_weight = view.font_weight;
                 prefs_changed = true;
+            }
+            i if (a::ORIENTATION_BASE..a::ORIENTATION_BASE + 4).contains(&i) => {
+                let idx = (i - a::ORIENTATION_BASE) as usize;
+                if idx != view.orientation {
+                    view.orientation = idx;
+                    self.prefs.orientation = idx;
+                    prefs_changed = true;
+                    let orient = aristotle_screen::Orientation::from_index(idx);
+                    self.apply_orientation(orient);
+                }
             }
             _ => {}
         }
@@ -4426,6 +4846,64 @@ impl App {
         } else {
             "Off"
         };
+        let wifi_st = aristotle_hal::wifi::status();
+        let wifi_summary = if wifi_st.airplane_mode {
+            tr(Msg::DeviceSettingsWifiAirplane).to_string()
+        } else if let Some(ssid) = wifi_st.connected_ssid {
+            ssid
+        } else {
+            tr(Msg::DeviceSettingsWifiDisconnected).to_string()
+        };
+        let bt_st = aristotle_hal::bluetooth::status();
+        let bt_summary = if !bt_st.available {
+            tr(Msg::DeviceSettingsBtOff).to_string()
+        } else if let Some(dev) = bt_st.connected_device {
+            dev.name
+        } else if bt_st.powered {
+            tr(Msg::DeviceSettingsBtOn).to_string()
+        } else {
+            tr(Msg::DeviceSettingsBtOff).to_string()
+        };
+        let time_now = system::local_time()
+            .map(|lt| aristotle_screen::format_clock_hm(lt.hour, lt.minute, system::clock_24h()))
+            .unwrap_or_else(|| facts.status_line().clock.to_string());
+        let tz_short = self
+            .prefs
+            .timezone
+            .as_deref()
+            .and_then(aristotle_screen::find_timezone)
+            .map(time_ui::timezone_label)
+            .unwrap_or("UTC");
+        let time_summary = format!("{time_now} · {tz_short}");
+        let key_summary = keys_ui::touch_zone_label(aristotle_screen::TouchZoneLayout::from_index(
+            self.prefs.touch_zone_layout,
+        ));
+        let orient_summary = device_settings::orientation_label(
+            aristotle_screen::Orientation::from_index(self.prefs.orientation),
+        );
+        let dict_summary = self
+            .prefs
+            .default_dictionary
+            .clone()
+            .or_else(|| {
+                self.dict
+                    .as_ref()
+                    .and_then(|d| d.dicts.first().map(|x| x.label.clone()))
+            })
+            .unwrap_or_else(|| tr(Msg::DeviceSettingsDevDictNone).to_string());
+        let pin_summary = if self.prefs.app_pin_hash.is_some() {
+            tr(Msg::DeviceSettingsDevPinOn)
+        } else {
+            tr(Msg::DeviceSettingsDevPinOff)
+        };
+        let cache_summary = self.cache_status.as_deref().unwrap_or("");
+        let font_folder_summary = self.active_fonts_dir().display().to_string();
+        let reboot_summary = if self.reboot_armed {
+            tr(Msg::DeviceSettingsDevRebootConfirm)
+        } else {
+            ""
+        };
+        let tts_summary = self.prefs.tts.settings_summary();
         let view = SystemView {
             status: facts.status_line(),
             light,
@@ -4471,6 +4949,33 @@ impl App {
             weread_notes: weread_notes.map(|(books, highlights, thoughts)| {
                 (books as u32, highlights as u32, thoughts as u32)
             }),
+            extra: set_ui::SettingsExtra {
+                reader_bars: Some(bars_ui::preset_label(
+                    self.prefs.reader_bars.to_config().preset,
+                )),
+                wifi_settings: Some(&wifi_summary),
+                bluetooth_settings: Some(&bt_summary),
+                tts_settings: Some(&tts_summary),
+                time_settings: Some(&time_summary),
+                key_settings: Some(key_summary),
+                warmth: self
+                    .device_caps
+                    .has_warm_light
+                    .then_some((self.prefs.warmth, LIGHT_STEPS)),
+                auto_brightness: self
+                    .device_caps
+                    .has_als
+                    .then_some(self.prefs.auto_brightness),
+                orientation: Some(orient_summary),
+                sleep_wifi_off: Some(self.prefs.sleep_wifi_off),
+                clear_cache: Some(cache_summary),
+                reboot_label: Some(reboot_summary),
+                dictionary: Some(&dict_summary),
+                pin_status: Some(pin_summary),
+                show_battery_pct: Some(self.prefs.show_battery_pct),
+                font_folder: Some(&font_folder_summary),
+                night_dim_refresh: Some(self.prefs.night_dim_refresh),
+            },
         };
         let (tree, ids) = set_ui::Settings::build(&mut self.ui.text, &self.styles, &view);
         self.ui.set_tree_with(tree, refresh);
@@ -4543,6 +5048,981 @@ impl App {
         self.ui.layout();
         self.screen = Screen::SleepImages { pictures, page };
         self.render_ui()
+    }
+
+    /// Snapshot of live device status (clock, battery, Wi-Fi, frontlight) for
+    /// the reader's top and bottom bars.
+    fn device_bar_status(&self) -> aristotle_render::page::DeviceBarStatus {
+        let facts = Facts::status(&self.battery);
+        let status = facts.status_line();
+        let clock = status.clock.to_string();
+        let light = self
+            .light
+            .as_ref()
+            .map(|_| (self.light_step(), LIGHT_STEPS));
+        let warmth = self
+            .device_caps
+            .has_warm_light
+            .then_some((self.prefs.warmth, LIGHT_STEPS));
+        let wifi = aristotle_hal::wifi::status().badge();
+        aristotle_render::page::DeviceBarStatus {
+            clock,
+            battery_pct: status
+                .battery
+                .map(|b| (b * 100.0).round().clamp(0.0, 100.0) as u8),
+            hide_battery_pct: !self.prefs.show_battery_pct,
+            charging: status.charging,
+            wifi,
+            frontlight: light,
+            warmth,
+            light_off_label: tr(Msg::BarsLightOff).to_string(),
+            wifi_off_label: tr(Msg::BarsWifiOff).to_string(),
+            wifi_airplane_label: tr(Msg::BarsWifiAirplane).to_string(),
+        }
+    }
+
+    fn show_wifi_settings(
+        &mut self,
+        refresh: Refresh,
+        page: usize,
+        settings_page: usize,
+        networks: Vec<aristotle_hal::wifi::WifiNetwork>,
+        message: Option<String>,
+    ) -> Result<(), Error> {
+        let facts = Facts::read(&self.battery, &self.root);
+        let st = aristotle_hal::wifi::status();
+        let rows: Vec<wifi_set_ui::WifiRow> = networks
+            .iter()
+            .map(|n| wifi_set_ui::WifiRow {
+                ssid: n.ssid.clone(),
+                signal_bars: n.signal_bars,
+                secured: n.secured,
+                connected: n.connected,
+                saved: n.saved,
+            })
+            .collect();
+        let view = wifi_set_ui::WifiSettingsView {
+            status: facts.status_line(),
+            airplane_mode: st.airplane_mode,
+            wifi_enabled: st.enabled,
+            scanning: false,
+            connected_ssid: st.connected_ssid.as_deref(),
+            ip: st.ip.as_deref(),
+            message: message.as_deref(),
+            networks: &rows,
+        };
+        let (tree, ids) =
+            wifi_set_ui::WifiSettingsUi::build(&mut self.ui.text, &self.styles, &view);
+        self.ui.set_tree_with(tree, refresh);
+        self.ui.layout();
+        if page > 0 {
+            self.ui.tree.set_page(ids.list, page);
+            self.ui.layout();
+        }
+        ids.sync_pager(&mut self.ui.tree);
+        self.screen = Screen::WifiSettings {
+            ids,
+            page,
+            settings_page,
+            networks,
+            message,
+        };
+        self.render_ui()
+    }
+
+    fn on_wifi_settings_event(&mut self, ev: UiEvent) -> Result<Flow, Error> {
+        let UiEvent::Action { id, .. } = ev else {
+            return Ok(Flow::Continue);
+        };
+        let (page, settings_page, networks) = match &mut self.screen {
+            Screen::WifiSettings {
+                ids,
+                page,
+                settings_page,
+                networks,
+                ..
+            } => {
+                if id == wifi_set_ui::action::BACK {
+                    let sp = *settings_page;
+                    return self
+                        .show_settings(Refresh::Full, sp)
+                        .map(|_| Flow::Continue);
+                }
+                if ids.handle_pager(&mut self.ui.tree, id) {
+                    *page = self.ui.tree.page(ids.list).0;
+                    self.render_ui()?;
+                    return Ok(Flow::Continue);
+                }
+                (*page, *settings_page, networks.clone())
+            }
+            _ => return Ok(Flow::Continue),
+        };
+        match id {
+            wifi_set_ui::action::AIRPLANE => {
+                let st = aristotle_hal::wifi::status();
+                let _ = aristotle_hal::wifi::set_wireless_enabled(st.airplane_mode);
+                if st.airplane_mode {
+                    self.time_sync.schedule_auto(Duration::from_secs(4));
+                }
+                let nets = if st.airplane_mode {
+                    aristotle_hal::wifi::scan().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                self.show_wifi_settings(Refresh::Auto, 0, settings_page, nets, None)?;
+            }
+            wifi_set_ui::action::WIFI_TOGGLE => {
+                let st = aristotle_hal::wifi::status();
+                let target = !(st.enabled && !st.airplane_mode);
+                let _ = aristotle_hal::wifi::set_wireless_enabled(target);
+                if target {
+                    self.time_sync.schedule_auto(Duration::from_secs(4));
+                }
+                let nets = if target {
+                    aristotle_hal::wifi::scan().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                self.show_wifi_settings(Refresh::Auto, 0, settings_page, nets, None)?;
+            }
+            wifi_set_ui::action::SCAN => {
+                let nets = aristotle_hal::wifi::scan().unwrap_or_default();
+                self.show_wifi_settings(Refresh::Auto, 0, settings_page, nets, None)?;
+            }
+            wifi_set_ui::action::DISCONNECT => {
+                let _ = aristotle_hal::wifi::disconnect();
+                self.show_wifi_settings(Refresh::Auto, page, settings_page, networks, None)?;
+            }
+            wifi_set_ui::action::FORGET_CURRENT => {
+                if let Some(ssid) = aristotle_hal::wifi::status().connected_ssid {
+                    let _ = aristotle_hal::wifi::forget(&ssid);
+                }
+                let nets = aristotle_hal::wifi::scan().unwrap_or_default();
+                self.show_wifi_settings(Refresh::Auto, 0, settings_page, nets, None)?;
+            }
+            id if id >= wifi_set_ui::action::CONNECT_BASE => {
+                let idx = (id - wifi_set_ui::action::CONNECT_BASE) as usize;
+                if let Some(net) = networks.get(idx) {
+                    let msg = match aristotle_hal::wifi::connect(&net.ssid, None) {
+                        Ok(()) => {
+                            self.time_sync.schedule_auto(Duration::from_secs(4));
+                            Some(tr(Msg::DeviceSettingsWifiConnecting).to_string())
+                        }
+                        Err(e) => Some(e.to_string()),
+                    };
+                    self.show_wifi_settings(Refresh::Auto, page, settings_page, networks, msg)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(Flow::Continue)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn show_bluetooth_settings(
+        &mut self,
+        refresh: Refresh,
+        page: usize,
+        settings_page: usize,
+        devices: Vec<aristotle_hal::bluetooth::BluetoothDevice>,
+        scanning: bool,
+        message: Option<String>,
+        auth_prompt: Option<bt_ui::BluetoothAuthPrompt>,
+    ) -> Result<(), Error> {
+        let facts = Facts::read(&self.battery, &self.root);
+        let st = aristotle_hal::bluetooth::status();
+        let rows: Vec<bt_ui::BluetoothRow> = devices
+            .iter()
+            .map(|d| bt_ui::BluetoothRow {
+                mac: d.mac.clone(),
+                name: d.name.clone(),
+                paired: d.paired,
+                connected: d.connected,
+                rssi: d.rssi,
+            })
+            .collect();
+        let connected_row = st.connected_device.as_ref().map(|d| bt_ui::BluetoothRow {
+            mac: d.mac.clone(),
+            name: d.name.clone(),
+            paired: d.paired,
+            connected: d.connected,
+            rssi: d.rssi,
+        });
+        let view = bt_ui::BluetoothSettingsView {
+            status: facts.status_line(),
+            available: st.available,
+            powered: st.powered,
+            scanning,
+            connected_device: connected_row.as_ref(),
+            message: message.as_deref(),
+            devices: &rows,
+            auth_prompt: auth_prompt.as_ref(),
+        };
+        let (tree, ids) = bt_ui::BluetoothSettingsUi::build(&mut self.ui.text, &self.styles, &view);
+        self.ui.set_tree_with(tree, refresh);
+        self.ui.layout();
+        if let Some(list) = ids.list {
+            if page > 0 {
+                self.ui.tree.set_page(list, page);
+                self.ui.layout();
+            }
+        }
+        ids.sync_pager(&mut self.ui.tree);
+        self.screen = Screen::BluetoothSettings {
+            ids,
+            page,
+            settings_page,
+            devices,
+            scanning,
+            message,
+            auth_prompt,
+        };
+        self.render_ui()
+    }
+
+    fn start_bluetooth_scan(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.bt_worker = Some(rx);
+        std::thread::spawn(move || {
+            let devices = aristotle_hal::bluetooth::scan(5)
+                .unwrap_or_else(|_| aristotle_hal::bluetooth::list_devices());
+            let _ = tx.send(BluetoothWorkerMsg::ScanDone(devices));
+            wake::notify();
+        });
+    }
+
+    fn start_bluetooth_pair(
+        &mut self,
+        mac: String,
+        name: String,
+        pin: Option<String>,
+        confirm_passkey: bool,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.bt_worker = Some(rx);
+        std::thread::spawn(move || {
+            let outcome =
+                aristotle_hal::bluetooth::pair_and_connect(&mac, pin.as_deref(), confirm_passkey);
+            let devices = aristotle_hal::bluetooth::list_devices();
+            let _ = tx.send(BluetoothWorkerMsg::PairDone {
+                name,
+                outcome,
+                devices,
+            });
+            wake::notify();
+        });
+    }
+
+    fn poll_bluetooth_worker(&mut self, input: Option<&mut Input>) -> Result<(), Error> {
+        let msg = match self.bt_worker.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(m)) => {
+                self.bt_worker = None;
+                m
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.bt_worker = None;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+
+        let (page, settings_page, prev_devices) = match &self.screen {
+            Screen::BluetoothSettings {
+                page,
+                settings_page,
+                devices,
+                ..
+            } => (*page, *settings_page, devices.clone()),
+            _ => {
+                if let BluetoothWorkerMsg::PairDone {
+                    outcome: aristotle_hal::bluetooth::PairOutcome::PairedAndConnected,
+                    ..
+                } = msg
+                {
+                    if let Some(inp) = input {
+                        inp.refresh_bluetooth_inputs();
+                    }
+                }
+                return Ok(());
+            }
+        };
+
+        match msg {
+            BluetoothWorkerMsg::ScanDone(devices) => {
+                self.show_bluetooth_settings(
+                    Refresh::Auto,
+                    0,
+                    settings_page,
+                    devices,
+                    false,
+                    None,
+                    None,
+                )?;
+            }
+            BluetoothWorkerMsg::PairDone {
+                name,
+                outcome,
+                devices,
+            } => {
+                use aristotle_hal::bluetooth::PairOutcome;
+                let devices = if devices.is_empty() {
+                    prev_devices
+                } else {
+                    devices
+                };
+                match outcome {
+                    PairOutcome::PairedAndConnected => {
+                        if let Some(inp) = input {
+                            inp.refresh_bluetooth_inputs();
+                        }
+                        self.show_bluetooth_settings(
+                            Refresh::Auto,
+                            0,
+                            settings_page,
+                            devices,
+                            false,
+                            Some(format!("{name}: {}", tr(Msg::DeviceSettingsBtConnected))),
+                            None,
+                        )?;
+                    }
+                    PairOutcome::PairedNotConnected(err) => {
+                        self.show_bluetooth_settings(
+                            Refresh::Auto,
+                            page,
+                            settings_page,
+                            devices,
+                            false,
+                            Some(err),
+                            None,
+                        )?;
+                    }
+                    PairOutcome::PinRequired { mac, prompt } => {
+                        let modal = bt_ui::BluetoothAuthPrompt::new_pin(mac, name, Some(prompt));
+                        self.show_bluetooth_settings(
+                            Refresh::Auto,
+                            page,
+                            settings_page,
+                            devices,
+                            false,
+                            None,
+                            Some(modal),
+                        )?;
+                    }
+                    PairOutcome::ConfirmPasskey { mac, passkey } => {
+                        let modal =
+                            bt_ui::BluetoothAuthPrompt::ConfirmPasskey { mac, name, passkey };
+                        self.show_bluetooth_settings(
+                            Refresh::Auto,
+                            page,
+                            settings_page,
+                            devices,
+                            false,
+                            None,
+                            Some(modal),
+                        )?;
+                    }
+                    PairOutcome::Failed(err) => {
+                        self.show_bluetooth_settings(
+                            Refresh::Auto,
+                            page,
+                            settings_page,
+                            devices,
+                            false,
+                            Some(err),
+                            None,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn on_bluetooth_settings_event(&mut self, ev: UiEvent) -> Result<Flow, Error> {
+        let UiEvent::Action { id, .. } = ev else {
+            return Ok(Flow::Continue);
+        };
+        let (page, settings_page, devices, scanning, mut auth_prompt) = match &mut self.screen {
+            Screen::BluetoothSettings {
+                ids,
+                page,
+                settings_page,
+                devices,
+                scanning,
+                auth_prompt,
+                ..
+            } => {
+                if auth_prompt.is_none() {
+                    if id == bt_ui::action::BACK {
+                        let sp = *settings_page;
+                        return self
+                            .show_settings(Refresh::Full, sp)
+                            .map(|_| Flow::Continue);
+                    }
+                    if ids.handle_pager(&mut self.ui.tree, id) {
+                        if let Some(list) = ids.list {
+                            *page = self.ui.tree.page(list).0;
+                        }
+                        self.render_ui()?;
+                        return Ok(Flow::Continue);
+                    }
+                }
+                (
+                    *page,
+                    *settings_page,
+                    devices.clone(),
+                    *scanning,
+                    auth_prompt.clone(),
+                )
+            }
+            _ => return Ok(Flow::Continue),
+        };
+
+        // Handle active PIN entry or SSP Passkey confirmation modal first.
+        if let Some(mut modal) = auth_prompt.take() {
+            match id {
+                bt_ui::action::PIN_CANCEL | bt_ui::action::PASSKEY_CANCEL => {
+                    self.show_bluetooth_settings(
+                        Refresh::Auto,
+                        page,
+                        settings_page,
+                        devices,
+                        scanning,
+                        None,
+                        None,
+                    )?;
+                }
+                bt_ui::action::PIN_CONFIRM | aristotle_ui::keyboard::action::CONFIRM => {
+                    if let bt_ui::BluetoothAuthPrompt::PinEntry {
+                        mac,
+                        name,
+                        keyboard,
+                        ..
+                    } = modal
+                    {
+                        let pin = keyboard.committed.trim().to_string();
+                        if pin.is_empty() {
+                            let retry = bt_ui::BluetoothAuthPrompt::new_pin(
+                                mac,
+                                name,
+                                Some(tr(Msg::DeviceSettingsBtPinPlaceholder).to_string()),
+                            );
+                            self.show_bluetooth_settings(
+                                Refresh::Auto,
+                                page,
+                                settings_page,
+                                devices,
+                                false,
+                                None,
+                                Some(retry),
+                            )?;
+                        } else {
+                            self.start_bluetooth_pair(mac, name, Some(pin), true);
+                            self.show_bluetooth_settings(
+                                Refresh::Auto,
+                                page,
+                                settings_page,
+                                devices,
+                                true,
+                                Some(tr(Msg::DeviceSettingsBtPairing).to_string()),
+                                None,
+                            )?;
+                        }
+                    }
+                }
+                bt_ui::action::PASSKEY_ACCEPT => {
+                    if let bt_ui::BluetoothAuthPrompt::ConfirmPasskey { mac, name, .. } = modal {
+                        self.start_bluetooth_pair(mac, name, None, true);
+                        self.show_bluetooth_settings(
+                            Refresh::Auto,
+                            page,
+                            settings_page,
+                            devices,
+                            true,
+                            Some(tr(Msg::DeviceSettingsBtPairing).to_string()),
+                            None,
+                        )?;
+                    }
+                }
+                other => {
+                    if modal.handle_keyboard_action(other) {
+                        self.show_bluetooth_settings(
+                            Refresh::Auto,
+                            page,
+                            settings_page,
+                            devices,
+                            scanning,
+                            None,
+                            Some(modal),
+                        )?;
+                    }
+                }
+            }
+            return Ok(Flow::Continue);
+        }
+
+        match id {
+            bt_ui::action::BT_TOGGLE => {
+                let st = aristotle_hal::bluetooth::status();
+                let target = !st.powered;
+                let msg = aristotle_hal::bluetooth::set_powered(target)
+                    .err()
+                    .map(|e| e.to_string());
+                if target && msg.is_none() {
+                    let devs = aristotle_hal::bluetooth::list_devices();
+                    self.start_bluetooth_scan();
+                    self.show_bluetooth_settings(
+                        Refresh::Auto,
+                        0,
+                        settings_page,
+                        devs,
+                        true,
+                        None,
+                        None,
+                    )?;
+                } else {
+                    self.show_bluetooth_settings(
+                        Refresh::Auto,
+                        0,
+                        settings_page,
+                        Vec::new(),
+                        false,
+                        msg,
+                        None,
+                    )?;
+                }
+            }
+            bt_ui::action::SCAN => {
+                if !scanning {
+                    self.start_bluetooth_scan();
+                    self.show_bluetooth_settings(
+                        Refresh::Auto,
+                        0,
+                        settings_page,
+                        devices,
+                        true,
+                        None,
+                        None,
+                    )?;
+                }
+            }
+            bt_ui::action::DISCONNECT => {
+                let msg = if let Some(dev) = aristotle_hal::bluetooth::status().connected_device {
+                    aristotle_hal::bluetooth::disconnect(&dev.mac)
+                        .err()
+                        .map(|e| e.to_string())
+                } else {
+                    None
+                };
+                let devs = aristotle_hal::bluetooth::list_devices();
+                self.show_bluetooth_settings(
+                    Refresh::Auto,
+                    page,
+                    settings_page,
+                    devs,
+                    false,
+                    msg,
+                    None,
+                )?;
+            }
+            bt_ui::action::FORGET_CURRENT => {
+                let msg = if let Some(dev) = aristotle_hal::bluetooth::status().connected_device {
+                    aristotle_hal::bluetooth::remove(&dev.mac)
+                        .err()
+                        .map(|e| e.to_string())
+                } else {
+                    None
+                };
+                let devs = aristotle_hal::bluetooth::list_devices();
+                self.show_bluetooth_settings(
+                    Refresh::Auto,
+                    0,
+                    settings_page,
+                    devs,
+                    false,
+                    msg,
+                    None,
+                )?;
+            }
+            id if id >= bt_ui::action::PAIR_PIN_BASE => {
+                let idx = (id - bt_ui::action::PAIR_PIN_BASE) as usize;
+                if let Some(dev) = devices.get(idx) {
+                    let modal = bt_ui::BluetoothAuthPrompt::new_pin(
+                        dev.mac.clone(),
+                        dev.name.clone(),
+                        None,
+                    );
+                    self.show_bluetooth_settings(
+                        Refresh::Auto,
+                        page,
+                        settings_page,
+                        devices,
+                        scanning,
+                        None,
+                        Some(modal),
+                    )?;
+                }
+            }
+            id if id >= bt_ui::action::CONNECT_BASE => {
+                let idx = (id - bt_ui::action::CONNECT_BASE) as usize;
+                if let Some(dev) = devices.get(idx) {
+                    self.start_bluetooth_pair(dev.mac.clone(), dev.name.clone(), None, false);
+                    self.show_bluetooth_settings(
+                        Refresh::Auto,
+                        page,
+                        settings_page,
+                        devices,
+                        true,
+                        Some(tr(Msg::DeviceSettingsBtPairing).to_string()),
+                        None,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn show_time_settings(
+        &mut self,
+        refresh: Refresh,
+        page: usize,
+        settings_page: usize,
+        message: Option<String>,
+    ) -> Result<(), Error> {
+        let facts = Facts::status(&self.battery);
+        let now_display = system::local_time()
+            .map(|lt| {
+                let hm = aristotle_screen::format_clock_hm(lt.hour, lt.minute, system::clock_24h());
+                format!("{:04}-{:02}-{:02}  {hm}", lt.year, lt.month, lt.day)
+            })
+            .unwrap_or_else(|| "--:--".to_string());
+        let tz_id = self.prefs.timezone.as_deref().unwrap_or("Asia/Shanghai");
+        let view = time_ui::TimeSettingsView {
+            status: facts.status_line(),
+            now_display: &now_display,
+            clock_24h: self.prefs.clock_24h,
+            timezone_id: tz_id,
+            syncing: self.time_sync.is_syncing(),
+            message: message.as_deref(),
+        };
+        let (tree, ids) = time_ui::TimeSettingsUi::build(&mut self.ui.text, &self.styles, &view);
+        self.ui.set_tree_with(tree, refresh);
+        self.ui.layout();
+        if page > 0 {
+            self.ui.tree.set_page(ids.list, page);
+            self.ui.layout();
+        }
+        ids.sync_pager(&mut self.ui.tree);
+        self.screen = Screen::TimeSettings {
+            ids,
+            page,
+            settings_page,
+            message,
+        };
+        self.render_ui()
+    }
+
+    /// Apply an authoritative UTC UNIX timestamp globally: write the kernel
+    /// clock + hardware RTC when permitted (clearing the fallback offset), or
+    /// store the exact fallback offset in both the process-wide atomic and
+    /// persisted prefs.
+    fn apply_unix_time(&mut self, target_unix: i64) {
+        if system::set_system_time(target_unix).is_ok() {
+            self.prefs.clock_offset_secs = 0;
+        } else {
+            self.prefs.clock_offset_secs = target_unix.saturating_sub(system::raw_unix_now());
+        }
+        system::set_clock_offset(self.prefs.clock_offset_secs);
+        self.home_clock = (u32::MAX, u32::MAX);
+        self.save_prefs();
+    }
+
+    fn on_time_settings_event(&mut self, ev: UiEvent) -> Result<Flow, Error> {
+        let UiEvent::Action { id, .. } = ev else {
+            return Ok(Flow::Continue);
+        };
+        let (page, settings_page) = match &mut self.screen {
+            Screen::TimeSettings {
+                ids,
+                page,
+                settings_page,
+                ..
+            } => {
+                if id == time_ui::action::BACK {
+                    let sp = *settings_page;
+                    return self
+                        .show_settings(Refresh::Full, sp)
+                        .map(|_| Flow::Continue);
+                }
+                if ids.handle_pager(&mut self.ui.tree, id) {
+                    *page = self.ui.tree.page(ids.list).0;
+                    self.render_ui()?;
+                    return Ok(Flow::Continue);
+                }
+                (*page, *settings_page)
+            }
+            _ => return Ok(Flow::Continue),
+        };
+        let msg = None;
+        match id {
+            time_ui::action::CLOCK_24H => {
+                self.prefs.clock_24h = !self.prefs.clock_24h;
+                system::set_clock_24h(self.prefs.clock_24h);
+                self.home_clock = (u32::MAX, u32::MAX);
+                self.save_prefs();
+            }
+            time_ui::action::SYNC_NET => {
+                self.time_sync.start_manual(wake::signal);
+            }
+            time_ui::action::YEAR_DOWN
+            | time_ui::action::YEAR_UP
+            | time_ui::action::MONTH_DOWN
+            | time_ui::action::MONTH_UP
+            | time_ui::action::DAY_DOWN
+            | time_ui::action::DAY_UP
+            | time_ui::action::HOUR_DOWN
+            | time_ui::action::HOUR_UP
+            | time_ui::action::MINUTE_DOWN
+            | time_ui::action::MINUTE_UP => {
+                let current = system::unix_now();
+                let target = match id {
+                    time_ui::action::YEAR_DOWN => device_settings::shift_local_months(current, -12),
+                    time_ui::action::YEAR_UP => device_settings::shift_local_months(current, 12),
+                    time_ui::action::MONTH_DOWN => device_settings::shift_local_months(current, -1),
+                    time_ui::action::MONTH_UP => device_settings::shift_local_months(current, 1),
+                    time_ui::action::DAY_DOWN => current.saturating_sub(86_400),
+                    time_ui::action::DAY_UP => current.saturating_add(86_400),
+                    time_ui::action::HOUR_DOWN => current.saturating_sub(3_600),
+                    time_ui::action::HOUR_UP => current.saturating_add(3_600),
+                    time_ui::action::MINUTE_DOWN => current.saturating_sub(60),
+                    _ => current.saturating_add(60),
+                };
+                self.apply_unix_time(target);
+            }
+            id if id >= time_ui::action::TZ_BASE => {
+                let idx = (id - time_ui::action::TZ_BASE) as usize;
+                if let Some(tz) = aristotle_screen::TIMEZONES.get(idx) {
+                    system::apply_timezone(tz.posix_tz, tz.id);
+                    self.prefs.timezone = Some(tz.id.to_string());
+                    self.home_clock = (u32::MAX, u32::MAX);
+                    self.save_prefs();
+                }
+            }
+            _ => {}
+        }
+        self.show_time_settings(Refresh::Auto, page, settings_page, msg)?;
+        Ok(Flow::Continue)
+    }
+
+    fn show_key_settings(
+        &mut self,
+        refresh: Refresh,
+        page: usize,
+        settings_page: usize,
+    ) -> Result<(), Error> {
+        let facts = Facts::read(&self.battery, &self.root);
+        let view = keys_ui::KeySettingsView {
+            status: facts.status_line(),
+            has_page_keys: self.device_caps.has_page_keys,
+            invert_page_keys: self.prefs.invert_page_keys,
+            long_press: aristotle_screen::KeyLongPressAction::from_index(
+                self.prefs.page_key_long_press,
+            ),
+            disable_touch_turn: self.prefs.disable_touch_turn,
+            touch_zone: aristotle_screen::TouchZoneLayout::from_index(self.prefs.touch_zone_layout),
+        };
+        let (tree, ids) = keys_ui::KeySettingsUi::build(&mut self.ui.text, &self.styles, &view);
+        self.ui.set_tree_with(tree, refresh);
+        self.ui.layout();
+        if page > 0 {
+            self.ui.tree.set_page(ids.list, page);
+            self.ui.layout();
+        }
+        ids.sync_pager(&mut self.ui.tree);
+        self.screen = Screen::KeySettings {
+            ids,
+            page,
+            settings_page,
+        };
+        self.render_ui()
+    }
+
+    fn on_key_settings_event(&mut self, ev: UiEvent) -> Result<Flow, Error> {
+        let UiEvent::Action { id, .. } = ev else {
+            return Ok(Flow::Continue);
+        };
+        let (page, settings_page) = match &mut self.screen {
+            Screen::KeySettings {
+                ids,
+                page,
+                settings_page,
+            } => {
+                if id == keys_ui::action::BACK {
+                    let sp = *settings_page;
+                    return self
+                        .show_settings(Refresh::Full, sp)
+                        .map(|_| Flow::Continue);
+                }
+                if ids.handle_pager(&mut self.ui.tree, id) {
+                    *page = self.ui.tree.page(ids.list).0;
+                    self.render_ui()?;
+                    return Ok(Flow::Continue);
+                }
+                (*page, *settings_page)
+            }
+            _ => return Ok(Flow::Continue),
+        };
+        match id {
+            keys_ui::action::INVERT_KEYS => {
+                self.prefs.invert_page_keys = !self.prefs.invert_page_keys;
+                self.save_prefs();
+            }
+            keys_ui::action::LONG_PRESS_ACTION => {
+                let cur = aristotle_screen::KeyLongPressAction::from_index(
+                    self.prefs.page_key_long_press,
+                );
+                self.prefs.page_key_long_press = cur.next().index();
+                self.save_prefs();
+            }
+            keys_ui::action::DISABLE_TOUCH_TURN => {
+                self.prefs.disable_touch_turn = !self.prefs.disable_touch_turn;
+                self.save_prefs();
+            }
+            keys_ui::action::TOUCH_ZONE_LAYOUT => {
+                let cur =
+                    aristotle_screen::TouchZoneLayout::from_index(self.prefs.touch_zone_layout);
+                self.prefs.touch_zone_layout = cur.next().index();
+                self.save_prefs();
+            }
+            _ => {}
+        }
+        self.show_key_settings(Refresh::Auto, page, settings_page)?;
+        Ok(Flow::Continue)
+    }
+
+    fn open_reader_bars_from_reader(&mut self) -> Result<(), Error> {
+        let Screen::Reader(reading) =
+            std::mem::replace(&mut self.screen, Screen::Settings { ids: None, page: 0 })
+        else {
+            return Ok(());
+        };
+        let initial_config = self.prefs.reader_bars.to_config();
+        self.show_reader_bars(
+            Refresh::Full,
+            0,
+            ReaderBarsReturn::Reader {
+                reading,
+                initial_config,
+            },
+        )
+    }
+
+    fn show_reader_bars(
+        &mut self,
+        refresh: Refresh,
+        page: usize,
+        mut back: ReaderBarsReturn,
+    ) -> Result<(), Error> {
+        let facts = Facts::read(&self.battery, &self.root);
+        let status = facts.status_line();
+        let config = self.prefs.reader_bars.to_config();
+        let (book_title, chapter_title) = match &mut back {
+            ReaderBarsReturn::Reader { reading, .. } => {
+                let title = reading.session.title.clone();
+                let ch = reading
+                    .session
+                    .chapter_title(reading.session.current)
+                    .unwrap_or_else(|| title.clone());
+                (title, ch)
+            }
+            ReaderBarsReturn::Settings(_) => (
+                "曹雪芹 · 红楼梦".to_string(),
+                "第七回 送宫花贾琏戏熙凤".to_string(),
+            ),
+        };
+        let battery_pct = status
+            .battery
+            .map(|b| (b * 100.0).round().clamp(0.0, 100.0) as u8)
+            .unwrap_or(84);
+        let view = bars_ui::ReaderBarsView {
+            status,
+            config,
+            book_title: &book_title,
+            chapter_title: &chapter_title,
+            clock: status.clock,
+            battery_pct,
+            light_step: self.light_step(),
+            light_max: LIGHT_STEPS,
+        };
+        let (tree, ids) = bars_ui::ReaderBarsUi::build(&mut self.ui.text, &self.styles, &view);
+        self.ui.set_tree_with(tree, refresh);
+        self.ui.layout();
+        if page > 0 {
+            self.ui.tree.set_page(ids.list, page);
+            self.ui.layout();
+        }
+        ids.sync_pager(&mut self.ui.tree);
+        self.screen = Screen::ReaderBars { ids, page, back };
+        self.render_ui()
+    }
+
+    fn on_reader_bars_event(&mut self, ev: UiEvent) -> Result<Flow, Error> {
+        let UiEvent::Action { id, .. } = ev else {
+            return Ok(Flow::Continue);
+        };
+        if id == bars_ui::action::BACK {
+            let Screen::ReaderBars { back, .. } =
+                std::mem::replace(&mut self.screen, Screen::Settings { ids: None, page: 0 })
+            else {
+                return Ok(Flow::Continue);
+            };
+            match back {
+                ReaderBarsReturn::Settings(settings_page) => {
+                    return self
+                        .show_settings(Refresh::Full, settings_page)
+                        .map(|_| Flow::Continue);
+                }
+                ReaderBarsReturn::Reader {
+                    mut reading,
+                    initial_config,
+                } => {
+                    let new_config = self.prefs.reader_bars.to_config();
+                    let status = self.device_bar_status();
+                    reading.session.set_bar_status(status);
+                    let needs_relayout = initial_config.changes_body_geometry(new_config);
+                    if !needs_relayout {
+                        reading.session.set_bar_config(new_config);
+                    }
+                    let menu_settings = reading.settings;
+                    self.screen = Screen::Reader(reading);
+                    self.rebuild_reader(Refresh::Full)?;
+                    if needs_relayout {
+                        self.request_restyle(menu_settings)?;
+                    }
+                    return Ok(Flow::Continue);
+                }
+            }
+        }
+        if let Screen::ReaderBars { ids, page, .. } = &mut self.screen {
+            if ids.handle_pager(&mut self.ui.tree, id) {
+                *page = self.ui.tree.page(ids.list).0;
+                self.render_ui()?;
+                return Ok(Flow::Continue);
+            }
+        }
+        let mut config = self.prefs.reader_bars.to_config();
+        if bars_ui::apply_action(&mut config, id) {
+            self.prefs.reader_bars = prefs::ReaderBarPrefs::from_config(config);
+            self.save_prefs();
+            let Screen::ReaderBars { page, back, .. } =
+                std::mem::replace(&mut self.screen, Screen::Settings { ids: None, page: 0 })
+            else {
+                return Ok(Flow::Continue);
+            };
+            self.show_reader_bars(Refresh::Auto, page, back)?;
+        }
+        Ok(Flow::Continue)
     }
 
     /// The events of the page that picks the screensaver's own picture.
@@ -4699,6 +6179,155 @@ impl App {
                 self.set_light_step(step);
             }
             a::NIGHT => self.set_night(!self.prefs.night),
+            a::READER_BARS => {
+                return self
+                    .show_reader_bars(Refresh::Full, 0, ReaderBarsReturn::Settings(page))
+                    .map(|_| Flow::Continue);
+            }
+            a::WIFI_SETTINGS => {
+                let nets = aristotle_hal::wifi::scan().unwrap_or_default();
+                return self
+                    .show_wifi_settings(Refresh::Full, 0, page, nets, None)
+                    .map(|_| Flow::Continue);
+            }
+            a::BLUETOOTH_SETTINGS => {
+                let devs = aristotle_hal::bluetooth::list_devices();
+                let st = aristotle_hal::bluetooth::status();
+                let scanning = st.powered;
+                if scanning {
+                    self.start_bluetooth_scan();
+                }
+                return self
+                    .show_bluetooth_settings(Refresh::Full, 0, page, devs, scanning, None, None)
+                    .map(|_| Flow::Continue);
+            }
+            a::TTS_SETTINGS => {
+                return self
+                    .show_tts_settings(Refresh::Full, TtsSettingsReturn::Settings(page), None, None)
+                    .map(|_| Flow::Continue);
+            }
+            a::TIME_SETTINGS => {
+                return self
+                    .show_time_settings(Refresh::Full, 0, page, None)
+                    .map(|_| Flow::Continue);
+            }
+            a::KEY_SETTINGS => {
+                return self
+                    .show_key_settings(Refresh::Full, 0, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::WARMTH_DOWN | a::WARMTH_UP => {
+                let next = if id == a::WARMTH_DOWN {
+                    self.prefs.warmth.saturating_sub(1)
+                } else {
+                    (self.prefs.warmth + 1).min(LIGHT_STEPS)
+                };
+                self.prefs.warmth = next;
+                self.sleep_ctl.set_warmth(next);
+                self.save_prefs();
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::AUTO_BRIGHTNESS => {
+                self.prefs.auto_brightness = !self.prefs.auto_brightness;
+                self.sleep_ctl
+                    .set_auto_brightness(self.prefs.auto_brightness);
+                self.save_prefs();
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::ORIENTATION => {
+                let cur = aristotle_screen::Orientation::from_index(self.prefs.orientation);
+                let next = cur.next(self.device_caps.has_accelerometer);
+                self.prefs.orientation = next.index();
+                self.apply_orientation(next);
+                self.save_prefs();
+                return self
+                    .show_settings(Refresh::Full, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::SLEEP_WIFI_OFF => {
+                self.prefs.sleep_wifi_off = !self.prefs.sleep_wifi_off;
+                self.save_prefs();
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::SHOW_BATTERY_PCT => {
+                self.prefs.show_battery_pct = !self.prefs.show_battery_pct;
+                aristotle_ui::status::set_show_battery_pct(self.prefs.show_battery_pct);
+                self.save_prefs();
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::DICTIONARY => {
+                if let Some(svc) = &self.dict {
+                    if !svc.dicts.is_empty() {
+                        let cur_idx = self
+                            .prefs
+                            .default_dictionary
+                            .as_deref()
+                            .and_then(|name| svc.dicts.iter().position(|d| d.label == name))
+                            .unwrap_or(0);
+                        let next = &svc.dicts[(cur_idx + 1) % svc.dicts.len()];
+                        self.prefs.default_dictionary = Some(next.label.clone());
+                        self.save_prefs();
+                    }
+                }
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::APP_PIN => {
+                let mode = if self.prefs.app_pin_hash.is_some() {
+                    pin_ui::PinMode::VerifyOld
+                } else {
+                    pin_ui::PinMode::SetNew
+                };
+                return self
+                    .show_pin_lock(Refresh::Full, mode, String::new(), None, None, page, None)
+                    .map(|_| Flow::Continue);
+            }
+            a::FONT_FOLDER => {
+                self.font_picker_return = Some(SoonBack::Settings { page });
+                let current = self.active_fonts_dir();
+                return self
+                    .show_scan_sources(
+                        Refresh::Full,
+                        ui_scan::PickerMode::FontDestination,
+                        Some(&current),
+                    )
+                    .map(|_| Flow::Continue);
+            }
+            a::CLEAR_CACHE => {
+                let freed = device_settings::clear_caches(self.lib.data_dir());
+                self.cache_status = Some(format!(
+                    "{} ({})",
+                    tr(Msg::DeviceSettingsDevCacheCleared),
+                    aristotle_i18n::fmt_bytes(freed)
+                ));
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::REBOOT => {
+                if !self.reboot_armed {
+                    self.reboot_armed = true;
+                    return self
+                        .show_settings(Refresh::Auto, page)
+                        .map(|_| Flow::Continue);
+                }
+                self.reboot_armed = false;
+                self.save_prefs();
+                self.saver.save(&self.lib);
+                self.speed.save();
+                self.stats.flush();
+                let _ = system::reboot_device();
+                return Ok(Flow::Quit);
+            }
             a::SYNC => {
                 return self
                     .open_network(catalogs::NetView::Sync, page)
@@ -4752,7 +6381,15 @@ impl App {
                     .map(|_| Flow::Continue);
             }
             a::REFRESH_INTERVAL => {
-                self.prefs.refresh_interval = (self.prefs.refresh_interval + 1) % 3;
+                self.prefs.refresh_interval =
+                    (self.prefs.refresh_interval + 1) % set_ui::REFRESH_OPTIONS.len() as u8;
+                self.save_prefs();
+                return self
+                    .show_settings(Refresh::Auto, page)
+                    .map(|_| Flow::Continue);
+            }
+            a::NIGHT_DIM_REFRESH => {
+                self.prefs.night_dim_refresh = !self.prefs.night_dim_refresh;
                 self.save_prefs();
                 return self
                     .show_settings(Refresh::Auto, page)
@@ -4948,6 +6585,13 @@ impl App {
         }
         // The device is going to sleep: nothing listens on the network now.
         self.stop_wifi();
+        if self.prefs.sleep_wifi_off && !self.tts_active() {
+            let st = aristotle_hal::wifi::status();
+            self.wifi_was_on_before_sleep = st.enabled && !st.airplane_mode;
+            if self.wifi_was_on_before_sleep {
+                let _ = aristotle_hal::wifi::set_wireless_enabled(false);
+            }
+        }
         self.save_snapshot();
         self.saver.save(&self.lib);
         self.speed.save();
@@ -4984,7 +6628,7 @@ impl App {
             let picked = stored
                 .as_deref()
                 .filter(|name| pictures.iter().any(|p| p.name == *name));
-            if stored.is_some() && picked.is_none() {
+            if stored.is_some() && picked.is_none() && std::fs::read_dir(&dir).is_ok() {
                 self.prefs.sleep_image = None;
                 self.save_prefs();
             }
@@ -5026,7 +6670,7 @@ impl App {
                 "sleep: own picture ({})",
                 if by_powerd { "powerd" } else { "own" }
             );
-            return self.submit_ui(Content::Chrome);
+            return self.present_sleep_screen();
         }
         let book_rec = shelf::current_book(&self.lib).cloned();
         let sources = self.channel_sources();
@@ -5035,7 +6679,10 @@ impl App {
                 shelf::screen_book_with_sources(&self.lib, rec, &mut self.covers, &sources);
             // The screensaver shows one book large: its own cover at the
             // size of the sleep screen, made from the book the first time.
-            book.cover = self.covers.get_large(&self.lib, rec);
+            // Keep the cached thumbnail as fallback when the large cover cannot be made.
+            if let Some(large) = self.covers.get_large(&self.lib, rec) {
+                book.cover = Some(large);
+            }
             book
         });
         let tree = match self.prefs.sleep_screen {
@@ -5101,12 +6748,47 @@ impl App {
             "sleep: screensaver ({})",
             if by_powerd { "powerd" } else { "own" }
         );
-        self.submit_ui(Content::Chrome)
+        self.present_sleep_screen()
+    }
+
+    /// Submit the sleep screen, wait until the panel finishes driving it, and
+    /// arm a brief watch to repair any late external overwrite of `/dev/fb0`.
+    fn present_sleep_screen(&mut self) -> Result<(), Error> {
+        self.submit_ui(Content::Chrome)?;
+        self.panel.wait_idle();
+        self.sleep_watch = Some(StartupWatch {
+            until: Instant::now() + Duration::from_secs(5),
+            repairs: 3,
+        });
+        Ok(())
+    }
+
+    /// Force a full-screen repaint of the active screensaver tree and wait for
+    /// the panel to finish displaying it.
+    fn repaint_sleep_screen(&mut self) -> Result<(), Error> {
+        self.ui.request_full_refresh();
+        self.submit_ui(Content::Chrome)?;
+        self.panel.wait_idle();
+        Ok(())
     }
 
     /// powerd left its screensaver, or a touch woke ours: the light and
     /// the screen come back.
     fn wake(&mut self, by_powerd: bool) -> Result<(), Error> {
+        self.sleep_watch = None;
+        // Never allow the Kindle's native accelerometer/powerd to flip fb0's
+        // rotation on wakeup behind our back, which would desync display from
+        // the touchscreen transform locked at startup.
+        let rotate_drifted = self.panel.enforce_fb_rotate().unwrap_or(false);
+        self.startup_watch = Some(StartupWatch {
+            until: Instant::now() + Duration::from_secs(3),
+            repairs: 6,
+        });
+        if std::mem::take(&mut self.screensaver_blanket_dirty) && self.sleep_ctl.managed() {
+            if let Err(e) = aristotle_hal::powerd::blanket(false, "screensaver") {
+                eprintln!("aristotle: unloading blanket screensaver module on wake: {e}");
+            }
+        }
         self.ui.reset_gestures();
         if let Some(step) = self.asleep.take() {
             if std::mem::take(&mut self.light_off_by_app) {
@@ -5115,6 +6797,16 @@ impl App {
         }
         self.last_touch = Instant::now();
         self.sleep_ctl.awake(by_powerd, self.last_touch);
+        // Force clock-bearing screens (home, settings, reader bars) to refresh
+        // immediately with the elapsed wall-clock time after sleep.
+        self.home_clock = (u32::MAX, u32::MAX);
+        let wifi_re_enabled =
+            self.prefs.sleep_wifi_off && std::mem::take(&mut self.wifi_was_on_before_sleep);
+        if wifi_re_enabled {
+            let _ = aristotle_hal::wifi::set_wireless_enabled(true);
+        }
+        self.time_sync
+            .schedule_auto(Duration::from_secs(if wifi_re_enabled { 4 } else { 2 }));
         self.weread_web_resume();
         self.weread_readtime_wake();
         self.prewarm.input();
@@ -5122,12 +6814,275 @@ impl App {
             "sleep: woken ({})",
             if by_powerd { "powerd" } else { "touch" }
         );
-        let refresh = if self.prefs.sleep_screen == prefs::SleepScreen::LastScreen {
-            Refresh::Auto
-        } else {
-            Refresh::Full
-        };
+        if self.prefs.app_pin_hash.is_some()
+            && !matches!(
+                self.screen,
+                Screen::PinLock {
+                    mode: pin_ui::PinMode::Unlock,
+                    ..
+                }
+            )
+        {
+            let prev = std::mem::replace(&mut self.screen, Screen::Settings { ids: None, page: 0 });
+            return self.show_pin_lock(
+                Refresh::Full,
+                pin_ui::PinMode::Unlock,
+                String::new(),
+                None,
+                None,
+                0,
+                Some(Box::new(prev)),
+            );
+        }
+        let refresh =
+            if !rotate_drifted && self.prefs.sleep_screen == prefs::SleepScreen::LastScreen {
+                Refresh::Auto
+            } else {
+                Refresh::Full
+            };
         self.repaint_screen(refresh)
+    }
+
+    /// Apply a screen orientation change immediately via software rotation,
+    /// resizing the logical UI canvas and clearing stale prewarmed pages.
+    fn apply_orientation(&mut self, orientation: aristotle_screen::Orientation) {
+        let rot = panel::soft_rotate_for(orientation);
+        let old_size = self.panel.size();
+        self.panel.set_soft_rotate(rot);
+        let (lw, lh) = self.panel.size();
+        if (lw, lh) != old_size {
+            self.ui.resize(lw, lh);
+            self.prewarm.cancel();
+        }
+        self.ui.reset_gestures();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn show_pin_lock(
+        &mut self,
+        refresh: Refresh,
+        mode: pin_ui::PinMode,
+        digits: String,
+        first_pin: Option<String>,
+        error: Option<String>,
+        settings_page: usize,
+        resume: Option<Box<Screen>>,
+    ) -> Result<(), Error> {
+        let facts = Facts::status(&self.battery);
+        let tree = pin_ui::build(
+            &self.styles,
+            &pin_ui::PinLockView {
+                status: facts.status_line(),
+                mode,
+                entered_len: digits.len(),
+                error: error.as_deref(),
+            },
+        );
+        self.ui.set_tree_with(tree, refresh);
+        self.screen = Screen::PinLock {
+            mode,
+            digits,
+            first_pin,
+            error,
+            settings_page,
+            resume,
+        };
+        self.render_ui()
+    }
+
+    fn on_pin_lock_event(&mut self, ev: UiEvent) -> Result<Flow, Error> {
+        let UiEvent::Action { id, .. } = ev else {
+            return Ok(Flow::Continue);
+        };
+        let Screen::PinLock {
+            mode,
+            digits,
+            first_pin,
+            settings_page,
+            resume,
+            ..
+        } = std::mem::replace(&mut self.screen, Screen::Settings { ids: None, page: 0 })
+        else {
+            return Ok(Flow::Continue);
+        };
+        use pin_ui::action as pa;
+        match id {
+            pa::CANCEL if mode != pin_ui::PinMode::Unlock => {
+                self.show_settings(Refresh::Full, settings_page)?;
+                return Ok(Flow::Continue);
+            }
+            pa::CHANGE_PIN if mode == pin_ui::PinMode::Manage => {
+                self.show_pin_lock(
+                    Refresh::Auto,
+                    pin_ui::PinMode::SetNew,
+                    String::new(),
+                    None,
+                    None,
+                    settings_page,
+                    None,
+                )?;
+                return Ok(Flow::Continue);
+            }
+            pa::DISABLE_PIN if mode == pin_ui::PinMode::Manage => {
+                self.prefs.app_pin_hash = None;
+                self.save_prefs();
+                self.show_settings(Refresh::Full, settings_page)?;
+                return Ok(Flow::Continue);
+            }
+            pa::CLEAR => {
+                self.show_pin_lock(
+                    Refresh::Auto,
+                    mode,
+                    String::new(),
+                    first_pin,
+                    None,
+                    settings_page,
+                    resume,
+                )?;
+                return Ok(Flow::Continue);
+            }
+            pa::BACKSPACE => {
+                let mut digits = digits;
+                digits.pop();
+                self.show_pin_lock(
+                    Refresh::Auto,
+                    mode,
+                    digits,
+                    first_pin,
+                    None,
+                    settings_page,
+                    resume,
+                )?;
+                return Ok(Flow::Continue);
+            }
+            d if (pa::DIGIT_BASE..pa::DIGIT_BASE + 10).contains(&d) => {
+                let mut digits = digits;
+                if digits.len() < pin_ui::PIN_LEN {
+                    digits.push(char::from(b'0' + (d - pa::DIGIT_BASE) as u8));
+                }
+                if digits.len() < pin_ui::PIN_LEN {
+                    self.show_pin_lock(
+                        Refresh::Auto,
+                        mode,
+                        digits,
+                        first_pin,
+                        None,
+                        settings_page,
+                        resume,
+                    )?;
+                    return Ok(Flow::Continue);
+                }
+                // All 4 digits entered: evaluate according to mode.
+                match mode {
+                    pin_ui::PinMode::Unlock => {
+                        let ok = self
+                            .prefs
+                            .app_pin_hash
+                            .as_deref()
+                            .is_none_or(|h| prefs::verify_pin(&digits, h));
+                        if ok {
+                            if let Some(prev) = resume {
+                                self.screen = *prev;
+                                self.repaint_screen(Refresh::Full)?;
+                            } else if crate::shelf::current_book(&self.lib).is_some() {
+                                self.show_home(Refresh::Full)?;
+                            } else {
+                                self.show_library(Refresh::Full)?;
+                            }
+                        } else {
+                            self.show_pin_lock(
+                                Refresh::Auto,
+                                pin_ui::PinMode::Unlock,
+                                String::new(),
+                                None,
+                                Some(tr(Msg::DeviceSettingsDevPinWrong).to_string()),
+                                settings_page,
+                                resume,
+                            )?;
+                        }
+                    }
+                    pin_ui::PinMode::SetNew => {
+                        self.show_pin_lock(
+                            Refresh::Auto,
+                            pin_ui::PinMode::ConfirmNew,
+                            String::new(),
+                            Some(digits),
+                            None,
+                            settings_page,
+                            None,
+                        )?;
+                    }
+                    pin_ui::PinMode::ConfirmNew => {
+                        if first_pin.as_deref() == Some(digits.as_str()) {
+                            self.prefs.app_pin_hash = Some(prefs::hash_pin(&digits));
+                            self.save_prefs();
+                            self.show_settings(Refresh::Full, settings_page)?;
+                        } else {
+                            self.show_pin_lock(
+                                Refresh::Auto,
+                                pin_ui::PinMode::SetNew,
+                                String::new(),
+                                None,
+                                Some(tr(Msg::DeviceSettingsDevPinMismatch).to_string()),
+                                settings_page,
+                                None,
+                            )?;
+                        }
+                    }
+                    pin_ui::PinMode::VerifyOld => {
+                        let ok = self
+                            .prefs
+                            .app_pin_hash
+                            .as_deref()
+                            .is_none_or(|h| prefs::verify_pin(&digits, h));
+                        if ok {
+                            self.show_pin_lock(
+                                Refresh::Auto,
+                                pin_ui::PinMode::Manage,
+                                String::new(),
+                                None,
+                                None,
+                                settings_page,
+                                None,
+                            )?;
+                        } else {
+                            self.show_pin_lock(
+                                Refresh::Auto,
+                                pin_ui::PinMode::VerifyOld,
+                                String::new(),
+                                None,
+                                Some(tr(Msg::DeviceSettingsDevPinWrong).to_string()),
+                                settings_page,
+                                None,
+                            )?;
+                        }
+                    }
+                    pin_ui::PinMode::Manage => {
+                        self.show_pin_lock(
+                            Refresh::Auto,
+                            mode,
+                            String::new(),
+                            None,
+                            None,
+                            settings_page,
+                            None,
+                        )?;
+                    }
+                }
+            }
+            _ => {
+                self.show_pin_lock(
+                    Refresh::Auto,
+                    mode,
+                    digits,
+                    first_pin,
+                    None,
+                    settings_page,
+                    resume,
+                )?;
+            }
+        }
+        Ok(Flow::Continue)
     }
 
     /// Redraw the current screen with the requested refresh mode.
@@ -5146,6 +7101,114 @@ impl App {
             Screen::Settings { page, .. } => {
                 let page = *page;
                 self.show_settings(refresh, page)
+            }
+            Screen::ReaderBars { page, .. } => {
+                let page = *page;
+                let Screen::ReaderBars { back, .. } =
+                    std::mem::replace(&mut self.screen, Screen::Settings { ids: None, page: 0 })
+                else {
+                    return Ok(());
+                };
+                self.show_reader_bars(refresh, page, back)
+            }
+            Screen::WifiSettings {
+                page,
+                settings_page,
+                networks,
+                message,
+                ..
+            } => {
+                let (page, settings_page, networks, message) =
+                    (*page, *settings_page, networks.clone(), message.clone());
+                self.show_wifi_settings(refresh, page, settings_page, networks, message)
+            }
+            Screen::BluetoothSettings {
+                page,
+                settings_page,
+                devices,
+                scanning,
+                message,
+                auth_prompt,
+                ..
+            } => {
+                let (page, settings_page, devices, scanning, message, auth_prompt) = (
+                    *page,
+                    *settings_page,
+                    devices.clone(),
+                    *scanning,
+                    message.clone(),
+                    auth_prompt.clone(),
+                );
+                self.show_bluetooth_settings(
+                    refresh,
+                    page,
+                    settings_page,
+                    devices,
+                    scanning,
+                    message,
+                    auth_prompt,
+                )
+            }
+            Screen::TtsSettings { .. } => {
+                if let Screen::TtsSettings {
+                    back,
+                    message,
+                    editor,
+                    ..
+                } = std::mem::replace(&mut self.screen, Screen::Mine)
+                {
+                    self.show_tts_settings(refresh, back, message, editor)
+                } else {
+                    Ok(())
+                }
+            }
+            Screen::TtsPlayer { .. } => {
+                if let Screen::TtsPlayer { state, .. } =
+                    std::mem::replace(&mut self.screen, Screen::Mine)
+                {
+                    self.show_tts_player(refresh, state)
+                } else {
+                    Ok(())
+                }
+            }
+            Screen::TimeSettings {
+                page,
+                settings_page,
+                message,
+                ..
+            } => {
+                let (page, settings_page, message) = (*page, *settings_page, message.clone());
+                self.show_time_settings(refresh, page, settings_page, message)
+            }
+            Screen::KeySettings {
+                page,
+                settings_page,
+                ..
+            } => {
+                let (page, settings_page) = (*page, *settings_page);
+                self.show_key_settings(refresh, page, settings_page)
+            }
+            Screen::PinLock { .. } => {
+                let Screen::PinLock {
+                    mode,
+                    digits,
+                    first_pin,
+                    error,
+                    settings_page,
+                    resume,
+                } = std::mem::replace(&mut self.screen, Screen::Settings { ids: None, page: 0 })
+                else {
+                    return Ok(());
+                };
+                self.show_pin_lock(
+                    refresh,
+                    mode,
+                    digits,
+                    first_pin,
+                    error,
+                    settings_page,
+                    resume,
+                )
             }
             Screen::SleepImages { page, .. } => {
                 let page = *page;
@@ -5233,11 +7296,19 @@ impl App {
         let Some(watch) = self.startup_watch else {
             return Ok(());
         };
-        if self.asleep.is_some()
-            || matches!(self.screen, Screen::Reader(_) | Screen::Opening)
-            || Instant::now() >= watch.until
-        {
+        if self.asleep.is_some() || Instant::now() >= watch.until {
             self.startup_watch = None;
+            return Ok(());
+        }
+        if self.panel.enforce_fb_rotate().unwrap_or(false) {
+            perf!("wakeup: kernel fb0 rotate drifted; forced back and repainting");
+            self.startup_watch = (watch.repairs > 1).then(|| StartupWatch {
+                until: watch.until,
+                repairs: watch.repairs - 1,
+            });
+            return self.repaint_screen(Refresh::Full);
+        }
+        if matches!(self.screen, Screen::Reader(_) | Screen::Opening) {
             return Ok(());
         }
         if self.panel.still_shows_ui(&self.ui) {
@@ -5251,6 +7322,31 @@ impl App {
         self.repaint_screen(Refresh::Full)
     }
 
+    /// Repaint the screensaver if the system or a blank window overwrote
+    /// `/dev/fb0` shortly after entering sleep.
+    fn watch_sleep(&mut self) -> Result<(), Error> {
+        let Some(watch) = self.sleep_watch else {
+            return Ok(());
+        };
+        if self.asleep.is_none()
+            || self.usb_mode == UsbMode::DriveMode
+            || self.prefs.sleep_screen == prefs::SleepScreen::LastScreen
+            || Instant::now() >= watch.until
+        {
+            self.sleep_watch = None;
+            return Ok(());
+        }
+        if self.panel.still_shows_ui(&self.ui) {
+            return Ok(());
+        }
+        perf!("sleep: framebuffer changed while asleep; repainting screensaver");
+        self.sleep_watch = (watch.repairs > 1).then(|| StartupWatch {
+            until: watch.until,
+            repairs: watch.repairs - 1,
+        });
+        self.repaint_sleep_screen()
+    }
+
     fn poll_timeout(&self, now_us: u64, now: Instant) -> Duration {
         if self.usb_mode == UsbMode::DriveMode {
             // Wakes up periodically (1s) as a fallback in case the
@@ -5259,9 +7355,9 @@ impl App {
             return Duration::from_secs(1);
         }
         let mut timeout = Duration::MAX;
-        if self.startup_watch.is_some() {
-            // The stock GUI can draw over the first frame at any moment in
-            // its shutdown; look between its updates (STARTUP-001).
+        if self.startup_watch.is_some() || self.sleep_watch.is_some_and(|w| now < w.until) {
+            // The stock GUI or a blank window can draw over our frame shortly
+            // after takeover or entering sleep; check between its updates.
             timeout = timeout.min(Duration::from_millis(200));
         }
         if self.asleep.is_none() {
@@ -5280,6 +7376,9 @@ impl App {
         if let Some(d) = self.sleep_deadline() {
             timeout = timeout.min(d.saturating_duration_since(now));
         }
+        if let Some((deadline, _)) = self.pending_light_restore.get() {
+            timeout = timeout.min(deadline.saturating_duration_since(now));
+        }
         if self.asleep.is_none() {
             if let Screen::Reader(r) = &self.screen {
                 if let Some(t) = r.gestures.next_deadline(now_us) {
@@ -5295,10 +7394,15 @@ impl App {
         if let Some(d) = self.sleep_ctl.deadline(self.asleep.is_some()) {
             timeout = timeout.min(d.saturating_duration_since(now));
         }
-        // The clock of the home screen: the loop wakes up when the minute
-        // turns, so the time is never a minute old.
-        if let Some(d) = self.home_clock_deadline() {
+        // Wake up when a minute turns on any clock-bearing screen so the time
+        // stays globally synchronized.
+        if let Some(d) = self.clock_deadline() {
             timeout = timeout.min(d);
+        }
+        if self.asleep.is_none() {
+            if let Some(d) = self.time_sync.deadline() {
+                timeout = timeout.min(d.saturating_duration_since(now));
+            }
         }
         // A worker wakes the loop only when it ends: while a book is laid
         // out, the loop wakes up by itself to read how far it has come.
@@ -5318,46 +7422,132 @@ impl App {
         self.pending.is_some() || self.opening.is_some() || self.restyler.worker().is_some()
     }
 
-    /// How long until the clock of the home screen shows a new minute.
-    /// Nothing when the home screen is not up, or the app is asleep.
-    fn home_clock_deadline(&self) -> Option<Duration> {
-        if self.asleep.is_some() || !matches!(self.screen, Screen::Home { .. }) {
+    /// Whether the active reader screen's top or bottom bar displays the clock.
+    fn reader_shows_clock(&self) -> bool {
+        let Screen::Reader(r) = &self.screen else {
+            return false;
+        };
+        let cfg = &r.session.style.bar_config;
+        (cfg.show_header && cfg.header_slots.contains(&aristotle_screen::BarItem::Clock))
+            || (cfg.show_footer && cfg.footer_slots.contains(&aristotle_screen::BarItem::Clock))
+    }
+
+    /// How long until the visible clock shows a new minute.
+    /// Nothing while asleep or on screens that do not display a live clock.
+    fn clock_deadline(&self) -> Option<Duration> {
+        if self.asleep.is_some() {
+            return None;
+        }
+        let shows_clock = matches!(
+            self.screen,
+            Screen::Home { .. } | Screen::TimeSettings { .. } | Screen::Settings { .. }
+        ) || self.reader_shows_clock();
+        if !shows_clock {
             return None;
         }
         let t = system::local_time()?;
         Some(Duration::from_secs((60 - t.second as u64).clamp(1, 60)))
     }
 
-    /// A new minute on the home screen: the time changes, and only the
-    /// word of the clock is drawn again. At the top of the hour the whole
-    /// screen is drawn, so the date and the lunar calendar change with it.
-    fn tick_home_clock(&mut self) -> Result<(), Error> {
-        let Screen::Home { .. } = &self.screen else {
-            return Ok(());
-        };
+    /// Refresh the visible clock across screens whenever the minute turns.
+    fn tick_clock(&mut self) -> Result<(), Error> {
         let Some(t) = system::local_time() else {
             return Ok(());
         };
         if (t.hour, t.minute) == self.home_clock {
             return Ok(());
         }
-        let time = fmt_time(t.hour, t.minute);
-        let Screen::Home { view, .. } = &self.screen else {
+        match &self.screen {
+            Screen::Home { .. } => {
+                let time = aristotle_screen::format_clock_hm(t.hour, t.minute, system::clock_24h());
+                let Screen::Home { view, .. } = &self.screen else {
+                    return Ok(());
+                };
+                view.set_time(&mut self.ui.tree, &time);
+                self.ui.layout();
+                self.home_clock = (t.hour, t.minute);
+                if t.minute == 0 {
+                    // The top of the hour: the date may have turned too, so the
+                    // whole screen is drawn again.
+                    return self.show_home(Refresh::Full);
+                }
+                self.render_ui()?;
+            }
+            Screen::TimeSettings {
+                page,
+                settings_page,
+                message,
+                ..
+            } => {
+                self.home_clock = (t.hour, t.minute);
+                let (page, settings_page, message) = (*page, *settings_page, message.clone());
+                self.show_time_settings(Refresh::Auto, page, settings_page, message)?;
+            }
+            Screen::Settings { page, .. } => {
+                self.home_clock = (t.hour, t.minute);
+                let page = *page;
+                self.show_settings(Refresh::Auto, page)?;
+            }
+            Screen::Reader(r)
+                if !r.menu_open && r.overlay.is_none() && self.reader_shows_clock() =>
+            {
+                self.home_clock = (t.hour, t.minute);
+                let bar_status = self.device_bar_status();
+                if let Screen::Reader(r) = &mut self.screen {
+                    r.session.set_bar_status(bar_status);
+                }
+                self.rebuild_reader(Refresh::Auto)?;
+                self.render_ui()?;
+            }
+            _ => {
+                self.home_clock = (t.hour, t.minute);
+            }
+        }
+        Ok(())
+    }
+
+    /// Poll background network time synchronization and apply the updated time
+    /// globally once it arrives.
+    fn poll_time_sync(&mut self) -> Result<(), Error> {
+        let Some((is_manual, result)) = self.time_sync.poll(Instant::now(), wake::signal) else {
             return Ok(());
         };
-        view.set_time(&mut self.ui.tree, &time);
-        self.ui.layout();
-        self.home_clock = (t.hour, t.minute);
-        if t.minute == 0 {
-            // The top of the hour: the date may have turned too, so the
-            // whole screen is drawn again.
-            return self.show_home(Refresh::Full);
+        match result {
+            Some(unix_secs) => {
+                self.apply_unix_time(unix_secs);
+                if let Screen::TimeSettings {
+                    page,
+                    settings_page,
+                    ..
+                } = &self.screen
+                {
+                    let (page, settings_page) = (*page, *settings_page);
+                    let msg = Some(tr(Msg::DeviceSettingsTimeSyncOk).to_string());
+                    self.show_time_settings(Refresh::Auto, page, settings_page, msg)?;
+                } else {
+                    self.tick_clock()?;
+                }
+            }
+            None if is_manual => {
+                if let Screen::TimeSettings {
+                    page,
+                    settings_page,
+                    ..
+                } = &self.screen
+                {
+                    let (page, settings_page) = (*page, *settings_page);
+                    let msg = Some(tr(Msg::DeviceSettingsTimeSyncFail).to_string());
+                    self.show_time_settings(Refresh::Auto, page, settings_page, msg)?;
+                }
+            }
+            None => {}
         }
         Ok(())
     }
 
     fn run(&mut self, input: &mut Input) -> Result<(), Error> {
         let worker = wake::fd()?;
+        self.time_sync.schedule_auto(Duration::from_secs(2));
         loop {
             if STOP.load(Ordering::Relaxed) {
                 return Ok(());
@@ -5413,7 +7603,10 @@ impl App {
                 }
             }
             self.watch_startup()?;
+            self.watch_sleep()?;
+            self.restore_dimmed_light(false);
             self.panel.poll();
+            self.poll_bluetooth_worker(Some(input))?;
             if self.usb_mode != UsbMode::DriveMode {
                 self.background()?;
                 let now = Instant::now();
@@ -5459,8 +7652,18 @@ impl App {
                 }
                 P::ReadyToSuspend(level) => {
                     perf!("power: readyToSuspend level {level}");
-                    if self.asleep.is_none() {
+                    if self.tts_active() {
+                        perf!("tts: active during readyToSuspend; deferring suspend to keep BT and Wi-Fi alive");
+                        self.sleep_ctl.defer_suspend(300);
+                        self.tts_defer_at = Some(Instant::now());
+                    } else if self.asleep.is_none() {
                         self.sleep_ctl.resync();
+                    } else if self.usb_mode != UsbMode::DriveMode
+                        && self.prefs.sleep_screen != prefs::SleepScreen::LastScreen
+                        && !self.panel.still_shows_ui(&self.ui)
+                    {
+                        perf!("sleep: framebuffer lost before suspend; repainting screensaver");
+                        self.repaint_sleep_screen()?;
                     }
                 }
                 P::DriveMode(active) => {
@@ -5497,6 +7700,7 @@ impl App {
             UsbAction::None => {}
             UsbAction::SaveAndFreeze => {
                 perf!("usb: entering drive mode; settling in-flight work and saving progress");
+                self.sleep_watch = None;
                 // 1. Settle in-flight restyle, cancel openings and worker tasks (Item 6):
                 self.settle_restyle()?;
                 self.finish_opening(true)?;
@@ -5558,6 +7762,8 @@ impl App {
                     if let Err(e) = aristotle_hal::powerd::blanket(false, "screensaver") {
                         eprintln!("aristotle: unloading blanket screensaver module: {e}");
                     }
+                } else {
+                    self.screensaver_blanket_dirty = true;
                 }
 
                 // 2. Reopen input devices if available (Item 4):
@@ -5596,6 +7802,14 @@ impl App {
             | Screen::About
             | Screen::ComingSoon { .. }
             | Screen::Settings { .. }
+            | Screen::ReaderBars { .. }
+            | Screen::WifiSettings { .. }
+            | Screen::BluetoothSettings { .. }
+            | Screen::TtsSettings { .. }
+            | Screen::TtsPlayer { .. }
+            | Screen::TimeSettings { .. }
+            | Screen::KeySettings { .. }
+            | Screen::PinLock { .. }
             | Screen::SleepImages { .. }
             | Screen::Typeset { .. }
             | Screen::Network(_)
@@ -5634,6 +7848,15 @@ impl App {
         }
         if self.asleep.is_some() {
             self.poll_net()?;
+            self.poll_tts()?;
+            if self.tts_active() {
+                if let Some(last) = self.tts_defer_at {
+                    if last.elapsed() >= Duration::from_secs(240) {
+                        self.sleep_ctl.defer_suspend(300);
+                        self.tts_defer_at = Some(Instant::now());
+                    }
+                }
+            }
             return Ok(());
         }
         if let Some(result) = self.opening.as_ref().and_then(|o| o.worker.poll()) {
@@ -5648,6 +7871,8 @@ impl App {
         self.poll_restyle()?;
         self.poll_lookup()?;
         self.poll_translate()?;
+        self.poll_tts()?;
+        self.poll_lan_input()?;
         self.poll_net()?;
         self.poll_weread()?;
         self.poll_weread_web()?;
@@ -5658,7 +7883,8 @@ impl App {
         self.poll_wifi()?;
         self.poll_formatting_progress()?;
         self.poll_pending_loading()?;
-        self.tick_home_clock()?;
+        self.poll_time_sync()?;
+        self.tick_clock()?;
         // Snapshots ahead of time: only on the library screen (not the
         // settings), with no book opening and no screensaver.
         if self.prewarm_allowed() {
@@ -5862,7 +8088,17 @@ impl App {
         }
         self.last_touch = Instant::now();
         self.sleep_ctl.touched();
-        let ev = ui_event(ev);
+        if ev.phase == HalPhase::Down && self.panel.enforce_fb_rotate().unwrap_or(false) {
+            perf!("touch: kernel fb0 rotate drifted; forced back and repainting");
+            let _ = self.repaint_screen(Refresh::Full);
+        }
+        let mut ev = ui_event(ev);
+        if self.panel.soft_rotate() != 0 {
+            let (pw, ph) = self.panel.physical_size();
+            let (lx, ly) = panel::unmap_touch_point(ev.x, ev.y, pw, ph, self.panel.soft_rotate());
+            ev.x = lx;
+            ev.y = ly;
+        }
         self.prewarm.input();
         if self.opening.is_some() {
             return self.on_opening_touch(ev);
@@ -5894,10 +8130,16 @@ impl App {
         }
         self.last_touch = Instant::now();
         self.sleep_ctl.touched();
-        let dir = match key {
+        let mut dir = match key {
             Key::PageForward => Turn::Forward,
             Key::PageBack => Turn::Back,
         };
+        if self.prefs.invert_page_keys ^ (self.panel.soft_rotate() == 2) {
+            dir = match dir {
+                Turn::Forward => Turn::Back,
+                Turn::Back => Turn::Forward,
+            };
+        }
         if let Screen::Reader(r) = &mut self.screen {
             if r.menu_open || r.gestures.holding() {
                 return Ok(Flow::Continue);
@@ -5996,6 +8238,14 @@ impl App {
             Screen::Library { .. } => self.on_library_event(ev),
             Screen::Search { .. } => self.on_search_event(ev),
             Screen::Settings { .. } => self.on_settings_event(ev),
+            Screen::ReaderBars { .. } => self.on_reader_bars_event(ev),
+            Screen::WifiSettings { .. } => self.on_wifi_settings_event(ev),
+            Screen::BluetoothSettings { .. } => self.on_bluetooth_settings_event(ev),
+            Screen::TtsSettings { .. } => self.on_tts_settings_event(ev),
+            Screen::TtsPlayer { .. } => self.on_tts_player_event(ev),
+            Screen::TimeSettings { .. } => self.on_time_settings_event(ev),
+            Screen::KeySettings { .. } => self.on_key_settings_event(ev),
+            Screen::PinLock { .. } => self.on_pin_lock_event(ev),
             Screen::SleepImages { .. } => self.on_sleep_images_event(ev),
             Screen::Typeset { .. } => self.on_typeset_event(ev),
             Screen::Network(_) => self.on_network_event(ev),
@@ -6633,6 +8883,24 @@ impl App {
                     }
                 }
             }
+            a::SCAN_LOCAL => {
+                let back = match &self.screen {
+                    Screen::WifiTransfer { back, .. } => *back,
+                    _ => SoonBack::Mine,
+                };
+                self.stop_wifi();
+                match back {
+                    SoonBack::Reader | SoonBack::Settings { .. } => {
+                        self.scan_kind = ScanKind::Fonts;
+                        self.scan_return = Some(back);
+                    }
+                    _ => {
+                        self.scan_kind = ScanKind::Books;
+                        self.scan_return = None;
+                    }
+                }
+                self.show_scan_sources(Refresh::Full, ui_scan::PickerMode::Sources, None)?;
+            }
             a::TOGGLE => {
                 if self.wifi.is_some() {
                     // Stop: nothing listens on the network any more.
@@ -6682,6 +8950,29 @@ impl App {
                 ..
             } => *mode,
             _ => ui_scan::PickerMode::Sources,
+        }
+    }
+
+    fn return_from_font_picker(&mut self, back: SoonBack) -> Result<(), Error> {
+        match back {
+            SoonBack::Settings { page } => self.show_settings(Refresh::Full, page),
+            SoonBack::Reader => {
+                if let Some(r) = self.saved_reading.take() {
+                    let refresh_fonts = matches!(r.overlay, reading::Overlay::Typeset { .. });
+                    self.screen = Screen::Reader(r);
+                    self.rebuild_reader(Refresh::Full)?;
+                    if refresh_fonts {
+                        self.open_typeset()?;
+                    } else {
+                        self.render_ui()?;
+                    }
+                    self.stats_page_shown();
+                    Ok(())
+                } else {
+                    self.show_library(Refresh::Full)
+                }
+            }
+            _ => self.show_mine(Refresh::Full),
         }
     }
 
@@ -6871,19 +9162,24 @@ impl App {
                 Screen::Scan {
                     state:
                         ui_scan::ScanState::Sources {
-                            mode: ui_scan::PickerMode::Destination,
+                            mode:
+                                ui_scan::PickerMode::Destination | ui_scan::PickerMode::FontDestination,
                             ..
                         },
                     ..
                 } => {
                     // Leaving the destination picker changes nothing, and
-                    // returns to source selection explicitly.
-                    let path = self.scan_picker_path();
-                    self.show_scan_sources(
-                        Refresh::Full,
-                        ui_scan::PickerMode::Sources,
-                        path.as_deref(),
-                    )?;
+                    // returns to Settings (when opened from there) or source selection.
+                    if let Some(back) = self.font_picker_return.take() {
+                        self.return_from_font_picker(back)?;
+                    } else {
+                        let path = self.scan_picker_path();
+                        self.show_scan_sources(
+                            Refresh::Full,
+                            ui_scan::PickerMode::Sources,
+                            path.as_deref(),
+                        )?;
+                    }
                 }
                 Screen::Scan {
                     state: ui_scan::ScanState::Review { .. },
@@ -6899,7 +9195,10 @@ impl App {
                     self.cancel_scan()?;
                 }
                 Screen::Scan { .. } => {
-                    if self.lib.books().is_empty() {
+                    if let Some(back) = self.scan_return.take() {
+                        self.scan_kind = ScanKind::Books;
+                        self.return_from_font_picker(back)?;
+                    } else if self.lib.books().is_empty() {
                         self.show_home(Refresh::Full)?;
                     } else {
                         self.show_library(Refresh::Full)?;
@@ -6923,8 +9222,16 @@ impl App {
             }
             a::SCOPE_PARENT => {
                 let path = self.scan_picker_path();
+                let mode = self.scan_picker_mode();
+                let allow_fonts = mode == ui_scan::PickerMode::FontDestination
+                    || (mode == ui_scan::PickerMode::Sources && self.scan_kind == ScanKind::Fonts);
                 let parent = path.as_deref().and_then(|p| {
-                    scan_scope::Scope::new(&scan_root(&self.root), p).and_then(|s| s.parent())
+                    let scope = if allow_fonts {
+                        scan_scope::Scope::new_allowing_fonts(&scan_root(&self.root), p)
+                    } else {
+                        scan_scope::Scope::new(&scan_root(&self.root), p)
+                    };
+                    scope.and_then(|s| s.parent())
                 });
                 if let Some(parent) = parent {
                     self.show_scan_picker(Some(&parent))?;
@@ -6960,28 +9267,64 @@ impl App {
                     path.as_deref(),
                 )?;
             }
+            a::FONT_DEST_CHOOSE => {
+                let path = self.scan_picker_path();
+                self.show_scan_sources(
+                    Refresh::Full,
+                    ui_scan::PickerMode::FontDestination,
+                    path.as_deref(),
+                )?;
+            }
             a::DEST_USE => {
                 let Some(path) = self.scan_picker_path() else {
                     return Ok(Flow::Continue);
                 };
                 let root = scan_root(&self.root);
-                match resolve_library_destination(&root, &path) {
-                    Ok(destination) => {
-                        let previous = self.prefs.library_destination.replace(destination);
-                        if let Err(error) = self.prefs.save(self.lib.data_dir()) {
-                            self.prefs.library_destination = previous;
-                            self.show_scan_failed(Refresh::Full, error.to_string())?;
+                if self.scan_picker_mode() == ui_scan::PickerMode::FontDestination {
+                    match fonts::resolve_fonts_destination(&root, &path) {
+                        Ok(destination) => {
+                            let previous_pref =
+                                self.prefs.fonts_destination.replace(destination.clone());
+                            if let Err(error) = self.prefs.save(self.lib.data_dir()) {
+                                self.prefs.fonts_destination = previous_pref;
+                                self.show_scan_failed(Refresh::Full, error.to_string())?;
+                                return Ok(Flow::Continue);
+                            }
+                            self.fonts_dir = destination;
+                            self.load_font();
+                            if let Some(back) = self.font_picker_return.take() {
+                                self.return_from_font_picker(back)?;
+                                return Ok(Flow::Continue);
+                            }
+                        }
+                        Err(e) => {
+                            self.show_scan_failed(Refresh::Full, e.to_string())?;
                             return Ok(Flow::Continue);
                         }
                     }
-                    Err(e) => {
-                        self.show_scan_failed(Refresh::Full, e.to_string())?;
-                        return Ok(Flow::Continue);
+                } else {
+                    match resolve_library_destination(&root, &path) {
+                        Ok(destination) => {
+                            let previous = self.prefs.library_destination.replace(destination);
+                            if let Err(error) = self.prefs.save(self.lib.data_dir()) {
+                                self.prefs.library_destination = previous;
+                                self.show_scan_failed(Refresh::Full, error.to_string())?;
+                                return Ok(Flow::Continue);
+                            }
+                        }
+                        Err(e) => {
+                            self.show_scan_failed(Refresh::Full, e.to_string())?;
+                            return Ok(Flow::Continue);
+                        }
                     }
                 }
                 self.show_scan_sources(Refresh::Full, ui_scan::PickerMode::Sources, Some(&path))?;
             }
             a::DEST_CANCEL => {
+                if let Some(back) = self.font_picker_return.take() {
+                    self.return_from_font_picker(back)?;
+                    return Ok(Flow::Continue);
+                }
                 let path = self.scan_picker_path();
                 self.show_scan_sources(
                     Refresh::Full,
@@ -7016,7 +9359,12 @@ impl App {
                 self.cancel_scan()?;
             }
             a::VIEW_LIBRARY => {
-                self.show_library(Refresh::Full)?;
+                if let Some(back) = self.scan_return.take() {
+                    self.scan_kind = ScanKind::Books;
+                    self.return_from_font_picker(back)?;
+                } else {
+                    self.show_library(Refresh::Full)?;
+                }
             }
             a::RESCAN => {
                 self.start_scan()?;
@@ -7081,11 +9429,7 @@ impl App {
                     model.load_covers(&self.lib, &mut self.covers, view, &mut self.ui.tree);
                     let new_page = self.ui.tree.page(view.list).0;
                     if new_page != old_page {
-                        if self.prefs.covers.mode() != CoverMode::None {
-                            self.ui.request_full_refresh();
-                        } else {
-                            self.ui.request_clean_refresh();
-                        }
+                        self.ui.request_clean_refresh();
                     }
                 }
             }
@@ -7114,6 +9458,8 @@ impl App {
                 a::SCAN => {
                     // The sources are chosen first, and kept for the next
                     // scan; the destination stays as it was.
+                    self.scan_kind = ScanKind::Books;
+                    self.scan_return = None;
                     let path = self.scan_picker_path();
                     self.show_scan_sources(
                         Refresh::Full,
@@ -7133,11 +9479,11 @@ impl App {
                         Layout::Grid => Layout::List,
                     };
                     self.save_prefs();
-                    self.show_library(Refresh::Full)?;
+                    self.show_library(Refresh::Clean)?;
                 }
                 a::BACK => {
                     self.nav.up();
-                    self.show_library(Refresh::Full)?;
+                    self.show_library(Refresh::Clean)?;
                 }
                 id if id >= a::ITEM_MORE => {
                     let i = (id - a::ITEM_MORE) as usize;
@@ -7149,11 +9495,11 @@ impl App {
                     Some(Target::Book(book)) => self.open_from_library(&book, node)?,
                     Some(Target::Folder(name)) => {
                         self.nav.folder.push(name);
-                        self.show_library(Refresh::Full)?;
+                        self.show_library(Refresh::Clean)?;
                     }
                     Some(Target::Series(name)) => {
                         self.nav.series = Some(name);
-                        self.show_library(Refresh::Full)?;
+                        self.show_library(Refresh::Clean)?;
                     }
                     None => {}
                 },
@@ -7170,13 +9516,7 @@ impl App {
                         self.ui.layout();
                         view.sync(&mut self.ui.tree);
                         model.load_covers(&self.lib, &mut self.covers, view, &mut self.ui.tree);
-                        if view.jump_open {
-                            self.ui.request_clean_refresh();
-                        } else if self.prefs.covers.mode() != CoverMode::None {
-                            self.ui.request_full_refresh();
-                        } else {
-                            self.ui.request_clean_refresh();
-                        }
+                        self.ui.request_clean_refresh();
                     }
                 }
             },
@@ -7331,7 +9671,10 @@ impl App {
         // on the device that takes a while, and the status bar says so.
         self.register_fonts_for_crengine()?;
         let t0 = Instant::now();
-        let style = self.page_style();
+        let book_orient =
+            aristotle_screen::Orientation::from_index(self.prefs.orientation_for_book(&rec.id));
+        self.apply_orientation(book_orient);
+        let style = self.page_style_for_book(&rec);
         let mut src = match Source::new(&self.lib, &rec, &self.mobi_cache) {
             Ok(mut s) => {
                 s.secs_per_page = self.speed.secs_per_page();
@@ -7984,7 +10327,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn enter_reader(
         &mut self,
-        session: Session,
+        mut session: Session,
         menu: Menu,
         page_node: NodeId,
         nav: NodeId,
@@ -7993,10 +10336,15 @@ impl App {
         mut gestures: TurnGestures,
         turned: bool,
     ) {
+        session.set_bar_status(self.device_bar_status());
         // The book is here now: the turns follow the engine it really runs
         // on, whatever the snapshot's opening gestures guessed (VERT-101
-        // M1).
-        gestures.set_vertical(session.is_vertical());
+        // M1) and respect RTL comic page direction.
+        gestures.set_vertical(session.is_rtl_turns());
+        gestures.set_touch_prefs(
+            aristotle_screen::TouchZoneLayout::from_index(self.prefs.touch_zone_layout),
+            self.prefs.disable_touch_turn,
+        );
         let opened_locator = session.progress(0).locator;
         let (opened_annotations, opened_tombstones) = self
             .lib
@@ -8119,6 +10467,7 @@ impl App {
     /// overlays closed after the screensaver.
     fn reader_after_sleep(&mut self, refresh: Refresh) -> Result<(), Error> {
         let settings = self.prefs.menu_settings(self.light_level());
+        let bar_status = self.device_bar_status();
         let Screen::Reader(r) = &mut self.screen else {
             return Ok(());
         };
@@ -8126,6 +10475,8 @@ impl App {
         r.menu_open = false;
         r.overlay = Overlay::None;
         r.gestures.reset();
+        r.session.set_bar_status(bar_status);
+        self.home_clock = clock_minute();
         self.rebuild_reader(refresh)?;
         self.render_ui()?;
         self.stats_page_shown();
@@ -8182,9 +10533,16 @@ impl App {
             }
             return Ok(());
         };
-        let interval = self.prefs.refresh_pages();
+        let raw_interval = self.prefs.refresh_pages();
+        // Fast DU4 accumulates ghosting much faster than GLKW16, so cap its
+        // auto-flash interval at 5 pages whenever auto-refresh is enabled.
+        let interval = if raw_interval > 0 && self.prefs.turn_mode == prefs::DU4_TURN {
+            raw_interval.min(5)
+        } else {
+            raw_interval
+        };
         r.turns_since_flash += 1;
-        let flash = r.turns_since_flash >= interval;
+        let flash = interval > 0 && r.turns_since_flash >= interval;
         if flash {
             r.turns_since_flash = 0;
         }
@@ -8193,7 +10551,15 @@ impl App {
         let ready = s.is_rendered(target);
         let page = s.page(target)?;
         let t_render = t.elapsed();
+        if flash {
+            let _ = r;
+            self.dim_for_night_flash();
+        }
         let waited = self.panel.show_page(&page, flash, "turn")?;
+        let Screen::Reader(r) = &mut self.screen else {
+            return Ok(());
+        };
+        let s = &mut r.session;
         let tap_to_submit = monotonic_us().saturating_sub(at_us) as f64 / 1000.0;
         s.current = target;
         r.turned = true;
@@ -8373,6 +10739,583 @@ impl App {
         Ok(())
     }
 
+    fn tts_active(&self) -> bool {
+        self.tts.as_ref().is_some_and(TtsService::is_active)
+    }
+
+    fn stop_tts(&mut self) {
+        if let Some(svc) = &mut self.tts {
+            svc.stop();
+        }
+        if self.asleep.is_some() && self.tts_defer_at.take().is_some() {
+            // Release suspend deferral once audiobook playback ends while asleep.
+            self.sleep_ctl.defer_suspend(1);
+        }
+    }
+
+    fn toggle_tts(&mut self) -> Result<(), Error> {
+        let Screen::Reader(mut reader) = std::mem::replace(&mut self.screen, Screen::Mine) else {
+            return Ok(());
+        };
+        reader.menu_open = false;
+        let loc = reader.session.current;
+        let words = reader.session.words(loc);
+        let text = crate::tts::join_page_words(&words);
+        let chunks = crate::tts::page_chunks(&text);
+        let first = chunks.first().cloned().unwrap_or_default();
+        let next = chunks.get(1).cloned();
+        let ready = self.prefs.tts.is_ready();
+        let mut state = Box::new(TtsPlayerState {
+            reader,
+            chunks,
+            chunk_index: 0,
+            current_text: first,
+            next_text: next,
+            paused: !ready,
+            error: if ready {
+                None
+            } else {
+                Some("请先点击右上角「设置」配置语音大模型 API Key，或开启无耳机模拟模式。".into())
+            },
+        });
+        if ready {
+            self.start_tts_for_state(&mut state);
+        }
+        self.show_tts_player(Refresh::Full, state)
+    }
+
+    fn start_tts_for_state(&mut self, state: &mut TtsPlayerState) {
+        let prefs = self.prefs.tts.clone();
+        if !prefs.is_ready() {
+            state.paused = true;
+            state.error = Some("请先点击「API/声音设置」配置密钥，或开启模拟模式。".into());
+            return;
+        }
+        if !prefs.simulate_audio || !prefs.api_key.trim().is_empty() {
+            crate::tts::allow_host(&prefs);
+        }
+        state.paused = false;
+        state.error = None;
+        let loc = state.reader.session.current;
+        if state.chunks.is_empty() {
+            let words = state.reader.session.words(loc);
+            let text = crate::tts::join_page_words(&words);
+            state.chunks = crate::tts::page_chunks(&text);
+            state.chunk_index = 0;
+        }
+        if let Some(cur) = state.chunks.get(state.chunk_index) {
+            state.current_text = cur.clone();
+            state.next_text = state.chunks.get(state.chunk_index + 1).cloned();
+        }
+        let svc = self.tts.get_or_insert_with(TtsService::start);
+        perf!(
+            "tts: speaking page loc={} chunk {}/{} (simulate={})",
+            loc,
+            state.chunk_index + 1,
+            state.chunks.len(),
+            prefs.simulate_audio
+        );
+        svc.speak_chunks(loc, state.chunks.clone(), state.chunk_index, prefs);
+    }
+
+    fn show_tts_player(
+        &mut self,
+        refresh: Refresh,
+        state: Box<TtsPlayerState>,
+    ) -> Result<(), Error> {
+        let facts = Facts::read(&self.battery, &self.root);
+        let title = state.reader.session.title.clone();
+        let page_str = match state.reader.session.page_number() {
+            Some((p, total)) => format!("第 {p} / {total} 页"),
+            None => format!("位置 {}", state.reader.session.current + 1),
+        };
+        let total_chunks = state.chunks.len().max(1);
+        let cur_chunk = (state.chunk_index + 1).min(total_chunks);
+        let progress_label = format!("{page_str} · 第 {cur_chunk} / {total_chunks} 段");
+        let state_badge = if state.error.is_some() {
+            "等待配置 / 已暂停"
+        } else if state.paused {
+            "已暂停"
+        } else if self.prefs.tts.simulate_audio {
+            "模拟朗读中 · 锁屏不断网"
+        } else {
+            "蓝牙朗读中 · 锁屏不断网"
+        };
+        let view = tts_player_ui::TtsPlayerView {
+            screen: aristotle_ui::Size::new(self.ui.bounds().w, self.ui.bounds().h),
+            status: facts.status_line(),
+            book_title: &title,
+            progress_label: &progress_label,
+            state_badge,
+            current_paragraph: &state.current_text,
+            next_paragraph: state.next_text.as_deref(),
+            provider_name: self.prefs.tts.provider_display_name(),
+            voice_name: &self.prefs.tts.voice,
+            speed: self.prefs.tts.speed,
+            playing: !state.paused && self.tts_active(),
+            error: state.error.as_deref(),
+        };
+        let (tree, ids) = tts_player_ui::TtsPlayerUi::build(&mut self.ui.text, &self.styles, &view);
+        self.ui.set_tree_with(tree, refresh);
+        self.screen = Screen::TtsPlayer { ids, state };
+        self.render_ui()
+    }
+
+    fn return_from_tts_player(&mut self, state: Box<TtsPlayerState>) -> Result<(), Error> {
+        self.stop_tts();
+        let reader = state.reader;
+        let now = aristotle_library::library::now();
+        let progress = reader.session.progress(now);
+        if should_save_progress(reader.turned, &reader.opened_locator, &progress.locator) {
+            self.lib.set_progress(&reader.session.id, progress);
+            self.saver.save(&self.lib);
+        }
+        self.screen = Screen::Reader(reader);
+        self.rebuild_reader(Refresh::Full)?;
+        Ok(())
+    }
+
+    fn on_tts_player_event(&mut self, ev: UiEvent) -> Result<Flow, Error> {
+        let UiEvent::Action { id, .. } = ev else {
+            return Ok(Flow::Continue);
+        };
+        let Screen::TtsPlayer { mut state, .. } = std::mem::replace(&mut self.screen, Screen::Mine)
+        else {
+            return Ok(Flow::Continue);
+        };
+        use tts_player_ui::action as a;
+        match id {
+            a::BACK | a::STOP => {
+                self.return_from_tts_player(state)?;
+                return Ok(Flow::Continue);
+            }
+            a::OPEN_SETTINGS => {
+                self.stop_tts();
+                state.paused = true;
+                self.show_tts_settings(
+                    Refresh::Full,
+                    TtsSettingsReturn::TtsPlayer(state),
+                    None,
+                    None,
+                )?;
+                return Ok(Flow::Continue);
+            }
+            a::TOGGLE_PAUSE => {
+                if !state.paused && self.tts_active() {
+                    self.stop_tts();
+                    state.paused = true;
+                } else {
+                    self.start_tts_for_state(&mut state);
+                }
+            }
+            a::PREV_CHUNK => {
+                if state.chunk_index > 0 {
+                    state.chunk_index -= 1;
+                } else if let Some(prev_loc) = state
+                    .reader
+                    .session
+                    .neighbor(state.reader.session.current, Turn::Back)
+                {
+                    state.reader.session.current = prev_loc;
+                    state.reader.turned = true;
+                    let words = state.reader.session.words(prev_loc);
+                    state.chunks = crate::tts::page_chunks(&crate::tts::join_page_words(&words));
+                    state.chunk_index = state.chunks.len().saturating_sub(1);
+                }
+                self.start_tts_for_state(&mut state);
+            }
+            a::NEXT_CHUNK => {
+                if state.chunk_index + 1 < state.chunks.len() {
+                    state.chunk_index += 1;
+                } else if let Some(next_loc) = state
+                    .reader
+                    .session
+                    .neighbor(state.reader.session.current, Turn::Forward)
+                {
+                    state.reader.session.current = next_loc;
+                    state.reader.turned = true;
+                    let words = state.reader.session.words(next_loc);
+                    state.chunks = crate::tts::page_chunks(&crate::tts::join_page_words(&words));
+                    state.chunk_index = 0;
+                }
+                self.start_tts_for_state(&mut state);
+            }
+            a::VOICE_PREV | a::VOICE_NEXT => {
+                let delta = if id == a::VOICE_NEXT { 1 } else { -1 };
+                self.prefs.tts.cycle_voice(delta);
+                self.save_prefs();
+                if !state.paused {
+                    self.start_tts_for_state(&mut state);
+                }
+            }
+            a::SPEED_DOWN | a::SPEED_UP => {
+                let delta = if id == a::SPEED_UP { 0.1 } else { -0.1 };
+                self.prefs.tts.adjust_speed(delta);
+                self.save_prefs();
+                if !state.paused {
+                    self.start_tts_for_state(&mut state);
+                }
+            }
+            _ => {}
+        }
+        self.show_tts_player(Refresh::Auto, state)?;
+        Ok(Flow::Continue)
+    }
+
+    fn show_tts_settings(
+        &mut self,
+        refresh: Refresh,
+        back: TtsSettingsReturn,
+        message: Option<String>,
+        editor: Option<tts_set_ui::FieldEditor>,
+    ) -> Result<(), Error> {
+        let facts = Facts::read(&self.battery, &self.root);
+        let key_summary = self.prefs.tts.api_key_summary();
+        let qr_url = self.lan_input.as_ref().map(|s| s.url.clone());
+        let view = tts_set_ui::TtsSettingsView {
+            screen: aristotle_ui::Size::new(self.ui.bounds().w, self.ui.bounds().h),
+            status: facts.status_line(),
+            provider_index: self.prefs.tts.provider_preset_index(),
+            endpoint: &self.prefs.tts.endpoint,
+            api_key_summary: &key_summary,
+            app_id: &self.prefs.tts.app_id,
+            show_app_id: self.prefs.tts.provider == aristotle_net::tts::Provider::Volcengine,
+            model: &self.prefs.tts.model,
+            voice: &self.prefs.tts.voice,
+            speed: self.prefs.tts.speed,
+            simulate_audio: self.prefs.tts.simulate_audio,
+            message: message.as_deref(),
+            editor: editor.as_ref(),
+            qr_url: qr_url.as_deref(),
+        };
+        let (tree, ids) = tts_set_ui::TtsSettingsUi::build(&mut self.ui.text, &self.styles, &view);
+        self.ui.set_tree_with(tree, refresh);
+        self.screen = Screen::TtsSettings {
+            ids,
+            back,
+            message,
+            editor,
+        };
+        self.render_ui()
+    }
+
+    fn on_tts_settings_event(&mut self, ev: UiEvent) -> Result<Flow, Error> {
+        let UiEvent::Action { id, .. } = ev else {
+            return Ok(Flow::Continue);
+        };
+        let Screen::TtsSettings {
+            back, mut editor, ..
+        } = std::mem::replace(&mut self.screen, Screen::Mine)
+        else {
+            return Ok(Flow::Continue);
+        };
+        use tts_set_ui::action as a;
+        use tts_set_ui::EditField;
+
+        if self.lan_input.is_some() && matches!(id, a::BACK | a::QR_CLOSE) {
+            self.lan_input = None;
+            self.show_tts_settings(Refresh::Auto, back, None, editor)?;
+            return Ok(Flow::Continue);
+        }
+
+        if let Some(mut ed) = editor.take() {
+            match id {
+                a::BACK | a::FIELD_CANCEL => {
+                    self.lan_input = None;
+                    self.show_tts_settings(Refresh::Auto, back, None, None)?;
+                    return Ok(Flow::Continue);
+                }
+                a::SCAN_QR => {
+                    let mode = aristotle_net::lan_input::Mode::SingleField {
+                        title: ed.field.title().to_string(),
+                        initial: ed.value(),
+                        secret: ed.field.is_secret(),
+                    };
+                    match aristotle_net::lan_input::LanInputServer::start(mode, crate::wake::notify)
+                    {
+                        Ok(srv) => {
+                            self.lan_input = Some(srv);
+                            self.show_tts_settings(Refresh::Auto, back, None, Some(ed))?;
+                        }
+                        Err(e) => {
+                            self.show_tts_settings(
+                                Refresh::Auto,
+                                back,
+                                Some(format!("启动局域网扫码服务失败: {e}")),
+                                Some(ed),
+                            )?;
+                        }
+                    }
+                    return Ok(Flow::Continue);
+                }
+                a::FIELD_SAVE | aristotle_ui::keyboard::action::CONFIRM => {
+                    self.lan_input = None;
+                    let val = ed.value();
+                    match ed.field {
+                        EditField::Endpoint => self.prefs.tts.endpoint = val,
+                        EditField::ApiKey => self.prefs.tts.api_key = val,
+                        EditField::AppId => self.prefs.tts.app_id = val,
+                        EditField::Model => self.prefs.tts.model = val,
+                        EditField::Voice => self.prefs.tts.voice = val,
+                    }
+                    self.save_prefs();
+                    self.show_tts_settings(
+                        Refresh::Auto,
+                        back,
+                        Some("已保存听书配置".into()),
+                        None,
+                    )?;
+                    return Ok(Flow::Continue);
+                }
+                other => {
+                    let _ = ed.handle_keyboard(other);
+                    self.show_tts_settings(Refresh::Auto, back, None, Some(ed))?;
+                    return Ok(Flow::Continue);
+                }
+            }
+        }
+
+        let mut msg: Option<String> = None;
+        match id {
+            a::BACK => {
+                self.lan_input = None;
+                match back {
+                    TtsSettingsReturn::Settings(page) => {
+                        self.show_settings(Refresh::Full, page)?;
+                        return Ok(Flow::Continue);
+                    }
+                    TtsSettingsReturn::TtsPlayer(mut state) => {
+                        if self.prefs.tts.is_ready() {
+                            self.start_tts_for_state(&mut state);
+                        }
+                        self.show_tts_player(Refresh::Full, state)?;
+                        return Ok(Flow::Continue);
+                    }
+                }
+            }
+            a::SCAN_QR => {
+                let payload = aristotle_net::lan_input::TtsConfigPayload {
+                    provider_index: self.prefs.tts.provider_preset_index(),
+                    endpoint: self.prefs.tts.endpoint.clone(),
+                    api_key: self.prefs.tts.api_key.clone(),
+                    app_id: self.prefs.tts.app_id.clone(),
+                    model: self.prefs.tts.model.clone(),
+                    voice: self.prefs.tts.voice.clone(),
+                    speed: self.prefs.tts.speed,
+                    simulate_audio: self.prefs.tts.simulate_audio,
+                };
+                match aristotle_net::lan_input::LanInputServer::start(
+                    aristotle_net::lan_input::Mode::TtsConfig(payload),
+                    crate::wake::notify,
+                ) {
+                    Ok(srv) => {
+                        self.lan_input = Some(srv);
+                    }
+                    Err(e) => {
+                        msg = Some(format!("启动局域网扫码服务失败: {e}"));
+                    }
+                }
+            }
+            i if (a::PROVIDER_BASE..a::PROVIDER_BASE + 4).contains(&i) => {
+                self.prefs
+                    .tts
+                    .apply_provider_preset((i - a::PROVIDER_BASE) as usize);
+                self.save_prefs();
+                msg = Some(format!(
+                    "已切换为 {} 预设",
+                    self.prefs.tts.provider_display_name()
+                ));
+            }
+            a::EDIT_ENDPOINT => {
+                let ed =
+                    tts_set_ui::FieldEditor::new(EditField::Endpoint, &self.prefs.tts.endpoint);
+                self.show_tts_settings(Refresh::Auto, back, None, Some(ed))?;
+                return Ok(Flow::Continue);
+            }
+            a::EDIT_API_KEY => {
+                let ed = tts_set_ui::FieldEditor::new(EditField::ApiKey, &self.prefs.tts.api_key);
+                self.show_tts_settings(Refresh::Auto, back, None, Some(ed))?;
+                return Ok(Flow::Continue);
+            }
+            a::EDIT_APP_ID => {
+                let ed = tts_set_ui::FieldEditor::new(EditField::AppId, &self.prefs.tts.app_id);
+                self.show_tts_settings(Refresh::Auto, back, None, Some(ed))?;
+                return Ok(Flow::Continue);
+            }
+            a::EDIT_MODEL => {
+                let ed = tts_set_ui::FieldEditor::new(EditField::Model, &self.prefs.tts.model);
+                self.show_tts_settings(Refresh::Auto, back, None, Some(ed))?;
+                return Ok(Flow::Continue);
+            }
+            a::EDIT_VOICE => {
+                let ed = tts_set_ui::FieldEditor::new(EditField::Voice, &self.prefs.tts.voice);
+                self.show_tts_settings(Refresh::Auto, back, None, Some(ed))?;
+                return Ok(Flow::Continue);
+            }
+            a::VOICE_PREV | a::VOICE_NEXT => {
+                self.prefs
+                    .tts
+                    .cycle_voice(if id == a::VOICE_NEXT { 1 } else { -1 });
+                self.save_prefs();
+            }
+            a::SPEED_DOWN | a::SPEED_UP => {
+                self.prefs
+                    .tts
+                    .adjust_speed(if id == a::SPEED_UP { 0.1 } else { -0.1 });
+                self.save_prefs();
+            }
+            a::TOGGLE_SIMULATE => {
+                self.prefs.tts.simulate_audio = !self.prefs.tts.simulate_audio;
+                self.save_prefs();
+            }
+            _ => {}
+        }
+        self.show_tts_settings(Refresh::Auto, back, msg, None)?;
+        Ok(Flow::Continue)
+    }
+
+    fn poll_lan_input(&mut self) -> Result<(), Error> {
+        let Some(sub) = self.lan_input.as_ref().and_then(|s| s.try_recv()) else {
+            return Ok(());
+        };
+        use aristotle_net::lan_input::Submission;
+        use tts_set_ui::EditField;
+        match sub {
+            Submission::TtsConfig(cfg) => {
+                self.prefs.tts.provider = cfg.provider();
+                self.prefs.tts.endpoint = cfg.endpoint;
+                self.prefs.tts.api_key = cfg.api_key;
+                self.prefs.tts.app_id = cfg.app_id;
+                self.prefs.tts.model = cfg.model;
+                self.prefs.tts.voice = cfg.voice;
+                self.prefs.tts.speed = cfg.speed.clamp(0.5, 2.0);
+                self.prefs.tts.simulate_audio = cfg.simulate_audio;
+                self.save_prefs();
+                self.lan_input = None;
+                if let Screen::TtsSettings { back, .. } =
+                    std::mem::replace(&mut self.screen, Screen::Mine)
+                {
+                    self.show_tts_settings(
+                        Refresh::Auto,
+                        back,
+                        Some("✓ 已通过手机扫码保存听书配置".into()),
+                        None,
+                    )?;
+                }
+            }
+            Submission::Text(val) => {
+                self.lan_input = None;
+                if let Screen::TtsSettings { back, editor, .. } =
+                    std::mem::replace(&mut self.screen, Screen::Mine)
+                {
+                    if let Some(ed) = editor {
+                        match ed.field {
+                            EditField::Endpoint => self.prefs.tts.endpoint = val,
+                            EditField::ApiKey => self.prefs.tts.api_key = val,
+                            EditField::AppId => self.prefs.tts.app_id = val,
+                            EditField::Model => self.prefs.tts.model = val,
+                            EditField::Voice => self.prefs.tts.voice = val,
+                        }
+                        self.save_prefs();
+                    }
+                    self.show_tts_settings(
+                        Refresh::Auto,
+                        back,
+                        Some("✓ 已通过手机扫码填入并保存".into()),
+                        None,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_tts(&mut self) -> Result<(), Error> {
+        let Some(ev) = self.tts.as_mut().and_then(TtsService::poll) else {
+            return Ok(());
+        };
+        match ev {
+            TtsEvent::ChunkStarted {
+                chunk_index,
+                text,
+                next_text,
+                ..
+            } => {
+                if let Screen::TtsPlayer { ids, mut state } =
+                    std::mem::replace(&mut self.screen, Screen::Mine)
+                {
+                    state.chunk_index = chunk_index;
+                    state.current_text = text;
+                    state.next_text = next_text;
+                    state.error = None;
+                    if self.asleep.is_none() {
+                        self.show_tts_player(Refresh::Auto, state)?;
+                    } else {
+                        self.screen = Screen::TtsPlayer { ids, state };
+                    }
+                }
+            }
+            TtsEvent::PageFinished { location, .. } => {
+                perf!("tts: page finished at loc={location}, advancing");
+                if let Screen::TtsPlayer { ids, mut state } =
+                    std::mem::replace(&mut self.screen, Screen::Mine)
+                {
+                    let next_loc = state
+                        .reader
+                        .session
+                        .neighbor(state.reader.session.current, Turn::Forward);
+                    if let Some(next) = next_loc {
+                        state.reader.session.current = next;
+                        state.reader.turned = true;
+                        let now = aristotle_library::library::now();
+                        let progress = state.reader.session.progress(now);
+                        self.lib.set_progress(&state.reader.session.id, progress);
+                        self.saver.save(&self.lib);
+                        self.debounce.changed(Instant::now());
+                        let words = state.reader.session.words(next);
+                        state.chunks =
+                            crate::tts::page_chunks(&crate::tts::join_page_words(&words));
+                        state.chunk_index = 0;
+                        state.current_text = state.chunks.first().cloned().unwrap_or_default();
+                        state.next_text = state.chunks.get(1).cloned();
+                        self.start_tts_for_state(&mut state);
+                        if self.asleep.is_none() {
+                            self.show_tts_player(Refresh::Auto, state)?;
+                        } else {
+                            self.screen = Screen::TtsPlayer { ids, state };
+                        }
+                    } else {
+                        perf!("tts: reached end of book; stopping playback");
+                        self.stop_tts();
+                        state.paused = true;
+                        state.error = Some("已朗读至全书末尾".into());
+                        if self.asleep.is_none() {
+                            self.show_tts_player(Refresh::Auto, state)?;
+                        } else {
+                            self.screen = Screen::TtsPlayer { ids, state };
+                        }
+                    }
+                }
+            }
+            TtsEvent::Error { message, .. } => {
+                eprintln!("aristotle: tts error: {message}");
+                self.stop_tts();
+                if let Screen::TtsPlayer { ids, mut state } =
+                    std::mem::replace(&mut self.screen, Screen::Mine)
+                {
+                    state.paused = true;
+                    state.error = Some(message);
+                    if self.asleep.is_none() {
+                        self.show_tts_player(Refresh::Auto, state)?;
+                    } else {
+                        self.screen = Screen::TtsPlayer { ids, state };
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn on_menu_event(&mut self, ev: UiEvent) -> Result<(), Error> {
         let Screen::Reader(r) = &mut self.screen else {
             return Ok(());
@@ -8475,6 +11418,8 @@ impl App {
                         Ok(())
                     }
                     menu_action::TYPESET => self.open_typeset(),
+                    menu_action::BARS => self.open_reader_bars_from_reader(),
+                    menu_action::TTS_TOGGLE => self.toggle_tts(),
                     menu_action::FONT_LIST => self.open_fonts(fonts::FontTarget::Latin),
                     menu_action::CJK_FONT_LIST => self.open_fonts(fonts::FontTarget::Cjk),
                     menu_action::SIZE_DOWN => {
@@ -8565,8 +11510,14 @@ impl App {
     /// - `push_readest`: whether reading progress or local annotations/tombstones
     ///   changed while this book was open (or no reader is open).
     fn save_reader_progress_on_exit(&mut self) -> (bool, bool) {
-        let Screen::Reader(r) = &self.screen else {
-            return (true, true);
+        let r = match &self.screen {
+            Screen::Reader(r) => r.as_ref(),
+            Screen::TtsPlayer { state, .. } => state.reader.as_ref(),
+            Screen::TtsSettings {
+                back: TtsSettingsReturn::TtsPlayer(state),
+                ..
+            } => state.reader.as_ref(),
+            _ => return (true, true),
         };
         let now = aristotle_library::library::now();
         let progress = r.session.progress(now);
@@ -8583,6 +11534,7 @@ impl App {
     /// Leaves the reader and brings back the screen the book was opened
     /// from: the home page, the library, or a shelf of it.
     fn back_to_library(&mut self) -> Result<(), Error> {
+        self.stop_tts();
         self.stats.finish_page(Instant::now());
         let (push_progress, push_readest) = self.save_reader_progress_on_exit();
         let closed_book_id = if let Screen::Reader(r) = &self.screen {
@@ -8615,9 +11567,9 @@ impl App {
         // The screen the book was opened from goes out first; copying the
         // pages and serialising the index wait until it is submitted.
         match self.section {
-            ui_nav::Tab::Home => self.show_home(Refresh::Full)?,
-            ui_nav::Tab::Library => self.show_library(Refresh::Full)?,
-            ui_nav::Tab::Mine => self.show_mine(Refresh::Full)?,
+            ui_nav::Tab::Home => self.show_home(Refresh::Clean)?,
+            ui_nav::Tab::Library => self.show_library(Refresh::Clean)?,
+            ui_nav::Tab::Mine => self.show_mine(Refresh::Clean)?,
         }
         if let Some((key, current, next)) = snapshot {
             self.snapshots.save(key, current, next);
@@ -11127,11 +14079,14 @@ mod tests {
         let id = app.lib.books()[0].id.clone();
         assert!(Library::open(&library).unwrap().books().is_empty());
         let destination = app.library_destination();
+        let fonts_destination = app.active_fonts_dir();
         app.spawn_scan(ScanPurpose::Import {
             sources: vec![root.clone()],
             new_paths: Vec::new(),
             indexed: vec![id.clone()],
             destination: destination.clone(),
+            font_paths: Vec::new(),
+            fonts_destination,
         })
         .unwrap();
         wait_for_scan(&mut app);
@@ -11182,6 +14137,8 @@ mod tests {
                 new_paths: vec!["book.txt".into()],
                 indexed: Vec::new(),
                 destination,
+                font_paths: Vec::new(),
+                fonts_destination: app.active_fonts_dir(),
             },
             ack: Some(ack),
             _handle: None,
@@ -11816,6 +14773,81 @@ mod tests {
         };
         assert_eq!(after_auto, after_backward);
 
+        app.leave().unwrap();
+    }
+
+    #[test]
+    fn watch_sleep_repaints_cover_quote_when_framebuffer_is_blanked_to_white() {
+        let dir = testdir("sleep-watch-blank");
+        let mut app = memory_app(&dir.join("library"), &dir.join("books"));
+        app.prefs.sleep_screen = prefs::SleepScreen::CoverQuote;
+        app.fall_asleep(true).unwrap();
+        assert!(app.asleep.is_some());
+        assert!(app.sleep_watch.is_some());
+        assert!(app.panel.still_shows_ui(&app.ui));
+        let expected = pixels(&app).to_vec();
+        assert!(
+            expected.iter().any(|&p| p != 0xff),
+            "cover+quote screensaver must paint non-white pixels"
+        );
+        let before = updates(&app).len();
+
+        // Simulate an external blanking/overwrite of /dev/fb0 to pure white.
+        match &mut app.panel {
+            Panel::Memory(m) => m.pixels.fill(0xff),
+            Panel::Device(_) => unreachable!(),
+        }
+        assert!(!app.panel.still_shows_ui(&app.ui));
+
+        // The sleep watch detects the blanked framebuffer and repaints it.
+        app.watch_sleep().unwrap();
+        assert!(app.panel.still_shows_ui(&app.ui));
+        assert_eq!(pixels(&app), expected.as_slice());
+        assert!(updates(&app).len() > before);
+        assert_eq!(updates(&app).last().unwrap().as_str(), "flash");
+
+        // Once the watch window expires, watch_sleep clears it and stops polling.
+        app.sleep_watch = Some(StartupWatch {
+            until: Instant::now() - Duration::from_millis(1),
+            repairs: 2,
+        });
+        app.watch_sleep().unwrap();
+        assert!(app.sleep_watch.is_none());
+    }
+
+    #[test]
+    fn jianguoyun_sync_completion_does_not_overwrite_sleep_screen() {
+        let Some((library, root, id)) = reopen_fixture(false) else {
+            return;
+        };
+        let mut app = memory_app(&library, &root);
+        app.prefs.sleep_screen = prefs::SleepScreen::CoverQuote;
+        app.open_by_title("Reopened").unwrap();
+        wait(&mut app, |app| matches!(app.screen, Screen::Reader(_)));
+        app.fall_asleep(true).unwrap();
+        let before = updates(&app).len();
+        let expected = pixels(&app).to_vec();
+
+        let mut farther = inkread_core::jianguoyun::JianguoyunBookSync::new(id.clone(), "Reopened");
+        farther.progress = Some(inkread_core::jianguoyun::JianguoyunProgress {
+            xpointer: None,
+            cfi: None,
+            fraction: 0.7,
+            page: None,
+            total_pages: None,
+            chapter_title: None,
+            updated_at_ms: 1_700_000_020_000,
+            device_id: "phone".into(),
+        });
+        app.jianguoyun.sync_token = 99;
+        app.jianguoyun.book_sync_tokens.insert(id.clone(), 99);
+        app.on_jianguoyun_book_synced(id, 99, false, false, Ok(Some(farther)))
+            .unwrap();
+
+        assert!(app.asleep.is_some());
+        assert_eq!(updates(&app).len(), before);
+        assert_eq!(pixels(&app), expected.as_slice());
+        app.wake(true).unwrap();
         app.leave().unwrap();
     }
 }

@@ -10,6 +10,51 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+/// Process-wide fallback clock offset (seconds) when the platform denies
+/// writing the system clock / RTC. Every clock read in the app adds this
+/// offset so the status bar, home clock, reader bars, and settings stay in
+/// sync.
+static CLOCK_OFFSET_SECS: AtomicI64 = AtomicI64::new(0);
+
+/// Process-wide 24-hour clock preference (default: true).
+static CLOCK_24H: AtomicBool = AtomicBool::new(true);
+
+/// Set the process-wide fallback clock offset in seconds.
+pub fn set_clock_offset(offset_secs: i64) {
+    CLOCK_OFFSET_SECS.store(offset_secs, Ordering::Relaxed);
+}
+
+/// Current process-wide fallback clock offset in seconds.
+pub fn clock_offset() -> i64 {
+    CLOCK_OFFSET_SECS.load(Ordering::Relaxed)
+}
+
+/// Set the process-wide 24-hour clock preference.
+pub fn set_clock_24h(clock_24h: bool) {
+    CLOCK_24H.store(clock_24h, Ordering::Relaxed);
+}
+
+/// Current process-wide 24-hour clock preference.
+pub fn clock_24h() -> bool {
+    CLOCK_24H.load(Ordering::Relaxed)
+}
+
+/// Raw system UTC UNIX timestamp in seconds (without the fallback offset).
+pub fn raw_unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Effective UTC UNIX timestamp in seconds, including the process-wide
+/// fallback offset. Because the kernel `CLOCK_REALTIME` advances from the
+/// hardware RTC across CPU suspend, this clock continues advancing while
+/// the device is asleep.
+pub fn unix_now() -> i64 {
+    raw_unix_now().saturating_add(clock_offset())
+}
 
 /// Size and free space of a filesystem, in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,10 +222,23 @@ fn posix_offset(gmtoff: i32) -> Option<String> {
     })
 }
 
+/// Broken-down local time using the process-wide clock offset.
 pub fn local_time() -> Option<LocalTime> {
-    // SAFETY: time and localtime_r only write into the values passed.
+    local_time_with_offset(clock_offset())
+}
+
+/// Broken-down local time with an explicit offset in seconds relative to the
+/// raw system clock.
+pub fn local_time_with_offset(offset_secs: i64) -> Option<LocalTime> {
+    local_time_at(raw_unix_now().saturating_add(offset_secs))
+}
+
+/// Broken-down local time for a given UTC UNIX timestamp.
+#[allow(deprecated)]
+pub fn local_time_at(unix_secs: i64) -> Option<LocalTime> {
+    // SAFETY: localtime_r only reads `t` and writes into `tm`.
     unsafe {
-        let t = libc::time(std::ptr::null_mut());
+        let t = unix_secs as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&t, &mut tm).is_null() {
             return None;
@@ -194,6 +252,113 @@ pub fn local_time() -> Option<LocalTime> {
             minute: tm.tm_min as u32,
             second: tm.tm_sec as u32,
         })
+    }
+}
+
+/// Format a UTC UNIX timestamp as `"YYYY-MM-DD HH:MM:SS"` for BusyBox/GNU `date -u -s`.
+#[allow(deprecated)]
+fn format_utc_datetime(unix_secs: i64) -> Option<String> {
+    // SAFETY: gmtime_r only reads `t` and writes into `tm`.
+    unsafe {
+        let t = unix_secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::gmtime_r(&t, &mut tm).is_null() {
+            return None;
+        }
+        Some(format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        ))
+    }
+}
+
+/// Apply a timezone by setting `TZ` for the running process, refreshing libc
+/// timezone state (`tzset`), and best-effort updating `/var/local/system/tz`
+/// on Kindle when `/usr/share/zoneinfo/<iana>` is available.
+pub fn apply_timezone(posix_tz: &str, iana_id: &str) {
+    extern "C" {
+        fn tzset();
+    }
+    if !posix_tz.trim().is_empty() {
+        std::env::set_var("TZ", posix_tz);
+        // SAFETY: POSIX `tzset` takes no arguments and refreshes libc's cached TZ state.
+        unsafe {
+            tzset();
+        }
+    }
+    let zonefile = Path::new("/usr/share/zoneinfo").join(iana_id);
+    if zonefile.is_file() {
+        let _ = fs::copy(&zonefile, "/var/local/system/tz");
+    }
+}
+
+/// Best-effort set the system clock to `unix_secs` (UTC) and persist it to the
+/// hardware RTC so time keeps advancing accurately across CPU suspend/sleep.
+///
+/// Uses `clock_settime(CLOCK_REALTIME)` first (no shell/BusyBox flag quirks),
+/// falling back to `date -u -s "YYYY-MM-DD HH:MM:SS"`, then writes the RTC via
+/// `hwclock -w -u` (falling back to `hwclock -w`). Returns `Err` if the
+/// platform denies setting the system clock (callers fall back to the
+/// process-wide offset).
+#[allow(deprecated)]
+pub fn set_system_time(unix_secs: i64) -> io::Result<()> {
+    let ts = libc::timespec {
+        tv_sec: unix_secs as libc::time_t,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid timespec passed by pointer to clock_settime.
+    let set_via_syscall = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) } == 0;
+
+    if !set_via_syscall {
+        let formatted = format_utc_datetime(unix_secs)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid unix timestamp"))?;
+        let status = Command::new("date")
+            .args(["-u", "-s", &formatted])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "date -u -s {formatted}: {status}"
+            )));
+        }
+    }
+
+    // Persist to hardware RTC so sleep/suspend preserves the adjusted clock.
+    let rtc_utc = Command::new("hwclock")
+        .args(["-w", "-u"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !rtc_utc.is_ok_and(|s| s.success()) {
+        let _ = Command::new("hwclock")
+            .arg("-w")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    Ok(())
+}
+
+/// Request a clean system reboot (Kindle / Kobo Linux).
+pub fn reboot_device() -> io::Result<()> {
+    let status = Command::new("reboot")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("reboot: {status}")))
     }
 }
 
@@ -386,5 +551,34 @@ mod tests {
     fn storage_of_the_build_dir() {
         let s = storage(Path::new(".")).unwrap();
         assert!(s.total > 0 && s.free <= s.total);
+    }
+
+    #[test]
+    fn format_utc_datetime_matches_busybox_format() {
+        assert_eq!(
+            format_utc_datetime(0).as_deref(),
+            Some("1970-01-01 00:00:00")
+        );
+        assert_eq!(
+            format_utc_datetime(1_795_402_510).as_deref(),
+            Some("2026-11-24 02:55:10")
+        );
+    }
+
+    #[test]
+    fn global_clock_offset_applies_to_unix_now_and_local_time() {
+        let prev_offset = clock_offset();
+        let prev_24h = clock_24h();
+
+        set_clock_offset(3600);
+        set_clock_24h(false);
+        assert_eq!(clock_offset(), 3600);
+        assert!(!clock_24h());
+        let diff = unix_now() - raw_unix_now();
+        assert!((3599..=3601).contains(&diff), "diff was {diff}");
+        assert!(local_time().is_some());
+
+        set_clock_offset(prev_offset);
+        set_clock_24h(prev_24h);
     }
 }

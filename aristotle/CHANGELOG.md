@@ -8,6 +8,12 @@ are its section below.
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-11-27
+
+- 内置离线英汉词典与音标字体支持（`data/dicts`），查词与音标渲染更完整。
+- 排版面板、阅读页上下栏及横竖排样式微调，修正部分页面布局与刷新问题。
+- 更新独立书库入口图标与启动/OTA 脚本，版本号升至 0.3.8 并全量同步共享基线、适配中心目录与全机型 OTA 通道。
+
 ### Security
 
 - Update `rustls-webpki` to 0.103.16 and `webpki-roots` to 1.0.10 to address RUSTSEC-2026-0382 and RUSTSEC-2026-0381.

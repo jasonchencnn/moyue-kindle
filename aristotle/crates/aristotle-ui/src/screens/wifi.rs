@@ -6,12 +6,14 @@
 //! and the picture in `docs/ui/prototype-v2/reference/wifitransfer.png`.
 
 use super::library::{status_line, RoundedBar, StatusLine};
+use super::weread_login::render_qr;
 use crate::geom::{Insets, Rect, Size};
 use crate::icons::Icon;
 use crate::status::LoadingNodes;
 use crate::text::{Align, Paragraph, TextEngine};
 use crate::theme::{home_margin, Styles, CARD, INK, INK_MID, PAPER};
 use crate::tree::{Constraints, Cross, Feedback, Kind, Node, NodeId, PaintCx, Tree, Widget};
+use crate::widgets::GrayImage;
 use aristotle_i18n::{tf, tr, Msg};
 use zeno::Transform;
 
@@ -21,6 +23,8 @@ pub mod action {
     pub const BACK: ActionId = 1;
     /// The button that stops the transfer, or starts it again.
     pub const TOGGLE: ActionId = 3;
+    /// Jump to local library/font scan and folder picker.
+    pub const SCAN_LOCAL: ActionId = 4;
 }
 
 /// The height of the header, in reference pixels.
@@ -127,7 +131,8 @@ impl WifiUi {
         size: Size,
     ) -> (Tree, Self) {
         let compact = crate::theme::PanelLayout::for_size(size, s.density)
-            == crate::theme::PanelLayout::Compact;
+            == crate::theme::PanelLayout::Compact
+            || size.w > size.h;
         let mut t = Tree::new();
         let bar = status_line(&mut t, s, &wifi.status);
         let status = t.pad(Insets::new(0, home_margin(), 0, home_margin()), bar.root);
@@ -208,7 +213,33 @@ fn header(t: &mut Tree, s: &Styles, wifi: &Wifi, compact: bool) -> NodeId {
     t.fixed(None, Some(if compact { 88 } else { HEADER_H }), Some(row))
 }
 
-/// The card with the address the browser has to go to.
+struct TransferQr {
+    image: GrayImage,
+}
+
+impl Widget for TransferQr {
+    fn measure(&mut self, c: Constraints, _text: &mut TextEngine) -> Size {
+        c.constrain(Size::new(self.image.width as i32, self.image.height as i32))
+    }
+
+    fn paint(&self, rect: Rect, cx: &mut PaintCx) {
+        let p = &mut *cx.painter;
+        p.fill_rect(rect, PAPER);
+        let x = rect.x + (rect.w - self.image.width as i32) / 2;
+        let y = rect.y + (rect.h - self.image.height as i32) / 2;
+        p.blit_gray(
+            x,
+            y,
+            self.image.width,
+            self.image.height,
+            self.image.width as usize,
+            &self.image.pixels,
+        );
+    }
+}
+
+/// The card with the address the browser has to go to, plus a scannable QR code
+/// for instant phone book/font transfer on the same LAN.
 fn address_card(t: &mut Tree, s: &Styles, wifi: &Wifi, compact: bool) -> NodeId {
     let hint = t.label(
         if !wifi.connected {
@@ -222,14 +253,40 @@ fn address_card(t: &mut Tree, s: &Styles, wifi: &Wifi, compact: bool) -> NodeId 
     );
     let top = hint;
 
-    // The address is the one line of the card that is centred.
+    let qr_img = if wifi.connected && wifi.running && !wifi.address.is_empty() {
+        render_qr(&wifi.address, if compact { 128 } else { 196 })
+    } else {
+        None
+    };
+
     let address = t.text(Paragraph::plain(
         &wifi.address,
         s.font_md().bold().line_height(1.2).tracking(1.0),
-        Align::Center,
+        if qr_img.is_some() {
+            Align::Left
+        } else {
+            Align::Center
+        },
     ));
     let gap = t.gap(0, if compact { 8 } else { 14 });
-    let inner = t.add(Node::column(0), [top, gap, address]);
+    let inner = if let Some(image) = qr_img {
+        let scan_tip = t.label("手机扫码即可传书 / 传字体", s.font_xs().gray(INK_MID));
+        let gap_tip = t.gap(0, if compact { 6 } else { 10 });
+        let left = t.add(
+            Node::column(0).flex(1),
+            [top, gap, address, gap_tip, scan_tip],
+        );
+        let qr_widget = t.custom(TransferQr { image });
+        let qr_box = t.add(
+            Node::new(Kind::Padding(Insets::all(6)))
+                .bg(PAPER)
+                .border(1, INK, 12),
+            [qr_widget],
+        );
+        t.add(Node::row(16).cross(Cross::Center), [left, qr_box])
+    } else {
+        t.add(Node::column(0), [top, gap, address])
+    };
     let pad = if compact {
         Insets::new(14, 24, 14, 24)
     } else {
@@ -446,8 +503,24 @@ fn formats(t: &mut Tree, s: &Styles, compact: bool) -> NodeId {
     t.add(Node::column(0), [head, gap, row])
 }
 
-/// The button that stops the transfer, or starts it again.
+/// The bottom action row: local scan entry alongside stop/restart transfer.
 fn stop_button(t: &mut Tree, s: &Styles, wifi: &Wifi, compact: bool) -> (NodeId, NodeId) {
+    let h = if compact { 80 } else { 96 };
+    let scan_label = t.label(tr(Msg::LibraryScan), s.font_base().line_height(1.0));
+    let scan_aligned = t.add(Node::new(Kind::Align { x: 0.5, y: 0.5 }), [scan_label]);
+    let scan_btn = t.add(
+        Node::new(Kind::Fixed {
+            w: None,
+            h: Some(h),
+        })
+        .flex(1)
+        .bg(PAPER)
+        .border(2, INK, 20)
+        .action(action::SCAN_LOCAL)
+        .feedback(Feedback::Invert),
+        [scan_aligned],
+    );
+
     let label = t.label(
         if wifi.running {
             tr(Msg::WifiStop)
@@ -457,18 +530,20 @@ fn stop_button(t: &mut Tree, s: &Styles, wifi: &Wifi, compact: bool) -> (NodeId,
         s.font_base().line_height(1.0),
     );
     let aligned = t.add(Node::new(Kind::Align { x: 0.5, y: 0.5 }), [label]);
-    let button = t.add(
+    let toggle_btn = t.add(
         Node::new(Kind::Fixed {
             w: None,
-            h: Some(if compact { 80 } else { 96 }),
+            h: Some(h),
         })
+        .flex(1)
         .bg(PAPER)
         .border(2, INK, 20)
         .action(action::TOGGLE)
         .feedback(Feedback::Invert),
         [aligned],
     );
-    (button, label)
+    let row = t.add(Node::row(16).cross(Cross::Center), [scan_btn, toggle_btn]);
+    (row, label)
 }
 
 /// The share of the file that has arrived, as the page shows it.
@@ -716,6 +791,36 @@ mod tests {
         let hint = tr(Msg::WifiPictureHint);
         for part in ["JPG", "PNG", "5 MB", "screensavers"] {
             assert!(hint.contains(part), "{part} is not in {hint:?}");
+        }
+    }
+
+    #[test]
+    fn wifi_screen_exposes_local_scan_entry_in_portrait_and_landscape() {
+        for (w, h) in [(1264, 1680), (1680, 1264)] {
+            let mut text = TextEngine::new(Fonts::embedded());
+            let s = Styles::new(crate::text::FamilyId(0));
+            let (mut tree, _view) =
+                WifiUi::build_for_size(&mut text, &s, &sample(), Size::new(w, h));
+            let root = tree.root().unwrap();
+            assert!(
+                has_action(&tree, root, action::SCAN_LOCAL),
+                "SCAN_LOCAL missing at {w}x{h}"
+            );
+            tree.layout(crate::geom::Rect::new(0, 0, w, h), &mut text);
+            let mut found = None;
+            for i in 0..tree.len() {
+                let id = NodeId(i as u32);
+                if tree.node(id).action == Some(action::SCAN_LOCAL) {
+                    found = Some(tree.rect(id));
+                    break;
+                }
+            }
+            let r = found.expect("SCAN_LOCAL node rect");
+            assert!(r.w > 0 && r.h > 0, "SCAN_LOCAL empty at {w}x{h}: {r:?}");
+            assert!(
+                r.x >= 0 && r.y >= 0 && r.right() <= w && r.bottom() <= h,
+                "SCAN_LOCAL out of bounds at {w}x{h}: {r:?}"
+            );
         }
     }
 

@@ -532,6 +532,41 @@ fn test_interactive_epub_footnote_retrieves_body() {
 }
 
 #[test]
+fn test_interactive_epub_page_footnotes_and_has_page_footnotes() {
+    let _serial = serial();
+    let Some(cache) = cache() else {
+        return;
+    };
+    let style = Style::pw4();
+    let mut book = open_interactive_book(&cache, &style).expect("打开 interactive.epub");
+
+    assert!(
+        book.has_page_footnotes(0),
+        "含脚注的页面 has_page_footnotes 应返回 true"
+    );
+    let notes = book.page_footnotes(0);
+    assert!(
+        !notes.is_empty(),
+        "page_footnotes 应提取出当前页的所有自带注释"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.text.text().contains("这是第一条测试脚注的正文内容")),
+        "page_footnotes 应包含目标脚注正文，实际: {notes:?}"
+    );
+    // 同一 URI 不应重复列出
+    let mut uris: Vec<&str> = notes.iter().map(|n| n.link.uri.as_str()).collect();
+    uris.sort_unstable();
+    let unique = {
+        let mut u = uris.clone();
+        u.dedup();
+        u.len()
+    };
+    assert_eq!(uris.len(), unique, "page_footnotes 应按 URI 去重");
+}
+
+#[test]
 fn test_interactive_epub_highlight_xpointer_locates_same_text_after_font_change() {
     let _serial = serial();
     let Some(cache) = cache() else {

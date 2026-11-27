@@ -423,6 +423,175 @@ check "recovery entry restores both trees after extension-boundary power loss" \
 check "eips status and errors are ASCII" \
     "[ -s $WORK/dev/eips.log ] && ! LC_ALL=C grep -q '[^ -~]' $WORK/dev/eips.log"
 
+printf '\nIn-app OTA handover\n'
+MOYUE_OTA_TEST_CRASH=
+MOYUE_OTA_TEST_ROLLBACK_FAIL=
+write_handover() {
+    dir=$1 version=$2 device=$3 channel=$4 fw=$5 pkg=$6 sha=$7 size=$8
+    mkdir -p "$dir"
+    {
+        echo "version=$version"
+        echo "device=$device"
+        echo "channel=$channel"
+        echo "firmware=$fw"
+        echo "package=$pkg"
+        echo "sha256=$sha"
+        echo "size=$size"
+    } > "$dir/handover.conf"
+}
+
+run_handover() {
+    r=$1
+    AGENT_TEST_ROOT=$r \
+        ARISTOTLE_EXT_DIR=$r/mnt/us/extensions/aristotle \
+        ARISTOTLE_APP_DIR=$r/mnt/us/aristotle \
+        MOYUE_OTA_DIR=$r/mnt/us/.aristotle/ota \
+        PATH="$TEST_PATH" \
+        sh "$r/mnt/us/extensions/aristotle/bin/ota-update.sh" handover
+    return $?
+}
+
+fresh
+mkdir -p "$WORK/dev/mnt/us/.aristotle/ota"
+cp "$PKG" "$WORK/dev/mnt/us/.aristotle/ota/pkg-0.3.2.tar.gz"
+write_handover "$WORK/dev/mnt/us/.aristotle/ota" 0.3.2 0LN 0LN-5.16.2.1.1 5.16 \
+    "$WORK/dev/mnt/us/.aristotle/ota/pkg-0.3.2.tar.gz" "$SHA" "$SIZE"
+run_handover "$WORK/dev" > "$WORK/out" 2>&1
+check "handover updates app and extension without network" \
+    "[ $? = 0 ] && grep -q '更新完成：0.3.2' $WORK/out && [ \"\$(cat $WORK/dev/mnt/us/aristotle/VERSION)\" = 0.3.2 ] && grep -q '<version>0.3.2</version>' $WORK/dev/mnt/us/extensions/aristotle/config.xml"
+check "handover removes handover.conf and downloaded package after install" \
+    "[ ! -e $WORK/dev/mnt/us/.aristotle/ota/handover.conf ] && [ ! -e $WORK/dev/mnt/us/.aristotle/ota/pkg-0.3.2.tar.gz ]"
+check "handover preserves user data and credentials" \
+    "[ \"\$(cat $WORK/dev/mnt/us/documents/book.epub)\" = 'book bytes' ] && [ \"\$(cat $WORK/dev/mnt/us/.aristotle/reader.json)\" = 'login and settings' ] && grep -q 'ssh-ed25519 test' $WORK/dev/mnt/us/extensions/aristotle/authorized_keys"
+
+fresh
+mkdir -p "$WORK/dev/mnt/us/.aristotle/ota"
+cp "$PKG" "$WORK/dev/mnt/us/.aristotle/ota/pkg-0.3.2.tar.gz"
+write_handover "$WORK/dev/mnt/us/.aristotle/ota" 0.3.2 0PP 0PP-5.16.2.1.1 5.16 \
+    "$WORK/dev/mnt/us/.aristotle/ota/pkg-0.3.2.tar.gz" "$SHA" "$SIZE"
+run_handover "$WORK/dev" > "$WORK/out" 2>&1
+check "handover refuses wrong device and consumes handover.conf" \
+    "[ $? = 1 ] && grep -q '不是给设备 0LN' $WORK/out && [ \"\$(cat $WORK/dev/mnt/us/aristotle/VERSION)\" = 0.3.1 ] && [ ! -e $WORK/dev/mnt/us/.aristotle/ota/handover.conf ]"
+
+fresh
+mkdir -p "$WORK/dev/mnt/us/.aristotle/ota"
+cp "$PKG" "$WORK/dev/mnt/us/.aristotle/ota/pkg-0.3.2.tar.gz"
+write_handover "$WORK/dev/mnt/us/.aristotle/ota" 0.3.0 0LN 0LN-5.16.2.1.1 5.16 \
+    "$WORK/dev/mnt/us/.aristotle/ota/pkg-0.3.2.tar.gz" "$SHA" "$SIZE"
+run_handover "$WORK/dev" > "$WORK/out" 2>&1
+check "handover refuses downgrade and consumes handover.conf" \
+    "[ $? = 0 ] && grep -q '不降级' $WORK/out && [ \"\$(cat $WORK/dev/mnt/us/aristotle/VERSION)\" = 0.3.1 ] && [ ! -e $WORK/dev/mnt/us/.aristotle/ota/handover.conf ]"
+
+fresh
+mkdir -p "$WORK/dev/mnt/us/.aristotle/ota"
+write_handover "$WORK/dev/mnt/us/.aristotle/ota" 0.3.2 0LN 0LN-5.16.2.1.1 5.16 \
+    "$WORK/dev/mnt/us/.aristotle/ota/../evil.tar.gz" "$SHA" "$SIZE"
+run_handover "$WORK/dev" > "$WORK/out" 2>&1
+check "handover refuses package path traversal" \
+    "[ $? = 1 ] && grep -q '路径穿越' $WORK/out && [ ! -e $WORK/dev/mnt/us/.aristotle/ota/handover.conf ]"
+
+fresh
+mkdir -p "$WORK/dev/mnt/us/.aristotle/ota"
+cp "$PKG" "$WORK/dev/mnt/us/.aristotle/ota/pkg-0.3.2.tar.gz"
+write_handover "$WORK/dev/mnt/us/.aristotle/ota" 0.3.2 0LN 0LN-5.16.2.1.1 5.16 \
+    "$WORK/dev/mnt/us/.aristotle/ota/pkg-0.3.2.tar.gz" "$(printf '%064d' 0)" "$SIZE"
+run_handover "$WORK/dev" > "$WORK/out" 2>&1
+check "handover refuses bad SHA-256 and consumes handover.conf" \
+    "[ $? = 1 ] && grep -q 'SHA-256 校验失败' $WORK/out && [ \"\$(cat $WORK/dev/mnt/us/aristotle/VERSION)\" = 0.3.1 ] && [ ! -e $WORK/dev/mnt/us/.aristotle/ota/handover.conf ]"
+
+# End-to-end launcher test: run-aristotle.sh detects handover.conf, applies the
+# update via ota-update.sh handover, and immediately restarts the new binary.
+fresh
+cp "$DEVICE/app/run-aristotle.sh" "$WORK/dev/mnt/us/aristotle/run-aristotle.sh"
+chmod 755 "$WORK/dev/mnt/us/aristotle/run-aristotle.sh"
+cat > "$WORK/dev/mnt/us/aristotle/takeover.sh" << 'EOF'
+#!/bin/sh
+echo "takeover:$1" >> "$AGENT_TEST_ROOT/launcher.trace"
+exit 0
+EOF
+chmod 755 "$WORK/dev/mnt/us/aristotle/takeover.sh"
+mkdir -p "$WORK/dev/mnt/us/.aristotle/ota"
+cp "$PKG" "$WORK/dev/mnt/us/.aristotle/ota/pkg-0.3.2.tar.gz"
+cat > "$WORK/dev/mnt/us/aristotle/aristotle" << EOF
+#!/bin/sh
+echo "run:0.3.1" >> "\$AGENT_TEST_ROOT/launcher.trace"
+cat > "\$AGENT_TEST_ROOT/mnt/us/.aristotle/ota/handover.conf" << 'HO'
+version=0.3.2
+device=0LN
+channel=0LN-5.16.2.1.1
+firmware=5.16
+package=$WORK/dev/mnt/us/.aristotle/ota/pkg-0.3.2.tar.gz
+sha256=$SHA
+size=$SIZE
+HO
+exit 0
+EOF
+chmod 755 "$WORK/dev/mnt/us/aristotle/aristotle"
+AGENT_TEST_ROOT="$WORK/dev" \
+    ARISTOTLE_LOG="$WORK/dev/app.log" \
+    ARISTOTLE_EXT_DIR="$WORK/dev/mnt/us/extensions/aristotle" \
+    MOYUE_OTA_DIR="$WORK/dev/mnt/us/.aristotle/ota" \
+    PATH="$TEST_PATH" \
+    sh "$WORK/dev/mnt/us/aristotle/run-aristotle.sh" > "$WORK/out" 2>&1
+check "run-aristotle.sh applies handover and restarts the new version" \
+    "[ $? = 0 ] && [ \"\$(cat $WORK/dev/mnt/us/aristotle/VERSION)\" = 0.3.2 ] && grep -q '<version>0.3.2</version>' $WORK/dev/mnt/us/extensions/aristotle/config.xml && grep -q '=== ota handover applied; restarting app' $WORK/dev/app.log && grep -q 'fake aristotle\|fake' $WORK/dev/app.log && [ ! -e $WORK/dev/mnt/us/.aristotle/ota/handover.conf ]"
+check "run-aristotle.sh only ran takeover start once and stop once" \
+    "[ \"\$(grep -c '^takeover:start$' $WORK/dev/launcher.trace)\" = 1 ] && [ \"\$(grep -c '^run:0.3.1$' $WORK/dev/launcher.trace)\" = 1 ]"
+
+fresh
+mkdir -p "$WORK/dev/mnt/us/aristotle/data/ota"
+cp "$PKG" "$WORK/dev/mnt/us/aristotle/data/ota/pkg-0.3.2.tar.gz"
+write_handover "$WORK/dev/mnt/us/aristotle/data/ota" 0.3.2 0LN 0LN-5.16.2.1.1 5.16 \
+    "$WORK/dev/mnt/us/aristotle/data/ota/pkg-0.3.2.tar.gz" "$SHA" "$SIZE"
+AGENT_TEST_ROOT="$WORK/dev" \
+    ARISTOTLE_EXT_DIR="$WORK/dev/mnt/us/extensions/aristotle" \
+    ARISTOTLE_APP_DIR="$WORK/dev/mnt/us/aristotle" \
+    MOYUE_OTA_DIR="$WORK/dev/mnt/us/aristotle/data/ota" \
+    PATH="$TEST_PATH" \
+    sh "$WORK/dev/mnt/us/extensions/aristotle/bin/ota-update.sh" handover > "$WORK/out" 2>&1
+check "ota-update.sh refuses MOYUE_OTA_DIR inside app directory" \
+    "[ $? = 1 ] && grep -q '更新目录不能在应用或扩展目录内' $WORK/out && [ \"\$(cat $WORK/dev/mnt/us/aristotle/VERSION)\" = 0.3.1 ]"
+
+# Regression: legacy app writing handover into $DIR/data/ota while launched with
+# cwd inside $EXT (as KUAL does) must migrate out of $APP and succeed.
+fresh
+cp "$DEVICE/app/run-aristotle.sh" "$WORK/dev/mnt/us/aristotle/run-aristotle.sh"
+chmod 755 "$WORK/dev/mnt/us/aristotle/run-aristotle.sh"
+cat > "$WORK/dev/mnt/us/aristotle/takeover.sh" << 'EOF'
+#!/bin/sh
+echo "takeover:$1" >> "$AGENT_TEST_ROOT/launcher.trace"
+exit 0
+EOF
+chmod 755 "$WORK/dev/mnt/us/aristotle/takeover.sh"
+mkdir -p "$WORK/dev/mnt/us/aristotle/data/ota"
+cp "$PKG" "$WORK/dev/mnt/us/aristotle/data/ota/pkg-0.3.2.tar.gz"
+cat > "$WORK/dev/mnt/us/aristotle/aristotle" << EOF
+#!/bin/sh
+echo "run:legacy-0.3.1" >> "\$AGENT_TEST_ROOT/launcher.trace"
+cat > "\$AGENT_TEST_ROOT/mnt/us/aristotle/data/ota/handover.conf" << 'HO'
+version=0.3.2
+device=0LN
+channel=0LN-5.16.2.1.1
+firmware=5.16
+package=$WORK/dev/mnt/us/aristotle/data/ota/pkg-0.3.2.tar.gz
+sha256=$SHA
+size=$SIZE
+HO
+exit 0
+EOF
+chmod 755 "$WORK/dev/mnt/us/aristotle/aristotle"
+(
+    cd "$WORK/dev/mnt/us/extensions/aristotle" && \
+    AGENT_TEST_ROOT="$WORK/dev" \
+        ARISTOTLE_LOG="$WORK/dev/app.log" \
+        ARISTOTLE_EXT_DIR="$WORK/dev/mnt/us/extensions/aristotle" \
+        MOYUE_OTA_DIR="$WORK/dev/mnt/us/.aristotle/ota" \
+        PATH="$TEST_PATH" \
+        sh "$WORK/dev/mnt/us/aristotle/run-aristotle.sh"
+) > "$WORK/out" 2>&1
+check "run-aristotle.sh migrates legacy data/ota handover from EXT cwd and restarts new version" \
+    "[ $? = 0 ] && [ \"\$(cat $WORK/dev/mnt/us/aristotle/VERSION)\" = 0.3.2 ] && grep -q '<version>0.3.2</version>' $WORK/dev/mnt/us/extensions/aristotle/config.xml && grep -q '=== ota handover applied; restarting app' $WORK/dev/app.log && [ ! -e $WORK/dev/mnt/us/.aristotle/ota/handover.conf ]"
+
 printf '\nPackaging includes diagnostics and no credentials\n'
 mkdir -p "$WORK/bundle/aristotle/licenses"
 fake_app "$WORK/bundle/aristotle" "$WORKSPACE_VERSION"
@@ -432,13 +601,15 @@ check "package.sh tree includes the workspace VERSION" \
     "[ $? = 0 ] && [ \"\$(cat $WORK/pkgtree/aristotle/VERSION)\" = \"$WORKSPACE_VERSION\" ]"
 check "package.sh tree includes diagnostics and OTA menu" \
     "[ -f $WORK/pkgtree/extensions/aristotle/diagnostics/diagnostics.sh ] && grep -q '诊断日志' $WORK/pkgtree/extensions/aristotle/menu.json && grep -q '检查更新' $WORK/pkgtree/extensions/aristotle/menu.json"
+check "package.sh tree includes library scriptlet and cover icon" \
+    "[ -x $WORK/pkgtree/documents/墨阅.sh ] && [ -s $WORK/pkgtree/aristotle/moyue-icon.png ] && grep -q '^# Icon: /mnt/us/aristotle/moyue-icon.png$' $WORK/pkgtree/documents/墨阅.sh"
 check "package tree has no endpoint.txt or token.txt" \
     "[ -z \"\$(find $WORK/pkgtree -name endpoint.txt -o -name token.txt)\" ]"
 check "package tree has no credentials in diagnostics config" \
     "[ ! -e $WORK/pkgtree/extensions/aristotle/diagnostics/.gitignore ] || ! grep -q 'https://' $WORK/pkgtree/extensions/aristotle/diagnostics/.gitignore"
 APP_BUNDLE="$WORK/fake-app.tar.gz" sh "$REPO/tools/package.sh" zip "$WORK/pkg.zip" > "$WORK/out" 2>&1
-check "package.sh zip (normal USB packaging) includes diagnostics" \
-    "[ $? = 0 ] && unzip -Z1 $WORK/pkg.zip | grep -q '^extensions/aristotle/diagnostics/diagnostics.sh$' && unzip -Z1 $WORK/pkg.zip | grep -q '^aristotle/VERSION$'"
+check "package.sh zip (normal USB packaging) includes diagnostics, scriptlet and icon" \
+    "[ $? = 0 ] && python3 -c 'import sys, zipfile; n = set(zipfile.ZipFile(sys.argv[1]).namelist()); assert {\"extensions/aristotle/diagnostics/diagnostics.sh\", \"aristotle/VERSION\", \"aristotle/moyue-icon.png\", \"documents/墨阅.sh\"}.issubset(n)' $WORK/pkg.zip"
 APP_BUNDLE="$WORK/fake-app.tar.gz" sh "$REPO/tools/package.sh" ota "$WORK/pkg.tar.gz" > "$WORK/out" 2>&1
 check "package.sh ota builds a tar" "[ $? = 0 ] && [ -s $WORK/pkg.tar.gz ]"
 check "OTA tar has no top-level extensions directory entry" \

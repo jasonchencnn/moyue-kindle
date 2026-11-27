@@ -24,9 +24,10 @@
 //!   corner): a tap there is an [`Intent::Tap`] for the reader to resolve,
 //!   not a turn.
 
+use aristotle_screen::TouchZoneLayout;
 use aristotle_ui::geom::{Point, Rect};
 use aristotle_ui::input::{Direction, Gesture, GestureRecognizer, Phase, TouchEvent};
-use aristotle_ui::screens::reader::{vertical_zone_at, zone_at, Zone};
+use aristotle_ui::screens::reader::{zone_at_with_layout, Zone};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Turn {
@@ -69,6 +70,10 @@ pub struct TurnGestures {
     /// half turns forward, the right half back, and the swipes mirror the
     /// horizontal ones (VERT-101).
     vertical: bool,
+    /// User-configured touch tap-zone layout.
+    touch_zone: TouchZoneLayout,
+    /// When true, taps and horizontal swipes do not turn pages (anti-accidental-touch).
+    disable_touch_turn: bool,
 }
 
 /// The bookmark corner: the top right 10 mm square.
@@ -80,6 +85,20 @@ pub fn bookmark_corner(screen: Rect) -> Rect {
 pub fn bookmark_corner_at(screen: Rect, density: aristotle_ui::geom::Density) -> Rect {
     let s = density.mm(10.0);
     Rect::new(screen.x + screen.w - s, screen.y, s, s)
+}
+
+/// The top-right footnote button (magnifying glass) hit target, placed
+/// immediately to the left of [`bookmark_corner_at`] with zero overlap.
+/// Only registered as a quiet zone on pages that actually have footnotes.
+#[cfg(test)]
+pub fn footnote_button(screen: Rect) -> Rect {
+    footnote_button_at(screen, aristotle_ui::geom::Density::default())
+}
+
+pub fn footnote_button_at(screen: Rect, density: aristotle_ui::geom::Density) -> Rect {
+    let bm = bookmark_corner_at(screen, density);
+    let w = density.mm(9.0);
+    Rect::new((bm.x - w).max(screen.x), screen.y, w, bm.h)
 }
 
 impl TurnGestures {
@@ -98,6 +117,8 @@ impl TurnGestures {
             quiet: vec![bookmark_corner_at(screen, density)],
             holding: false,
             vertical: false,
+            touch_zone: TouchZoneLayout::Default30_70,
+            disable_touch_turn: false,
         }
     }
 
@@ -106,13 +127,21 @@ impl TurnGestures {
         self.vertical = vertical;
     }
 
-    /// The zone a point falls in, for the writing direction of the book.
-    fn zone(&self, p: Point) -> Zone {
-        if self.vertical {
-            vertical_zone_at(self.screen, p)
-        } else {
-            zone_at(self.screen, p)
-        }
+    /// Update touch zone layout and anti-accidental-touch flag.
+    pub fn set_touch_prefs(&mut self, layout: TouchZoneLayout, disable_touch_turn: bool) {
+        self.touch_zone = layout;
+        self.disable_touch_turn = disable_touch_turn;
+    }
+
+    /// The zone a point falls in, for the writing direction and user layout.
+    fn zone(&self, p: Point) -> Option<Zone> {
+        zone_at_with_layout(
+            self.screen,
+            p,
+            self.touch_zone,
+            self.vertical,
+            self.disable_touch_turn,
+        )
     }
 
     /// Forget the contact in progress (after the menu took over input).
@@ -188,15 +217,16 @@ impl TurnGestures {
                     out.push(Intent::Tap(p));
                 } else {
                     match self.zone(p) {
-                        Zone::Menu => out.push(Intent::OpenMenu),
-                        Zone::Prev => out.push(Intent::Turn {
+                        Some(Zone::Menu) => out.push(Intent::OpenMenu),
+                        Some(Zone::Prev) => out.push(Intent::Turn {
                             dir: Turn::Back,
                             at_us,
                         }),
-                        Zone::Next => out.push(Intent::Turn {
+                        Some(Zone::Next) => out.push(Intent::Turn {
                             dir: Turn::Forward,
                             at_us,
                         }),
+                        None => {}
                     }
                 }
             }
@@ -207,6 +237,7 @@ impl TurnGestures {
             Gesture::Swipe { dir, from, .. } => match dir {
                 // A horizontal book moves its text leftwards for the next
                 // page; a vertical one, right to left, moves it rightwards.
+                Direction::Left | Direction::Right if self.disable_touch_turn => {}
                 Direction::Left if self.vertical => out.push(Intent::Turn {
                     dir: Turn::Back,
                     at_us,
@@ -223,7 +254,9 @@ impl TurnGestures {
                     dir: Turn::Back,
                     at_us,
                 }),
-                Direction::Down if self.zone(from) == Zone::Menu => out.push(Intent::OpenMenu),
+                Direction::Down if self.zone(from) == Some(Zone::Menu) => {
+                    out.push(Intent::OpenMenu)
+                }
                 _ => {}
             },
         }
@@ -453,5 +486,27 @@ mod tests {
         // Elsewhere in the menu strip: the menu.
         g.feed(ev(Phase::Down, 300, 60, 2000));
         assert_eq!(g.feed(ev(Phase::Up, 300, 60, 2080)), vec![Intent::OpenMenu]);
+    }
+
+    #[test]
+    fn footnote_button_is_adjacent_to_bookmark_without_overlap() {
+        let screen = Rect::screen();
+        let bm = bookmark_corner(screen);
+        let btn = footnote_button(screen);
+        assert!(btn.intersect(&bm).is_none(), "btn={btn:?} bm={bm:?}");
+        assert_eq!(btn.right(), bm.x);
+        assert_eq!(btn.y, screen.y);
+        assert_eq!(btn.h, bm.h);
+
+        let mut g = TurnGestures::new(screen);
+        // Without footnotes, tapping the button area opens the menu.
+        let c = btn.center();
+        g.feed(ev(Phase::Down, c.x, c.y, 0));
+        assert_eq!(g.feed(ev(Phase::Up, c.x, c.y, 80)), vec![Intent::OpenMenu]);
+
+        // With footnotes registered as a quiet zone, tapping it emits Tap.
+        g.set_quiet(vec![btn]);
+        g.feed(ev(Phase::Down, c.x, c.y, 1000));
+        assert_eq!(g.feed(ev(Phase::Up, c.x, c.y, 1080)), vec![Intent::Tap(c)]);
     }
 }

@@ -13,7 +13,7 @@
 use crate::geom::{Insets, Size};
 use crate::icons::Icon;
 use crate::theme::{home_margin, Styles, CARD, INK, INK_MID, RULE};
-use crate::tree::{ActionId, Cross, Kind, Node, NodeId, Tree};
+use crate::tree::{ActionId, Cross, Feedback, Kind, Node, NodeId, Tree};
 use aristotle_i18n::{tr, Msg};
 
 /// The sections of the app, in the order the bar shows them.
@@ -113,8 +113,14 @@ pub fn build(t: &mut Tree, s: &Styles, current: Tab) -> NavBar {
             Node::column(GAP).cross(Cross::Center).flex(1),
             [icon, capsule],
         );
-        // The cells share the width of the bar, one third each.
-        let cell = t.button(Node::plain().flex(1), cell, action::TAB + i as ActionId);
+        // The cells share the width of the bar, one third each. Skip A2 press
+        // feedback so tapping a tab goes straight into the non-flashing screen
+        // switch instead of stalling on a 144 ms invert + wait_idle.
+        let cell = t.button(
+            Node::plain().flex(1).feedback(Feedback::None),
+            cell,
+            action::TAB + i as ActionId,
+        );
         cells.push(cell);
         row.push(cell);
     }

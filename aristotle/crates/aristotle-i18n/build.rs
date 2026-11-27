@@ -423,8 +423,8 @@ fn main() {
         writeln!(w, "    /// {k}: {s:?}\n    {},", variant(k)).unwrap();
     }
     writeln!(w, "}}").unwrap();
-    writeln!(w, "const MSG_KEYS: [&str; {}] = {:?};", texts.len(), texts).unwrap();
-    writeln!(w, "const MSG_PLACEHOLDERS: [&[&str]; {}] = [", texts.len()).unwrap();
+    writeln!(w, "static MSG_KEYS: [&str; {}] = {:?};", texts.len(), texts).unwrap();
+    writeln!(w, "static MSG_PLACEHOLDERS: [&[&str]; {}] = [", texts.len()).unwrap();
     for k in &texts {
         let Message::Text(s) = &locales[0].messages[*k] else {
             unreachable!()

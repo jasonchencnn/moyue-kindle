@@ -49,6 +49,10 @@ pub struct Metadata {
     /// listed but the reader will not open them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub drm: bool,
+    /// Right-to-left reading direction declared by comic metadata
+    /// (`ComicInfo.xml` `<Manga>`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manga_rtl: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

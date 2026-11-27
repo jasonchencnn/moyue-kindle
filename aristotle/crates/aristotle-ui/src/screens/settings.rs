@@ -59,6 +59,42 @@ pub mod action {
     pub const REFRESH_INTERVAL: ActionId = 122;
     pub const ACCOUNT: ActionId = 123;
     pub const WIFI_TRANSFER: ActionId = 124;
+    /// Toggle page-turn waveform between clear (`GLKW16`) and fast (`DU4`).
+    /// Open the reader top/bottom bars customization screen.
+    pub const READER_BARS: ActionId = 140;
+    /// Open Wi-Fi & airplane mode management screen.
+    pub const WIFI_SETTINGS: ActionId = 141;
+    /// Open Bluetooth page-turner management screen.
+    pub const BLUETOOTH_SETTINGS: ActionId = 154;
+    pub const TTS_SETTINGS: ActionId = 156;
+    /// Toggle frontlight dimming during flashing refreshes in night mode.
+    pub const NIGHT_DIM_REFRESH: ActionId = 159;
+    /// Open time & timezone settings screen.
+    pub const TIME_SETTINGS: ActionId = 142;
+    /// Open hardware keys & touch zones settings screen.
+    pub const KEY_SETTINGS: ActionId = 143;
+    /// Decrease warm frontlight by 1 step.
+    pub const WARMTH_DOWN: ActionId = 144;
+    /// Increase warm frontlight by 1 step.
+    pub const WARMTH_UP: ActionId = 145;
+    /// Toggle ambient-light auto-brightness.
+    pub const AUTO_BRIGHTNESS: ActionId = 146;
+    /// Cycle screen orientation.
+    pub const ORIENTATION: ActionId = 147;
+    /// Toggle turning Wi-Fi off on sleep.
+    pub const SLEEP_WIFI_OFF: ActionId = 148;
+    /// Clear crengine/cover layout cache.
+    pub const CLEAR_CACHE: ActionId = 149;
+    /// Request device restart (two-tap confirmation).
+    pub const REBOOT: ActionId = 150;
+    /// Cycle default dictionary.
+    pub const DICTIONARY: ActionId = 151;
+    /// Configure or clear app PIN lock.
+    pub const APP_PIN: ActionId = 152;
+    /// Toggle showing battery percentage in the global status bar.
+    pub const SHOW_BATTERY_PCT: ActionId = 153;
+    /// Open the designated font folder picker.
+    pub const FONT_FOLDER: ActionId = 155;
     pub const WEREAD_READTIME: ActionId = 130;
     pub const WEREAD_READTIME_RESUME: ActionId = 131;
     pub const WEREAD_NOTES_CLEAR: ActionId = 132;
@@ -81,10 +117,11 @@ pub const LIGHT_PRESETS: [(Msg, u32); 4] = [
 pub const SLEEP_MINUTES: [Option<u32>; 5] = [Some(5), Some(10), Some(15), Some(30), None];
 
 /// Full refresh interval options.
-pub const REFRESH_OPTIONS: [Msg; 3] = [
+pub const REFRESH_OPTIONS: [Msg; 4] = [
     Msg::SettingsRefreshPage,
     Msg::SettingsRefresh10,
     Msg::SettingsRefresh30,
+    Msg::SettingsRefreshNever,
 ];
 
 /// Clock style options.
@@ -119,6 +156,46 @@ pub struct BatteryInfo<'a> {
     pub state: &'a str,
     pub voltage_mv: u32,
     pub temperature_c: i32,
+}
+
+/// Extensible settings view fields for reader bars, Wi-Fi, time/timezone,
+/// hardware keys, warmth/rotation, and device management.
+#[derive(Clone, Default)]
+pub struct SettingsExtra<'a> {
+    /// Summary label for the reader header/footer preset (e.g. "完整" / "沉浸").
+    pub reader_bars: Option<&'a str>,
+    /// Summary label for Wi-Fi connection (SSID / Not connected / Airplane).
+    pub wifi_settings: Option<&'a str>,
+    /// Summary label for Bluetooth page turner (device name / On / Off).
+    pub bluetooth_settings: Option<&'a str>,
+    /// Summary label for Bluetooth AI audiobook (TTS) settings.
+    pub tts_settings: Option<&'a str>,
+    /// Summary label for Time & Timezone.
+    pub time_settings: Option<&'a str>,
+    /// Summary label for Buttons & Touch zones.
+    pub key_settings: Option<&'a str>,
+    /// Warm frontlight `(step, max)` on dual-tone hardware; `None` hides the card.
+    pub warmth: Option<(u32, u32)>,
+    /// Auto-brightness toggle on ALS hardware; `None` hides the card.
+    pub auto_brightness: Option<bool>,
+    /// Current screen orientation label.
+    pub orientation: Option<&'a str>,
+    /// Turn off Wi-Fi on sleep toggle.
+    pub sleep_wifi_off: Option<bool>,
+    /// Cache cleanup summary / status label.
+    pub clear_cache: Option<&'a str>,
+    /// Device restart label (changes to confirmation prompt on first tap).
+    pub reboot_label: Option<&'a str>,
+    /// Default dictionary name.
+    pub dictionary: Option<&'a str>,
+    /// App PIN status ("Off" / "Enabled").
+    pub pin_status: Option<&'a str>,
+    /// Show battery percentage in status bar toggle.
+    pub show_battery_pct: Option<bool>,
+    /// Current designated font folder path.
+    pub font_folder: Option<&'a str>,
+    /// Dim frontlight during flashing full refreshes in night mode.
+    pub night_dim_refresh: Option<bool>,
 }
 
 /// Everything the settings screen shows.
@@ -162,6 +239,8 @@ pub struct SystemView<'a> {
     /// Cached cloud notes: books, highlights and thoughts; `None` when the
     /// cache is empty and there is nothing to clear.
     pub weread_notes: Option<(u32, u32, u32)>,
+    /// Additional settings sections (reader bars, Wi-Fi, time/tz, hardware, power).
+    pub extra: SettingsExtra<'a>,
 }
 
 /// Handles to the nodes the app updates in place.
@@ -545,12 +624,68 @@ impl Settings {
         }
         let screen_top_block = t.add(Node::column(0), screen_top);
 
-        let screen_rest_items = vec![
+        let mut screen_rest_items = vec![
             toggle_card(&mut t, s, tr(Msg::SettingsNight), v.night, action::NIGHT),
             t.gap(0, 12),
             covers_card(&mut t, s, v.covers),
-            t.gap(0, 28),
         ];
+        if let Some((w_step, w_max)) = v.extra.warmth {
+            screen_rest_items.push(t.gap(0, 12));
+            let w_val = format!("{w_step} / {w_max}");
+            let lbl = t.label(tr(Msg::DeviceSettingsHwWarmth), s.font_sm());
+            let left = t.add(Node::column(0).flex(1), [lbl]);
+            let val = t.label(&w_val, s.font_xs().gray(INK_MID));
+            let minus_lb = t.label("−", s.font_base().bold());
+            let minus_c = t.align(0.5, 0.5, minus_lb);
+            let minus = t.add(
+                Node::new(Kind::Fixed {
+                    w: Some(64),
+                    h: Some(56),
+                })
+                .bg(PAPER)
+                .border(2, INK, 14)
+                .action(action::WARMTH_DOWN)
+                .feedback(Feedback::Invert),
+                [minus_c],
+            );
+            let plus_lb = t.label("+", s.font_base().bold());
+            let plus_c = t.align(0.5, 0.5, plus_lb);
+            let plus = t.add(
+                Node::new(Kind::Fixed {
+                    w: Some(64),
+                    h: Some(56),
+                })
+                .bg(PAPER)
+                .border(2, INK, 14)
+                .action(action::WARMTH_UP)
+                .feedback(Feedback::Invert),
+                [plus_c],
+            );
+            let right = t.add(Node::row(12).cross(Cross::Center), [val, minus, plus]);
+            let row = t.add(Node::row(0).cross(Cross::Center), [left, right]);
+            screen_rest_items.push(single_card(&mut t, row, None, Feedback::None));
+        }
+        if let Some(als_on) = v.extra.auto_brightness {
+            screen_rest_items.push(t.gap(0, 12));
+            screen_rest_items.push(toggle_card(
+                &mut t,
+                s,
+                tr(Msg::DeviceSettingsHwAutoLight),
+                als_on,
+                action::AUTO_BRIGHTNESS,
+            ));
+        }
+        if let Some(orient) = v.extra.orientation {
+            screen_rest_items.push(t.gap(0, 12));
+            screen_rest_items.push(value_card(
+                &mut t,
+                s,
+                tr(Msg::DeviceSettingsHwOrientation),
+                orient,
+                action::ORIENTATION,
+            ));
+        }
+        screen_rest_items.push(t.gap(0, 28));
         let screen_rest_block = t.add(Node::column(0), screen_rest_items);
 
         let clock_style_idx = v.clock_style.min(CLOCK_STYLES.len() - 1);
@@ -621,6 +756,46 @@ impl Settings {
             tr(REFRESH_OPTIONS[refresh_idx]),
             action::REFRESH_INTERVAL,
         ));
+        if let Some(night_dim) = v.extra.night_dim_refresh {
+            reading_items.push(t.gap(0, 12));
+            reading_items.push(toggle_card(
+                &mut t,
+                s,
+                tr(Msg::SettingsNightDimRefresh),
+                night_dim,
+                action::NIGHT_DIM_REFRESH,
+            ));
+        }
+        if let Some(bars_label) = v.extra.reader_bars {
+            reading_items.push(t.gap(0, 12));
+            reading_items.push(value_card(
+                &mut t,
+                s,
+                tr(Msg::BarsTitle),
+                bars_label,
+                action::READER_BARS,
+            ));
+        }
+        if let Some(keys_label) = v.extra.key_settings {
+            reading_items.push(t.gap(0, 12));
+            reading_items.push(value_card(
+                &mut t,
+                s,
+                tr(Msg::DeviceSettingsKeysTitle),
+                keys_label,
+                action::KEY_SETTINGS,
+            ));
+        }
+        if let Some(dict_label) = v.extra.dictionary {
+            reading_items.push(t.gap(0, 12));
+            reading_items.push(value_card(
+                &mut t,
+                s,
+                tr(Msg::DeviceSettingsDevDictTitle),
+                dict_label,
+                action::DICTIONARY,
+            ));
+        }
         reading_items.push(t.gap(0, 28));
         let reading_block = t.add(Node::column(0), reading_items);
 
@@ -648,6 +823,16 @@ impl Settings {
             action::SLEEP_SCREEN,
             sleep_screen_idx == SLEEP_SCREEN_OPTIONS.len() - 1,
         ));
+        if let Some(wifi_sleep) = v.extra.sleep_wifi_off {
+            power_items.push(t.gap(0, 12));
+            power_items.push(toggle_card(
+                &mut t,
+                s,
+                tr(Msg::DeviceSettingsDevSleepWifiOff),
+                wifi_sleep,
+                action::SLEEP_WIFI_OFF,
+            ));
+        }
         power_items.push(t.gap(0, 28));
         let power_block = t.add(Node::column(0), power_items);
 
@@ -659,12 +844,44 @@ impl Settings {
             Some(_) => tr(Msg::SettingsSyncKosyncOn).to_string(),
             None => tr(Msg::SettingsSyncKosyncOff).to_string(),
         };
-        let network_top_items = vec![
+        let mut network_top_items = vec![
             t.label(
                 tr(Msg::SettingsSectionNetworkSync),
                 s.font_sm().bold().line_height(1.2),
             ),
             t.gap(0, 12),
+        ];
+        if let Some(wifi_lbl) = v.extra.wifi_settings {
+            network_top_items.push(value_card(
+                &mut t,
+                s,
+                tr(Msg::DeviceSettingsWifiTitle),
+                wifi_lbl,
+                action::WIFI_SETTINGS,
+            ));
+            network_top_items.push(t.gap(0, 12));
+        }
+        if let Some(bt_lbl) = v.extra.bluetooth_settings {
+            network_top_items.push(value_card(
+                &mut t,
+                s,
+                tr(Msg::DeviceSettingsBtTitle),
+                bt_lbl,
+                action::BLUETOOTH_SETTINGS,
+            ));
+            network_top_items.push(t.gap(0, 12));
+        }
+        if let Some(tts_lbl) = v.extra.tts_settings {
+            network_top_items.push(value_card(
+                &mut t,
+                s,
+                "听书设置",
+                tts_lbl,
+                action::TTS_SETTINGS,
+            ));
+            network_top_items.push(t.gap(0, 12));
+        }
+        network_top_items.extend([
             value_card(
                 &mut t,
                 s,
@@ -681,7 +898,7 @@ impl Settings {
                 action::SYNC,
             ),
             t.gap(0, 12),
-        ];
+        ]);
         let network_top_block = t.add(Node::column(0), network_top_items);
 
         let cat_str = trn(Plural::SettingsCatalogsNum, v.catalogs);
@@ -769,6 +986,66 @@ impl Settings {
                 tr(Msg::SettingsBattery),
                 &bat_str,
                 action::BATTERY,
+            ));
+        }
+        if let Some(time_lbl) = v.extra.time_settings {
+            device_rest_items.push(t.gap(0, 12));
+            device_rest_items.push(value_card(
+                &mut t,
+                s,
+                tr(Msg::DeviceSettingsTimeTitle),
+                time_lbl,
+                action::TIME_SETTINGS,
+            ));
+        }
+        if let Some(show_pct) = v.extra.show_battery_pct {
+            device_rest_items.push(t.gap(0, 12));
+            device_rest_items.push(toggle_card(
+                &mut t,
+                s,
+                tr(Msg::DeviceSettingsDevShowBatteryPct),
+                show_pct,
+                action::SHOW_BATTERY_PCT,
+            ));
+        }
+        if let Some(pin_lbl) = v.extra.pin_status {
+            device_rest_items.push(t.gap(0, 12));
+            device_rest_items.push(value_card(
+                &mut t,
+                s,
+                tr(Msg::DeviceSettingsDevPinTitle),
+                pin_lbl,
+                action::APP_PIN,
+            ));
+        }
+        if let Some(font_dir) = v.extra.font_folder {
+            device_rest_items.push(t.gap(0, 12));
+            device_rest_items.push(value_card(
+                &mut t,
+                s,
+                tr(Msg::LibraryScanFontDestinationLabel),
+                font_dir,
+                action::FONT_FOLDER,
+            ));
+        }
+        if let Some(cache_lbl) = v.extra.clear_cache {
+            device_rest_items.push(t.gap(0, 12));
+            device_rest_items.push(value_card(
+                &mut t,
+                s,
+                tr(Msg::DeviceSettingsDevClearCache),
+                cache_lbl,
+                action::CLEAR_CACHE,
+            ));
+        }
+        if let Some(reboot_lbl) = v.extra.reboot_label {
+            device_rest_items.push(t.gap(0, 12));
+            device_rest_items.push(value_card(
+                &mut t,
+                s,
+                tr(Msg::DeviceSettingsDevReboot),
+                reboot_lbl,
+                action::REBOOT,
             ));
         }
         device_rest_items.push(t.gap(0, 20));
@@ -1032,6 +1309,7 @@ mod tests {
             weread_readtime: false,
             weread_readtime_note: Some(("Off — nothing is uploaded", false)),
             weread_notes: Some((2, 12, 4)),
+            extra: SettingsExtra::default(),
         }
     }
 
@@ -1236,6 +1514,55 @@ mod tests {
                     .any(|i| ui.tree.node(NodeId(i as u32)).action == Some(action::USB)),
                 "page {page}: USB row must be hidden"
             );
+        }
+    }
+
+    #[test]
+    fn landscape_settings_keeps_orientation_pin_battery_and_font_folder_reachable() {
+        let mut v = view();
+        v.extra.orientation = Some("横屏（左旋）");
+        v.extra.show_battery_pct = Some(true);
+        v.extra.pin_status = Some("未开启");
+        v.extra.font_folder = Some("/mnt/us/koreader/fonts");
+        v.extra.clear_cache = Some("");
+
+        for (w, h) in [(1680u32, 1264u32), (1448, 1072)] {
+            let mut text = TextEngine::new(Fonts::embedded());
+            let (tree, ids) = Settings::build(&mut text, &Styles::new(FamilyId(0)), &v);
+            let mut ui = Ui::new(tree, text, w, h);
+            ui.render();
+            let bounds = ui.bounds();
+            let page_count = ui.tree.page(ids.list).1;
+            assert!(page_count >= 1);
+
+            for required in [
+                action::ORIENTATION,
+                action::SHOW_BATTERY_PCT,
+                action::APP_PIN,
+                action::FONT_FOLDER,
+            ] {
+                let mut found = false;
+                for page in 0..page_count {
+                    if let Some(node) = find_on_page(&mut ui, &ids, page, required) {
+                        let r = ui.tree.rect(node);
+                        assert!(
+                            r.w > 100
+                                && r.h >= 48
+                                && r.x >= 0
+                                && r.y >= 0
+                                && r.right() <= bounds.right()
+                                && r.bottom() <= bounds.bottom(),
+                            "{w}x{h} page {page} action {required} bad rect: {r:?} vs {bounds:?}"
+                        );
+                        found = true;
+                        break;
+                    }
+                }
+                assert!(
+                    found,
+                    "{w}x{h}: required settings action {required} not reachable on any page"
+                );
+            }
         }
     }
 }

@@ -787,7 +787,7 @@ impl App {
             if !self.weread.web.signed_in() {
                 return self.start_weread_web_login();
             }
-            self.show_weread_shelf(Refresh::Full, 0)?;
+            self.show_weread_shelf(Refresh::Clean, 0)?;
             if !self.weread.loading {
                 self.refresh_weread_shelf();
             }
@@ -898,7 +898,7 @@ impl App {
             return self.start_weread_web_login();
         }
         if matches!(self.screen, Screen::WereadLogin) {
-            self.show_weread_shelf(Refresh::Full, 0)?;
+            self.show_weread_shelf(Refresh::Clean, 0)?;
         }
         self.refresh_weread_shelf();
         if matches!(self.screen, Screen::WereadShelf(_)) {
@@ -1097,8 +1097,9 @@ impl App {
         self.weread.save();
         if matches!(self.screen, Screen::WereadShelf(_)) {
             let page = self.list_page();
-            // A new list is a full GC16 refresh: the cards change together.
-            self.show_weread_shelf(Refresh::Full, page)?;
+            // A new list uses a non-flashing GLKW16 refresh; GhostBudget
+            // triggers periodic GC16 cleanup when needed.
+            self.show_weread_shelf(Refresh::Clean, page)?;
         }
         Ok(())
     }
@@ -1115,9 +1116,9 @@ impl App {
             ui_login::action::BACK => {
                 self.weread.cancel_login();
                 if self.weread.signed_in {
-                    self.show_weread_shelf(Refresh::Full, 0)?;
+                    self.show_weread_shelf(Refresh::Clean, 0)?;
                 } else {
-                    self.show_library(Refresh::Full)?;
+                    self.show_library(Refresh::Clean)?;
                 }
             }
             ui_login::action::REFRESH => {
@@ -1169,7 +1170,7 @@ impl App {
                 a::LOCAL => {
                     self.weread.cancel_login();
                     self.weread.downloads.cancel_all();
-                    self.show_library(Refresh::Full)?;
+                    self.show_library(Refresh::Clean)?;
                 }
                 a::CLOUD => {
                     self.weread.cancel_login();
@@ -1184,25 +1185,25 @@ impl App {
                 a::LOGIN => {
                     self.weread.cancel_login();
                     self.weread.downloads.cancel_all();
-                    self.start_weread_login(Refresh::Full)?;
+                    self.start_weread_login(Refresh::Clean)?;
                 }
                 a::LOGOUT => {
                     self.weread.forget_credentials();
                     self.weread.web.forget_credentials(&self.net.paths.state);
                     self.weread.message = None;
-                    self.start_weread_login(Refresh::Full)?;
+                    self.start_weread_login(Refresh::Clean)?;
                 }
                 a::SYNC => {
                     let page = self.list_page();
                     self.refresh_weread_shelf();
-                    self.show_weread_shelf(Refresh::Full, page)?;
+                    self.show_weread_shelf(Refresh::Clean, page)?;
                 }
                 id if (a::FILTER..a::FILTER + ui_shelf::WereadFilter::ALL.len() as u32)
                     .contains(&id) =>
                 {
                     let index = (id - a::FILTER) as usize;
                     self.weread.filter = ui_shelf::WereadFilter::ALL[index];
-                    self.show_weread_shelf(Refresh::Full, 0)?;
+                    self.show_weread_shelf(Refresh::Clean, 0)?;
                 }
                 _ => {
                     let mut handled = false;

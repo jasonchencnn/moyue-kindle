@@ -12,8 +12,11 @@
 #
 #   tree    Lays out DIR (which must not exist yet) as the root of the drive:
 #             DIR/aristotle/             the app bundle of tools/build-render.sh
-#                                        device (APP_BUNDLE), with licenses/
-#                                        and SOURCE.txt; left out if not built
+#                                        device (APP_BUNDLE), with licenses/,
+#                                        SOURCE.txt and moyue-icon.png; left out
+#                                        if not built
+#             DIR/documents/墨阅.sh      SH Integration library entry with cover
+#                                        icon (no KUAL needed)
 #             DIR/extensions/aristotle/  the KUAL extension (device/extension/
 #                                        and takeover.sh)
 #   zip     The same tree as one zip that users unpack to the root of the
@@ -67,9 +70,10 @@ lay_out() {
     else
         echo "app: not built ($APP_BUNDLE), left out"
     fi
-    mkdir -p "$1/extensions/aristotle"
+    mkdir -p "$1/extensions/aristotle" "$1/documents"
     cp -R "$REPO/device/extension/." "$1/extensions/aristotle/"
     cp "$REPO/device/app/takeover.sh" "$REPO/device/app/open-kual.sh" "$1/extensions/aristotle/"
+    cp "$REPO/device/app/moyue-entry.sh" "$1/documents/墨阅.sh"
     find "$1" -type f -name '*.sh' -exec chmod 755 {} +
     # The updater compares the app and extension versions before it swaps
     # anything.  Keep the one version in Cargo.toml and the extension in step.
@@ -80,6 +84,8 @@ lay_out() {
         exit 1
     }
     if [ -d "$1/aristotle" ]; then
+        cp "$REPO/device/app/moyue-icon.png" "$1/aristotle/moyue-icon.png"
+        chmod 644 "$1/aristotle/moyue-icon.png"
         printf '%s\n' "$VERSION" > "$1/aristotle/VERSION"
     fi
 }

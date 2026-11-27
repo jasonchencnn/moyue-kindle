@@ -84,6 +84,7 @@ struct CrLayout {
     line_spacing_percent: c_int,
     css: *const c_char,
     embedded_styles: c_int,
+    embedded_fonts: c_int,
     fallback_font_faces: *const c_char,
     fine_typesetting: c_int,
     font_weight: c_int,
@@ -145,6 +146,7 @@ impl CrLayoutArgs {
             line_spacing_percent: self.settings.line_spacing_percent as c_int,
             css: self.css.as_ptr(),
             embedded_styles: c_int::from(self.settings.embedded_styles),
+            embedded_fonts: c_int::from(self.settings.embedded_fonts),
             fallback_font_faces: self
                 .fallback_faces
                 .as_ref()

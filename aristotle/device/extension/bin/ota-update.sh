@@ -19,6 +19,18 @@ umask 022
 HERE=$(cd "$(dirname "$0")" && pwd)
 EXT=${ARISTOTLE_EXT_DIR:-$(dirname "$HERE")}
 R=${AGENT_TEST_ROOT:-}
+cd "${R:-/}" 2> /dev/null || cd /
+# Pivot to a tmpfs copy so $EXT has no open script descriptor while we rename
+# $EXT on Kindle's FUSE/vfat userstore (applies to KUAL `install` as well).
+SELF_TMP=${MOYUE_OTA_SELF_TMP:-}
+if [ "${MOYUE_OTA_PIVOTED:-0}" != 1 ] && [ -f "$0" ]; then
+    _pivot_dir="$R/var/tmp/moyue-ota-self.$$"
+    if mkdir -p "$_pivot_dir" 2> /dev/null && cp "$0" "$_pivot_dir/ota-update.sh" 2> /dev/null; then
+        exec env ARISTOTLE_EXT_DIR="$EXT" MOYUE_OTA_PIVOTED=1 MOYUE_OTA_SELF_TMP="$_pivot_dir" \
+            sh "$_pivot_dir/ota-update.sh" "$@"
+    fi
+    rm -rf "$_pivot_dir" 2> /dev/null || true
+fi
 APP=${ARISTOTLE_APP_DIR:-$R/mnt/us/aristotle}
 OTA=${MOYUE_OTA_DIR:-$R/mnt/us/.aristotle/ota}
 LOG=$R/mnt/us/.aristotle/ota.log
@@ -49,6 +61,7 @@ ascii_status() {
     已是最新版本*) echo "Moyue OTA: already up to date" ;;
     已安装的*) echo "Moyue OTA: server is older; no downgrade" ;;
     发现*) echo "Moyue OTA: update found; downloading" ;;
+    正在校验本地更新包*) echo "Moyue OTA: verifying handed-over package" ;;
     校验通过*) echo "Moyue OTA: SHA-256 OK; unpacking" ;;
     正在停止墨阅*) echo "Moyue OTA: stopping Moyue" ;;
     更新完成*) echo "Moyue OTA: update complete; tap Start Moyue" ;;
@@ -86,6 +99,7 @@ fail() {
 
 cleanup() {
     [ -z "$TMP" ] || rm -rf "$TMP"
+    [ -z "$SELF_TMP" ] || rm -rf "$SELF_TMP"
     [ "$LOCK_HELD" = 1 ] && rmdir "$LOCK" 2> /dev/null || true
 }
 trap cleanup EXIT
@@ -311,6 +325,65 @@ parse_manifest() {
     case "$m_source" in *' '*) fail "源码地址无效" ;; esac
 }
 
+# parse_handover FILE: parse the handover.conf written by the in-app OTA
+# downloader (crates/aristotle/src/ota.rs).  All 7 fields must appear once,
+# with no unknown keys, no blank lines and no trailing carriage returns.
+parse_handover() {
+    _file=$1
+    _bytes=$(wc -c < "$_file" | tr -d " ") || fail "无法读取更新交接文件"
+    [ "$_bytes" -le "$MAX_MANIFEST" ] || fail "更新交接文件过大"
+    unset m_version m_device m_channel m_firmware m_package m_sha256 m_size
+    while IFS= read -r _line; do
+        case "$_line" in
+        *"$(printf '\r')"*) fail "交接文件格式错误" ;;
+        ' '*) fail "交接文件格式错误" ;;
+        esac
+        [ -n "$_line" ] || fail "交接文件有空行"
+        case "$_line" in *=*) ;; *) fail "交接文件字段格式错误" ;; esac
+        _key=${_line%%=*}
+        _value=${_line#*=}
+        [ -n "$_key" ] && [ -n "$_value" ] || fail "交接文件字段为空"
+        case "$_key" in *[!a-z0-9-]*) fail "交接文件字段名错误" ;; esac
+        case "$_value" in *[!A-Za-z0-9._:/@%+,=\&?-]*) fail "交接文件字段值错误" ;; esac
+        case "$_key" in
+        version) [ -z "${m_version+x}" ] || fail "交接文件字段重复"; m_version=$_value ;;
+        device) [ -z "${m_device+x}" ] || fail "交接文件字段重复"; m_device=$_value ;;
+        channel) [ -z "${m_channel+x}" ] || fail "交接文件字段重复"; m_channel=$_value ;;
+        firmware) [ -z "${m_firmware+x}" ] || fail "交接文件字段重复"; m_firmware=$_value ;;
+        package) [ -z "${m_package+x}" ] || fail "交接文件字段重复"; m_package=$_value ;;
+        sha256) [ -z "${m_sha256+x}" ] || fail "交接文件字段重复"; m_sha256=$_value ;;
+        size) [ -z "${m_size+x}" ] || fail "交接文件字段重复"; m_size=$_value ;;
+        *) fail "交接文件有未知字段：$_key" ;;
+        esac
+    done < "$_file"
+    [ -n "${m_version:-}" ] || fail "交接文件缺少 version"
+    [ -n "${m_device:-}" ] || fail "交接文件缺少 device"
+    [ -n "${m_channel:-}" ] || fail "交接文件缺少 channel"
+    [ -n "${m_firmware:-}" ] || fail "交接文件缺少 firmware"
+    [ -n "${m_package:-}" ] || fail "交接文件缺少 package"
+    [ -n "${m_sha256:-}" ] || fail "交接文件缺少 sha256"
+    [ -n "${m_size:-}" ] || fail "交接文件缺少 size"
+
+    case "$m_channel" in
+    '' | *[!A-Za-z0-9.-]*) fail "交接通道名无效" ;;
+    esac
+    valid_version "$m_version" || fail "交接版本号无效"
+    case "$m_sha256" in *[!0-9a-f]* | '') fail "交接 SHA-256 无效" ;; esac
+    [ ${#m_sha256} -eq 64 ] || fail "交接 SHA-256 无效"
+    case "$m_size" in '' | *[!0-9]*) fail "交接包大小无效" ;; esac
+    [ "$m_size" -gt 0 ] && [ "$m_size" -le "$MAX_PACKAGE" ] || fail "交接包大小超出范围"
+    _ota_norm=${OTA%/}
+    case "$m_package" in
+    "$_ota_norm"/*) ;;
+    *) fail "交接更新包路径不在更新目录内" ;;
+    esac
+    _rel=${m_package#"$_ota_norm"/}
+    [ -n "$_rel" ] || fail "交接更新包路径无效"
+    case "/$_rel/" in
+    *"/../"* | *"/./"* | *"//"*) fail "交接更新包路径包含路径穿越" ;;
+    esac
+}
+
 # validate_name NAME: only the two trees of a package, no traversal and no
 # absolute paths.
 validate_name() {
@@ -416,9 +489,8 @@ EOF
 }
 
 case "${1:-}" in
-install | check) ;;
-recover) ;;
-*) fail "用法：ota-update.sh install" ;;
+install | check | handover | recover) ;;
+*) fail "用法：ota-update.sh install | handover | recover" ;;
 esac
 
 # One update at a time.  The lock is on the tmpfs, so a reboot clears an
@@ -426,6 +498,9 @@ esac
 case "$APP" in '' | / | */.. | */../*) fail "应用目录配置无效" ;; esac
 case "$EXT" in '' | / | */.. | */../*) fail "扩展目录配置无效" ;; esac
 [ "$APP" != "$EXT" ] || fail "应用与扩展目录相同"
+case "${OTA%/}/" in
+"${APP%/}"/* | "${EXT%/}"/*) fail "更新目录不能在应用或扩展目录内" ;;
+esac
 mkdir -p "$R/var/tmp" 2> /dev/null || true
 mkdir "$LOCK" 2> /dev/null || fail "另一个更新正在进行"
 LOCK_HELD=1
@@ -451,8 +526,6 @@ if [ "$installed" = "invalid" ]; then
     fail "已安装版本格式无效，请先用 USB 重新安装"
 fi
 
-say "正在检查更新..."
-command -v curl > /dev/null 2>&1 || fail "缺少 curl，无法联网更新"
 [ -f "$EXT/guard.sh" ] && [ ! -L "$EXT/guard.sh" ] \
     || fail "缺少设备守卫 guard.sh，请重新安装墨阅"
 . "$EXT/guard.sh"
@@ -460,88 +533,123 @@ _code=$(device_code)
 [ -n "$_code" ] || fail "无法从序列号读取设备型号"
 _fw=$(firmware_version)
 [ -n "$_fw" ] || fail "无法读取固件版本"
-proto='=https'
-[ "$TEST_HTTP" = 1 ] && [ -n "$R" ] && proto='=http,https'
 
-# fetch_manifest: try the channels this device could have, most specific
-# first.  A manifest for an exact firmware wins; shorter firmware prefixes
-# cover the entries that publish a firmware range (the PW4 5.13 one).  A 404
-# moves to the next candidate, any other failure is a real error.
-# Returns 0 with CHANNEL/ALLOWED_PREFIX set, 2 when no channel exists.
-fetch_manifest() {
-    _cand=$_fw
-    while :; do
-        _ch="$_code-$_cand"
-        _url=${MOYUE_OTA_MANIFEST_URL:-$OTA_BASE/$_ch/manifest.txt}
-        _prefix=${MOYUE_OTA_ALLOWED_PREFIX:-$OTA_BASE/$_ch/}
+if [ "${1:-}" = handover ]; then
+    HANDOVER=$OTA/handover.conf
+    [ -f "$HANDOVER" ] && [ ! -L "$HANDOVER" ] || fail "未找到更新交接文件"
+    mv "$HANDOVER" "$TMP/handover.conf" || fail "无法读取更新交接文件"
+    parse_handover "$TMP/handover.conf"
+
+    [ "$m_device" = "$_code" ] \
+        || fail "此更新不是给设备 ${_code} 的（清单设备：${m_device}）"
+    case "$m_channel" in
+    "$_code"-*) ;;
+    *) fail "交接通道与设备不符（通道：${m_channel}）" ;;
+    esac
+    case "$_fw" in
+    "$m_firmware" | "$m_firmware".*) ;;
+    *) fail "固件 $_fw 与交接要求的 $m_firmware 不符" ;;
+    esac
+
+    if ! version_gt "$m_version" "$installed"; then
+        rm -f "$m_package" 2> /dev/null || true
+        if [ "$m_version" = "$installed" ]; then
+            say "已是最新版本 $installed"
+        else
+            say "已安装的 ${installed} 比服务器上的 ${m_version} 新，不降级"
+            say2 "未改动任何文件"
+        fi
+        exit 0
+    fi
+
+    say "正在校验本地更新包..."
+    _pkg=$m_package
+else
+    say "正在检查更新..."
+    command -v curl > /dev/null 2>&1 || fail "缺少 curl，无法联网更新"
+    proto='=https'
+    [ "$TEST_HTTP" = 1 ] && [ -n "$R" ] && proto='=http,https'
+
+    # fetch_manifest: try the channels this device could have, most specific
+    # first.  A manifest for an exact firmware wins; shorter firmware prefixes
+    # cover the entries that publish a firmware range (the PW4 5.13 one).  A 404
+    # moves to the next candidate, any other failure is a real error.
+    # Returns 0 with CHANNEL/ALLOWED_PREFIX set, 2 when no channel exists.
+    fetch_manifest() {
+        _cand=$_fw
+        while :; do
+            _ch="$_code-$_cand"
+            _url=${MOYUE_OTA_MANIFEST_URL:-$OTA_BASE/$_ch/manifest.txt}
+            _prefix=${MOYUE_OTA_ALLOWED_PREFIX:-$OTA_BASE/$_ch/}
+            curl -q --fail --silent --show-error --proto "$proto" --max-redirs 0 \
+                --connect-timeout 10 --max-time 30 --max-filesize "$MAX_MANIFEST" \
+                --output "$TMP/manifest.txt" "$_url"
+            _rc=$?
+            if [ "$_rc" = 0 ]; then
+                CHANNEL=$_ch
+                MANIFEST_URL=$_url
+                ALLOWED_PREFIX=$_prefix
+                return 0
+            fi
+            # 22 is curl's --fail HTTP error: this channel does not exist.
+            [ "$_rc" = 22 ] || fail "无法下载版本清单，请检查 Wi-Fi"
+            case "$_cand" in
+            *.*) _cand=${_cand%.*} ;;
+            *) return 2 ;;
+            esac
+        done
+    }
+
+    if [ -n "${MOYUE_OTA_CHANNEL:-}" ]; then
+        # An explicit channel (tests, operators) pins this device's manifest.
+        CHANNEL=$MOYUE_OTA_CHANNEL
+        MANIFEST_URL=${MOYUE_OTA_MANIFEST_URL:-$OTA_BASE/$CHANNEL/manifest.txt}
+        ALLOWED_PREFIX=${MOYUE_OTA_ALLOWED_PREFIX:-$OTA_BASE/$CHANNEL/}
         curl -q --fail --silent --show-error --proto "$proto" --max-redirs 0 \
             --connect-timeout 10 --max-time 30 --max-filesize "$MAX_MANIFEST" \
-            --output "$TMP/manifest.txt" "$_url"
-        _rc=$?
-        if [ "$_rc" = 0 ]; then
-            CHANNEL=$_ch
-            MANIFEST_URL=$_url
-            ALLOWED_PREFIX=$_prefix
-            return 0
-        fi
-        # 22 is curl's --fail HTTP error: this channel does not exist.
-        [ "$_rc" = 22 ] || fail "无法下载版本清单，请检查 Wi-Fi"
-        case "$_cand" in
-        *.*) _cand=${_cand%.*} ;;
-        *) return 2 ;;
-        esac
-    done
-}
-
-if [ -n "${MOYUE_OTA_CHANNEL:-}" ]; then
-    # An explicit channel (tests, operators) pins this device's manifest.
-    CHANNEL=$MOYUE_OTA_CHANNEL
-    MANIFEST_URL=${MOYUE_OTA_MANIFEST_URL:-$OTA_BASE/$CHANNEL/manifest.txt}
-    ALLOWED_PREFIX=${MOYUE_OTA_ALLOWED_PREFIX:-$OTA_BASE/$CHANNEL/}
-    curl -q --fail --silent --show-error --proto "$proto" --max-redirs 0 \
-        --connect-timeout 10 --max-time 30 --max-filesize "$MAX_MANIFEST" \
-        --output "$TMP/manifest.txt" "$MANIFEST_URL" \
-        || fail "无法下载版本清单，请检查 Wi-Fi"
-else
-    fetch_manifest
-fi
-case $? in
-0) ;;
-2)
-    say "此设备暂未提供在线更新（${_code} / ${_fw}）"
-    say2 "未改动任何文件"
-    exit 0
-    ;;
-*) exit 1 ;;
-esac
-[ -f "$TMP/manifest.txt" ] && [ ! -L "$TMP/manifest.txt" ] || fail "版本清单无效"
-parse_manifest "$TMP/manifest.txt"
-
-[ "$m_device" = "$_code" ] \
-    || fail "此更新不是给设备 ${_code} 的（清单设备：${m_device}）"
-[ "$m_channel" = "$CHANNEL" ] \
-    || fail "清单通道与设备不符（清单：${m_channel}）"
-case "$_fw" in
-"$m_firmware" | "$m_firmware".*) ;;
-*) fail "固件 $_fw 与清单要求的 $m_firmware 不符" ;;
-esac
-
-if ! version_gt "$m_version" "$installed"; then
-    if [ "$m_version" = "$installed" ]; then
-        say "已是最新版本 $installed"
+            --output "$TMP/manifest.txt" "$MANIFEST_URL" \
+            || fail "无法下载版本清单，请检查 Wi-Fi"
     else
-        say "已安装的 ${installed} 比服务器上的 ${m_version} 新，不降级"
-        say2 "未改动任何文件"
+        fetch_manifest
     fi
-    exit 0
-fi
+    case $? in
+    0) ;;
+    2)
+        say "此设备暂未提供在线更新（${_code} / ${_fw}）"
+        say2 "未改动任何文件"
+        exit 0
+        ;;
+    *) exit 1 ;;
+    esac
+    [ -f "$TMP/manifest.txt" ] && [ ! -L "$TMP/manifest.txt" ] || fail "版本清单无效"
+    parse_manifest "$TMP/manifest.txt"
 
-say "发现 ${m_version}（当前 ${installed}），正在下载..."
-_pkg=$TMP/package.tar.gz
-curl -q --fail --silent --show-error --proto "$proto" --max-redirs 0 \
-    --connect-timeout 10 --max-time 300 --max-filesize "$MAX_PACKAGE" \
-    --output "$_pkg" "$m_package" \
-    || fail "下载更新包失败，请检查 Wi-Fi 后重试"
+    [ "$m_device" = "$_code" ] \
+        || fail "此更新不是给设备 ${_code} 的（清单设备：${m_device}）"
+    [ "$m_channel" = "$CHANNEL" ] \
+        || fail "清单通道与设备不符（清单：${m_channel}）"
+    case "$_fw" in
+    "$m_firmware" | "$m_firmware".*) ;;
+    *) fail "固件 $_fw 与清单要求的 $m_firmware 不符" ;;
+    esac
+
+    if ! version_gt "$m_version" "$installed"; then
+        if [ "$m_version" = "$installed" ]; then
+            say "已是最新版本 $installed"
+        else
+            say "已安装的 ${installed} 比服务器上的 ${m_version} 新，不降级"
+            say2 "未改动任何文件"
+        fi
+        exit 0
+    fi
+
+    say "发现 ${m_version}（当前 ${installed}），正在下载..."
+    _pkg=$TMP/package.tar.gz
+    curl -q --fail --silent --show-error --proto "$proto" --max-redirs 0 \
+        --connect-timeout 10 --max-time 300 --max-filesize "$MAX_PACKAGE" \
+        --output "$_pkg" "$m_package" \
+        || fail "下载更新包失败，请检查 Wi-Fi 后重试"
+fi
 [ -f "$_pkg" ] && [ ! -L "$_pkg" ] || fail "更新包无效"
 _actual=$(wc -c < "$_pkg" | tr -d " ")
 [ "$_actual" = "$m_size" ] || fail "更新包大小不符（${_actual}，应为 ${m_size}）"
@@ -559,7 +667,9 @@ check_stage "$TMP/root"
 # copies from the first integration are migrated there).
 for _f in authorized_keys; do
     if [ -f "$EXT/$_f" ] && [ ! -L "$EXT/$_f" ]; then
-        cp -p "$EXT/$_f" "$TMP/root/extensions/aristotle/$_f" || fail "无法保留 $_f"
+        cp -p "$EXT/$_f" "$TMP/root/extensions/aristotle/$_f" 2> /dev/null \
+            || cp "$EXT/$_f" "$TMP/root/extensions/aristotle/$_f" \
+            || fail "无法保留 $_f"
     fi
 done
 for _f in endpoint.txt token.txt; do
@@ -573,7 +683,9 @@ for _f in endpoint.txt token.txt; do
         _src=$R/mnt/us/extensions/moyue-diagnostics/$_f
     fi
     if [ -n "$_src" ]; then
-        cp -p "$_src" "$TMP/root/extensions/aristotle/diagnostics/$_f" || fail "无法保留 $_f"
+        cp -p "$_src" "$TMP/root/extensions/aristotle/diagnostics/$_f" 2> /dev/null \
+            || cp "$_src" "$TMP/root/extensions/aristotle/diagnostics/$_f" \
+            || fail "无法保留 $_f"
     fi
 done
 
@@ -642,6 +754,9 @@ _new=$(installed_version)
 printf 'version=%s\nphase=done\n' "$m_version" > "$OTA/journal" || true
 sync 2> /dev/null || true
 rm -rf "$OTA/backup" "$OTA/journal"
+if [ "${1:-}" = handover ]; then
+    rm -f "$_pkg" 2> /dev/null || true
+fi
 sync 2> /dev/null || true
 log "updated $installed -> $m_version"
 say "更新完成：${m_version}"

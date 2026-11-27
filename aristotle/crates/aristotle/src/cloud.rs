@@ -172,6 +172,28 @@ pub fn save_cache(path: &Path, user_id: Option<&str>, books: &[CloudBook], when:
     }
 }
 
+/// Redacted summary of a `CloudError` for stderr diagnostics: includes the
+/// error category (plus HTTP status code or brief transport class), while
+/// never logging response bodies, tokens, signed URLs, or emails.
+fn redacted_cloud_error(e: &CloudError) -> String {
+    match e {
+        CloudError::Sync(s) => format!("Sync({})", crate::readest::redacted_sync_error(s)),
+        CloudError::Transport(t) => {
+            let text = t.to_string();
+            let brief = text.split('\n').next().unwrap_or("");
+            let brief: String = brief.chars().take(80).collect();
+            format!("Transport({brief})")
+        }
+        CloudError::HttpStatus(code, _) => format!("HttpStatus({code})"),
+        CloudError::InvalidResponse(_) => "InvalidResponse".to_string(),
+        CloudError::MissingDownloadUrl => "MissingDownloadUrl".to_string(),
+        CloudError::MissingUserId => "MissingUserId".to_string(),
+        CloudError::TicketExpired => "TicketExpired".to_string(),
+        CloudError::HashMismatch { .. } => "HashMismatch".to_string(),
+        CloudError::Io(io) => format!("Io({:?})", io.kind()),
+    }
+}
+
 /// Wording for a failed list request. `has_cache` says whether the last
 /// saved list is still on screen.
 pub fn list_error_message(e: &CloudError, has_cache: bool) -> String {
@@ -327,7 +349,7 @@ use aristotle_ui::ui::UiEvent;
 impl App {
     /// Open the cloud shelf: the cached list first, then a fresh fetch.
     pub(crate) fn open_cloud(&mut self) -> Result<(), Error> {
-        self.show_cloud(Refresh::Full, 0)?;
+        self.show_cloud(Refresh::Clean, 0)?;
         if self.net.accounts.readest.is_some() && !self.cloud.loading {
             self.refresh_cloud();
             self.show_cloud(Refresh::Auto, 0)?;
@@ -521,6 +543,10 @@ impl App {
                 }
             }
             Err(e) => {
+                eprintln!(
+                    "aristotle: cloud library list failed: {}",
+                    redacted_cloud_error(&e)
+                );
                 // "Showing the last saved list" only when there is one.
                 let has_cache = !self.cloud.books.is_empty();
                 self.cloud.message = Some(list_error_message(&e, has_cache));
@@ -559,10 +585,10 @@ impl App {
             UiEvent::Action { id, node, .. } => {
                 if id == a::LOCAL {
                     self.cancel_cloud_on_leave();
-                    self.show_library(Refresh::Full)?;
+                    self.show_library(Refresh::Clean)?;
                 } else if id == a::LOGIN {
                     self.cancel_cloud_on_leave();
-                    self.show_mine(Refresh::Full)?;
+                    self.show_mine(Refresh::Clean)?;
                 } else if id == a::WEREAD {
                     self.cancel_cloud_on_leave();
                     self.open_weread()?;
@@ -1080,6 +1106,25 @@ mod tests {
         assert_eq!(
             download_error_message(&DownloadError::Cloud(CloudError::TicketExpired)),
             tr(Msg::CloudErrExpired)
+        );
+    }
+
+    #[test]
+    fn redacted_cloud_error_hides_bodies_and_preserves_kind() {
+        let http = CloudError::HttpStatus(502, "secret-token-body".into());
+        assert_eq!(redacted_cloud_error(&http), "HttpStatus(502)");
+
+        let invalid = CloudError::InvalidResponse("{\"email\":\"a@b.com\"}".into());
+        assert_eq!(redacted_cloud_error(&invalid), "InvalidResponse");
+
+        let sync_http = CloudError::Sync(inkread_core::sync::SyncError::HttpStatus(
+            500,
+            "sensitive-payload".into(),
+        ));
+        assert_eq!(redacted_cloud_error(&sync_http), "Sync(Server(HTTP 500))");
+        assert_eq!(
+            redacted_cloud_error(&CloudError::MissingUserId),
+            "MissingUserId"
         );
     }
 }

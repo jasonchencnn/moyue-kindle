@@ -147,6 +147,108 @@ impl WritingMode {
     }
 }
 
+/// How a fixed-layout page (CBZ, PDF) is scaled into the viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FitMode {
+    /// Scale proportionally so the entire page fits inside the viewport.
+    #[default]
+    FitPage,
+    /// Scale proportionally to fill the viewport width.
+    FitWidth,
+    /// Scale proportionally to fill the viewport height.
+    FitHeight,
+}
+
+impl FitMode {
+    /// Every fit mode, in the order the fixed-layout picker shows them.
+    pub const ALL: [FitMode; 3] = [FitMode::FitPage, FitMode::FitWidth, FitMode::FitHeight];
+
+    /// Turn a picker index into a fit mode; unknown indices fall back to [`FitMode::FitPage`].
+    pub fn from_index(index: usize) -> FitMode {
+        match index {
+            1 => FitMode::FitWidth,
+            2 => FitMode::FitHeight,
+            _ => FitMode::FitPage,
+        }
+    }
+
+    /// The picker's index for this mode.
+    pub fn index(self) -> usize {
+        match self {
+            FitMode::FitPage => 0,
+            FitMode::FitWidth => 1,
+            FitMode::FitHeight => 2,
+        }
+    }
+}
+
+/// Reading and page-turn direction for fixed-layout books (CBZ, PDF).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PageDirection {
+    /// Left to right (Western comics, standard PDFs).
+    #[default]
+    Ltr,
+    /// Right to left (Japanese manga: left tap / right swipe advances,
+    /// and split two-page spreads show the right half before the left half).
+    Rtl,
+}
+
+impl PageDirection {
+    /// Every direction, in the order the picker shows them.
+    pub const ALL: [PageDirection; 2] = [PageDirection::Ltr, PageDirection::Rtl];
+
+    /// Turn a picker index into a direction; unknown indices fall back to [`PageDirection::Ltr`].
+    pub fn from_index(index: usize) -> PageDirection {
+        match index {
+            1 => PageDirection::Rtl,
+            _ => PageDirection::Ltr,
+        }
+    }
+
+    /// The picker's index for this direction.
+    pub fn index(self) -> usize {
+        match self {
+            PageDirection::Ltr => 0,
+            PageDirection::Rtl => 1,
+        }
+    }
+
+    /// Whether the book advances right-to-left.
+    pub fn is_rtl(self) -> bool {
+        matches!(self, PageDirection::Rtl)
+    }
+}
+
+/// Layout options for fixed-layout documents (`Engine::Fixed`: CBZ, PDF).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedLayout {
+    /// How each page is scaled into the viewport.
+    pub fit: FitMode,
+    /// Page-turn direction and split-spread ordering.
+    pub direction: PageDirection,
+    /// Fullscreen mode: hide reader header/footer and margins so artwork fills the screen.
+    pub fullscreen: bool,
+    /// Automatically trim uniform white margins around page content before scaling.
+    pub auto_crop: bool,
+    /// Automatically split landscape two-page spreads into two sequential half-pages.
+    pub split_spread: bool,
+    /// Keep fixed-layout artwork uninverted in night mode.
+    pub keep_images_in_night: bool,
+}
+
+impl Default for FixedLayout {
+    fn default() -> Self {
+        Self {
+            fit: FitMode::FitPage,
+            direction: PageDirection::Ltr,
+            fullscreen: false,
+            auto_crop: false,
+            split_spread: false,
+            keep_images_in_night: true,
+        }
+    }
+}
+
 /// Everything that decides how a page looks. [`Style::pw4`] holds the
 /// defaults; the CLI can override the typographic ones.
 ///
@@ -182,6 +284,10 @@ pub struct Style {
     /// Margin around the text block in millimetres. Plato only takes whole
     /// millimetres, uniform on all sides of the area it lays out.
     pub margin_mm: i32,
+    /// Optional fine-grained margin override in 300-DPI reference pixels
+    /// (scaled by `dpi / 300.0`). When `Some`, [`Style::margin_px`] uses this
+    /// instead of converting [`Style::margin_mm`].
+    pub margin_px_override: Option<i32>,
     /// Distance in pixels from the top of the screen to the top of the
     /// text block; the header lives above it.
     pub text_top: u32,
@@ -197,8 +303,11 @@ pub struct Style {
     /// Hyphenation language for EPUB text, overriding the book's
     /// declaration (see [`crate::lang`]). `None`: decide per book.
     pub language: Option<String>,
-    /// CJK first-line indent in characters / ems: 2 (default) or 0.
+    /// Legacy CJK first-line indent in whole characters / ems: 2 (default) or 0.
     pub cjk_indent: usize,
+    /// Optional fine-grained CJK first-line indent in ems (e.g. `1.5`, `2.0`).
+    /// When `None`, [`Style::cjk_indent_em`] falls back to `cjk_indent as f32`.
+    pub cjk_indent_em: Option<f32>,
     /// CJK paragraph gap in ems: 0.0 (无), 0.3 (小), or 0.6 (大, default).
     pub cjk_gap: f32,
     /// Whether crengine's modern typesetting is on: W3C box model, the
@@ -209,6 +318,9 @@ pub struct Style {
     /// breaks; it also needs a new layout, as most of it is decided while
     /// parsing.
     pub fine_typesetting: bool,
+    /// Whether fine-typeset books may use their own embedded `@font-face`
+    /// fonts. Only takes effect when [`Style::fine_typesetting`] is enabled.
+    pub embedded_fonts: bool,
     /// Body text weight as a CSS `font-weight` number (100..=900).
     ///
     /// The engine treats it as a base weight: every element's own weight is
@@ -221,6 +333,10 @@ pub struct Style {
     /// out by the pure-Rust engine in [`crate::vertical`], not by crengine-ng.
     /// A style that differs only in this field needs a new layout.
     pub writing_mode: WritingMode,
+    /// Reader header and footer ("bars") configuration.
+    pub bar_config: aristotle_screen::ReaderBarConfig,
+    /// Layout options for fixed-layout / comic books (`Engine::Fixed`: CBZ, PDF).
+    pub fixed_layout: FixedLayout,
 }
 
 impl Style {
@@ -237,6 +353,15 @@ impl Style {
         self.stride = stride;
         self.dpi = screen.density.dpi();
         self
+    }
+
+    /// Update the reader bar configuration and recompute `text_top` and
+    /// `text_bottom` scaled to this style's DPI.
+    pub fn apply_bar_config(&mut self, config: aristotle_screen::ReaderBarConfig) {
+        let ratio = self.dpi as f32 / aristotle_screen::REFERENCE_DPI as f32;
+        self.bar_config = config;
+        self.text_top = (config.text_top_ref_px() as f32 * ratio).round() as u32;
+        self.text_bottom = (config.text_bottom_ref_px() as f32 * ratio).round() as u32;
     }
 
     /// Defaults for the PW4, chosen for Polish prose:
@@ -261,22 +386,39 @@ impl Style {
             font_size: 10.0,
             line_height: 1.3,
             margin_mm: 5,
+            margin_px_override: None,
             text_top: 104,
             text_bottom: 100,
             chrome_size: 7.0,
             chrome_gray: 0x40,
             language: None,
             cjk_indent: 2,
+            cjk_indent_em: None,
             cjk_gap: 0.6,
             fine_typesetting: true,
+            embedded_fonts: true,
             font_weight: FONT_WEIGHT_NORMAL,
             writing_mode: WritingMode::Horizontal,
+            bar_config: aristotle_screen::ReaderBarConfig::default(),
+            fixed_layout: FixedLayout::default(),
         }
     }
 
-    /// The margin in pixels, rounded the way Plato rounds it.
+    /// The margin in pixels, using the fine-grained pixel override when set
+    /// (scaled from 300-DPI reference pixels), otherwise rounded from `margin_mm`.
     pub fn margin_px(&self) -> i32 {
-        (self.margin_mm as f32 * self.dpi as f32 / 25.4).round() as i32
+        if let Some(ref_px) = self.margin_px_override {
+            ((ref_px.max(0) as f32) * self.dpi as f32 / 300.0).round() as i32
+        } else {
+            (self.margin_mm as f32 * self.dpi as f32 / 25.4).round() as i32
+        }
+    }
+
+    /// Effective CJK first-line indent in ems.
+    pub fn cjk_indent_em(&self) -> f32 {
+        self.cjk_indent_em
+            .unwrap_or(self.cjk_indent as f32)
+            .max(0.0)
     }
 
     /// The area handed to Plato for layout, as (top, height) in pixels.

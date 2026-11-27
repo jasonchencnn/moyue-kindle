@@ -330,6 +330,7 @@ fn settings_exposes_readest_and_weread_source_switches() {
             weread_readtime: false,
             weread_readtime_note: None,
             weread_notes: None,
+            extra: Default::default(),
         };
         for (size, dpi) in [
             (Size::new(600, 800), 167),

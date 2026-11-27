@@ -30,7 +30,7 @@ exclude = ["third_party"]
 [workspace.package]
 # The one version of the preview: every crate, the release tag (v0.3.1), the
 # About screen and SOURCE.txt. CHANGELOG.md has a section per version.
-version = "0.3.3"
+version = "0.3.8"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/piotrkowski/aristotle"

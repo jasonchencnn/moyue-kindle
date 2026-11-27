@@ -39,9 +39,12 @@ typedef struct CrDoc CrDoc;
  * css 为 NULL 或空串时不注入样式表。
  * embedded_styles 非 0 表示保留书内自带样式（<style>、外链 CSS、行内 style），
  * 0 表示只认注入的 css。对应 crengine 的 PROP_EMBEDDED_STYLES。
+ * embedded_fonts 非 0 表示精排模式下允许书内 @font-face 自带字体生效，
+ * 0 表示忽略书内嵌字体、一律使用阅读器选定的字体。对应 crengine 的
+ * PROP_EMBEDDED_FONTS（仅当 fine_typesetting 与 embedded_styles 均为非 0 时生效）。
  * fine_typesetting 非 0 表示启用现代精排：Web 盒模型与完整 block rendering
- * 标志、HarfBuzz kerning/shaping、悬挂标点、书内嵌字体、按面板 DPI 缩放
- * CSS 绝对单位。0 表示退回 crengine 的传统行为。DOM 版本不随开关切换，
+ * 标志、HarfBuzz kerning/shaping、悬挂标点、按面板 DPI 缩放 CSS 绝对单位。
+ * 0 表示退回 crengine 的传统行为。DOM 版本不随开关切换，
  * 两种状态都是 gDOMVersionCurrent：切换 DOM 版本会让已保存的 XPointer
  * 阅读进度/高亮错位。
  * font_weight 是正文字重（CSS font-weight 的 100..900）：超出范围时钳到
@@ -61,6 +64,7 @@ typedef struct {
     int line_spacing_percent;
     const char *css;
     int embedded_styles;
+    int embedded_fonts;
     const char *fallback_font_faces;
     int fine_typesetting;
     int font_weight;

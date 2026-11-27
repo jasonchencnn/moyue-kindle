@@ -81,6 +81,10 @@ pub mod action {
     pub const MARKS: ActionId = 8;
     pub const GOTO: ActionId = 9;
     pub const MENU: ActionId = 12;
+    /// Open the reader header & footer ("bars") configuration screen.
+    pub const BARS: ActionId = 13;
+    /// Start or stop Bluetooth AI audiobook (TTS) playback.
+    pub const TTS_TOGGLE: ActionId = 14;
     pub const LIGHT: ActionId = 11;
     pub const FONT: ActionId = 10;
     /// The device's font row: open the list of Latin fonts.
@@ -241,6 +245,49 @@ pub fn vertical_zone_at(screen: Rect, p: Point) -> Zone {
         .find(|(_, r)| r.contains(p))
         .map(|(z, _)| *z)
         .unwrap_or(Zone::Next)
+}
+
+/// Configurable tap zone lookup honoring [`aristotle_screen::TouchZoneLayout`]
+/// and `disable_touch_turn` (when true, only top/bottom menu bands respond).
+pub fn zone_at_with_layout(
+    screen: Rect,
+    p: Point,
+    layout: aristotle_screen::TouchZoneLayout,
+    vertical: bool,
+    disable_touch_turn: bool,
+) -> Option<Zone> {
+    let top = screen.h * 12 / 100;
+    let bottom = screen.h * 12 / 100;
+    let middle_y = screen.y + top;
+    let middle_h = screen.h - top - bottom;
+    if p.y < middle_y || p.y >= middle_y + middle_h {
+        return Some(Zone::Menu);
+    }
+    if disable_touch_turn {
+        return None;
+    }
+    if vertical {
+        return Some(vertical_zone_at(screen, p));
+    }
+    let rel_x = p.x - screen.x;
+    let zone = match layout {
+        aristotle_screen::TouchZoneLayout::Default30_70 => {
+            if rel_x < screen.w * 30 / 100 {
+                Zone::Prev
+            } else {
+                Zone::Next
+            }
+        }
+        aristotle_screen::TouchZoneLayout::Split50_50 => {
+            if rel_x < screen.w * 50 / 100 {
+                Zone::Prev
+            } else {
+                Zone::Next
+            }
+        }
+        aristotle_screen::TouchZoneLayout::NextOnly => Zone::Next,
+    };
+    Some(zone)
 }
 
 /// The opening of Bolesław Prus, *Lalka* (1890, public domain), lightly
@@ -555,10 +602,47 @@ pub fn build_menu_for_sync_channels(
         [bookmark_center],
     );
 
-    let g16_r = t.gap(16, 1);
+    let bars_icon = t.icon(Icon::Settings, 40, INK);
+    let bars_center = t.align(0.5, 0.5, bars_icon);
+    let bars_btn = t.add(
+        Node::new(Kind::Fixed {
+            w: Some(64),
+            h: Some(64),
+        })
+        .action(action::BARS)
+        .feedback(Feedback::Invert),
+        [bars_center],
+    );
+
+    // Listen button (action::TTS_TOGGLE)
+    let listen_label = t.label(tr(Msg::CommonListen), st.font_xs().gray(INK));
+    let listen_pad = t.pad(Insets::vh(0, 18), listen_label);
+    let listen_btn = t.add(
+        Node::new(Kind::Fixed {
+            w: None,
+            h: Some(64),
+        })
+        .bg(PAPER)
+        .border(2, INK, 16)
+        .action(action::TTS_TOGGLE)
+        .feedback(Feedback::Invert),
+        [listen_pad],
+    );
+
+    let g16_r0 = t.gap(12, 1);
+    let g16_r1 = t.gap(12, 1);
+    let g16_r = t.gap(12, 1);
     let right_group = t.add(
         Node::row(0).cross(Cross::Center),
-        [search_btn, g16_r, bookmark_btn],
+        [
+            bars_btn,
+            g16_r0,
+            listen_btn,
+            g16_r1,
+            search_btn,
+            g16_r,
+            bookmark_btn,
+        ],
     );
 
     let top_row = t.add(

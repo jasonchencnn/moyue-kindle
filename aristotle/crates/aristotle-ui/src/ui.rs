@@ -182,6 +182,26 @@ impl Ui {
         self.screen
     }
 
+    /// Resize the logical UI canvas (e.g. when switching between portrait and
+    /// landscape orientations). Keeps the panel DPI unchanged and marks the
+    /// next render as a full refresh.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if self.profile.width == width && self.profile.height == height {
+            return;
+        }
+        if let Ok(profile) = crate::geom::Screen::new(width, height, self.profile.density.dpi()) {
+            self.profile = profile;
+            self.canvas = Canvas::new(width, height);
+            self.front = Canvas::new(width, height);
+            self.screen = Rect::new(0, 0, width as i32, height as i32);
+            self.pressed = None;
+            self.snapshot.clear();
+            self.fast = None;
+            self.full_pending = true;
+            self.repaint_all = Some(Refresh::Full);
+        }
+    }
+
     /// Replaces the whole screen, e.g. going from the library to a book.
     /// A context switch gets a flashing GC16, which also clears ghosting.
     pub fn set_tree(&mut self, tree: Tree) -> Tree {
@@ -197,6 +217,7 @@ impl Ui {
         self.pressed = None;
         match refresh {
             Refresh::Full => self.full_pending = true,
+            Refresh::Clean => self.clean_pending = true,
             other => self.repaint_all = Some(other),
         }
         let old = std::mem::replace(&mut self.tree, tree);
@@ -318,8 +339,9 @@ impl Ui {
             let class = match r {
                 Refresh::Transient => 0,
                 Refresh::Full => 1,
-                Refresh::Page => 2,
-                Refresh::Auto => 3,
+                Refresh::Clean => 2,
+                Refresh::Page => 3,
+                Refresh::Auto => 4,
             };
             (class, std::cmp::Reverse(rect.area()))
         });
@@ -330,13 +352,14 @@ impl Ui {
             };
             self.repaint(r);
             let tight = match refresh {
-                Refresh::Full => Some(r),
+                Refresh::Full | Refresh::Clean => Some(r),
                 _ => self.canvas.diff_bounds(&self.front, r),
             };
             let Some(t) = tight else { continue };
             let waveform = match refresh {
                 Refresh::Transient => Waveform::A2,
                 Refresh::Full => Waveform::GC16,
+                Refresh::Clean => Waveform::GLKW16,
                 Refresh::Auto | Refresh::Page => {
                     if self.canvas.is_bilevel(t) {
                         Waveform::DU
@@ -775,6 +798,18 @@ mod tests {
                 waveform: Waveform::GLKW16
             }]
         );
+        let mut next = Tree::new();
+        let l = next.label("Next screen", style());
+        let root = next.pad(Insets::all(50), l);
+        next.set_root(root);
+        u.set_tree_with(next, Refresh::Clean);
+        assert_eq!(
+            u.render(),
+            vec![Damage {
+                rect: Rect::new(0, 0, 600, 800),
+                waveform: Waveform::GLKW16
+            }]
+        );
     }
 
     #[test]
@@ -957,5 +992,21 @@ mod tests {
             d(50, 50, 100, 100, Waveform::GL16),
         ]);
         assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn resize_updates_logical_bounds_and_buffers_for_landscape_rotation() {
+        let mut tree = Tree::new();
+        let r = tree.gap(10, 10);
+        tree.set_root(r);
+        let mut ui = Ui::new(tree, TextEngine::new(Fonts::embedded()), 1072, 1448);
+        assert_eq!(ui.bounds(), Rect::new(0, 0, 1072, 1448));
+
+        ui.resize(1448, 1072);
+        assert_eq!(ui.bounds(), Rect::new(0, 0, 1448, 1072));
+        assert_eq!(ui.profile().width, 1448);
+        assert_eq!(ui.profile().height, 1072);
+        assert_eq!(ui.screen().width, 1448);
+        assert_eq!(ui.screen().height, 1072);
     }
 }

@@ -97,6 +97,7 @@ fn settings_tree(text: &mut TextEngine, night: bool, light: u32) -> (Tree, set_u
         weread_readtime: false,
         weread_readtime_note: None,
         weread_notes: None,
+        extra: Default::default(),
     };
     set_ui::Settings::build(text, &styles(), &v)
 }
